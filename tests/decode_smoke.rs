@@ -6,9 +6,10 @@
 //! - synthesis-filter stability on zero excitation over many vectors.
 //!
 //! The numeric output is not bit-exact to ITU-T G.728 because the
-//! codebook tables + autocorrelation windowing in this crate are
-//! documented approximations. These tests assert properties (non-zero
-//! energy, finite samples, bounded amplitude) rather than exact values.
+//! autocorrelation windowing in this crate is a Hamming approximation of
+//! the spec's recursive Barnwell window. These tests assert properties
+//! (non-zero energy, finite samples, bounded amplitude) rather than
+//! exact values.
 
 use oxideav_codec::Decoder;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
@@ -142,9 +143,9 @@ fn bitstream_length_check() {
 #[test]
 fn synthesis_filter_stable_on_zero_excitation() {
     // Feed 200 vectors of all-zero indices (shape=0, sign=0, mag=0).
-    // The shape[0] row is not actually zero (placeholder random entries)
-    // but the excitation magnitude is tiny. The backward-adaptive LPC
-    // must not blow up over many vectors.
+    // ITU Annex B shape row 0 is not the zero vector, but the lowest
+    // `GAIN_CB` magnitude produces a small excitation. The backward-
+    // adaptive LPC must not blow up over many vectors.
     let mut dec = make_dec();
     let bytes = pack_indices(&vec![0u16; 200]);
     let pkt = Packet::new(0, TimeBase::new(1, SAMPLE_RATE as i64), bytes);

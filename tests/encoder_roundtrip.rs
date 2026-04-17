@@ -2,10 +2,10 @@
 //!
 //! The encoder shares its shape / gain codebooks and its backward-adaptive
 //! LPC + log-gain predictors with the decoder. The shape codebook in
-//! `crate::tables::SHAPE_CB` is a deterministic unit-RMS placeholder — it
-//! is *not* the ITU Annex A `CODEBK` table — so we cannot reasonably hope
-//! to approach reference-grade SNR numbers. These tests assert pipeline
-//! properties rather than exact reconstructions:
+//! `crate::tables::SHAPE_CB` is the ITU-T G.728 Annex B `CODEBK` table
+//! (128 × 5, Q11-divided-by-2048); the gain codebook is Annex B `GQ`.
+//! These tests assert round-trip pipeline properties rather than exact
+//! reconstructions:
 //!
 //!   1. Sinewave input produces finite output whose energy is at least
 //!      5 % of the input energy (i.e. the encoder emits non-trivial
@@ -45,10 +45,10 @@ fn make_decoder() -> Box<dyn Decoder> {
     oxideav_g728::decoder::make_decoder(&params).expect("decoder ctor")
 }
 
-/// Build a 400 Hz sine wave at 8 kHz. Amplitude chosen to sit comfortably
-/// within the placeholder-codebook scale — the decoder's gain predictor
-/// operates in a loose log-domain envelope that maps our ±1000 LSB sine
-/// to an output of broadly similar amplitude.
+/// Build a 400 Hz sine wave at 8 kHz. Amplitude sits comfortably within
+/// the codebook scale — the decoder's gain predictor operates in a loose
+/// log-domain envelope that maps our ±1000 LSB sine to an output of
+/// broadly similar amplitude.
 fn build_sine(n: usize) -> Vec<i16> {
     let sr = SAMPLE_RATE as f32;
     let mut out = Vec::with_capacity(n);
@@ -169,10 +169,10 @@ fn sine_roundtrip_has_nontrivial_energy() {
         "decoded output is near-constant ({distinct} distinct values)"
     );
 
-    // Energy check — placeholder codebook caps the SNR, but the
-    // encoder↔decoder pair must still route at least 5 % of the input
-    // energy through to the output. Much lower would mean the
-    // analysis-by-synthesis search is not actually tracking the target.
+    // Energy check — the encoder↔decoder pair must route at least 5 %
+    // of the input energy through to the output. Much lower would mean
+    // the analysis-by-synthesis search is not actually tracking the
+    // target.
     let e_in = energy(&input);
     let e_out = energy(&out);
     assert!(e_in > 0.0, "input energy is zero — test setup bug");

@@ -15,9 +15,6 @@
 //! Deliberate deviations from the ITU-T reference (called out so future
 //! work can close the gap):
 //!
-//! - The shape / gain codebooks in [`crate::tables`] are deterministic
-//!   unit-RMS placeholders rather than the exact Annex A `CODEBK` / `GB`
-//!   tables. Structure is right; numbers differ.
 //! - Autocorrelation uses a fixed 100-sample Hamming window instead of
 //!   the spec's recursive Barnwell (logarithmic) window.
 //! - Bandwidth expansion is applied post-recursion (γ = 0.96 for LPC,
@@ -472,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn excitation_from_index_is_nonzero_for_live_tables() {
+    fn excitation_from_index_is_nonzero_for_itu_tables() {
         // Any non-zero gain index should produce output.
         // Layout: shape(7) | sign(1) | mag(2). The 2-bit mag field selects
         // GAIN_CB[0..=3] directly; the sign bit flips polarity.
@@ -528,11 +525,11 @@ mod tests {
         // Feeding all-zero indices for a while must not cause growth.
         let mut st = G728State::new();
         let mut out = [0.0_f32; VECTOR_SIZE];
-        // gain_mag = 0 ⇒ 0.125 * sign; set sign=0 but also shape=0.
-        // Shape[0] has non-zero content (random placeholder), so to get
-        // truly silent input we just feed the same code and check the
-        // filter doesn't diverge — the gain predictor will adapt toward
-        // the excitation envelope.
+        // Shape row 0 is not the zero vector (ITU Annex B has 668,-2950,
+        // ... / 2048), so the lowest `GAIN_CB` level still produces
+        // non-zero excitation. The assertion is that the filter stays
+        // bounded as the gain predictor ratchets the excitation scale
+        // down over many vectors.
         let raw: u16 = 0; // shape=0, sign=0, mag=0
         let mut max_abs = 0.0_f32;
         for _ in 0..200 {

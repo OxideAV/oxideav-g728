@@ -18,9 +18,9 @@
 //!
 //! - Crate + workspace wiring (registers as codec id `g728`).
 //! - 10-bit MSB-first bit reader for the packed index stream.
-//! - 128 × 5 shape codebook + 8-magnitude gain codebook (see the
-//!   [`tables`] module; these are deterministic unit-RMS placeholders,
-//!   **not** the exact ITU Annex A `CODEBK` / `GB` values).
+//! - 128 × 5 shape codebook + 4-magnitude gain codebook transcribed
+//!   verbatim from ITU-T G.728 Annex B (`CODEBK` and `GQ`). See the
+//!   [`tables`] module.
 //! - Backward-adaptive 50th-order LPC predictor: windowed
 //!   autocorrelation + Levinson-Durbin, refreshed every 4 vectors
 //!   (2.5 ms), with bandwidth expansion for stability.
@@ -30,16 +30,17 @@
 //!
 //! What is deliberately **not** landed yet (tracked as follow-ups):
 //!
-//! - Exact ITU `CODEBK` / `GB` tables (one-table swap, no code change).
 //! - Spec's recursive Barnwell / logarithmic autocorrelation window —
 //!   we use a fixed 100-sample Hamming window instead.
 //! - Adaptive long-term (pitch) postfilter and short-term postfilter
 //!   described in §5.5 of the 2012 edition.
 //!
-//! Consequence: `make_decoder` now returns a working decoder that
-//! produces structured, bounded, non-silent output. It is not
-//! bit-compatible with reference ITU G.728 streams — treat it as a
-//! functional first cut until the exact tables + postfilter land.
+//! Consequence: `make_decoder` returns a working decoder that produces
+//! structured, bounded, non-silent output. The excitation codebooks are
+//! spec-accurate (Annex B); the LPC / log-gain adaptation still uses a
+//! simplified Hamming window, so the decoder is not bit-compatible with
+//! reference ITU G.728 streams until the Barnwell window + postfilter
+//! land.
 
 // Scaffold-only — symbols will be used once the full decoder body lands.
 // These allow()s come off when the decoder is exercised from end to end.

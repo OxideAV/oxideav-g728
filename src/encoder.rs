@@ -35,12 +35,11 @@
 //!
 //! # Caveats
 //!
-//! The shape codebook in [`crate::tables::SHAPE_CB`] is a deterministic
-//! unit-RMS placeholder — it is *not* the ITU Annex A `CODEBK` table.
-//! Analysis-by-synthesis will lock onto whichever codeword happens to
-//! best match the target, which is enough to demonstrate the pipeline
-//! but will not produce spec-grade reconstructions until the real tables
-//! are swapped in. The loop itself does not change when that happens.
+//! The shape codebook in [`crate::tables::SHAPE_CB`] is the ITU-T G.728
+//! Annex B `CODEBK` table (128 × 5, Q11 fixed-point divided by 2048);
+//! the gain codebook is the 4-entry `GQ` table. Analysis-by-synthesis
+//! matches the target against the real spec vectors, so reconstruction
+//! quality depends only on the surrounding LPC / log-gain adaptation.
 
 use std::collections::VecDeque;
 

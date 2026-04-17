@@ -73,27 +73,32 @@ What is implemented:
 - Backward-adaptive 10th-order log-gain predictor.
 - 10-bit MSB-first bit reader / packer: 7-bit shape index, 1-bit sign,
   2-bit gain magnitude.
+- **ITU-T G.728 Annex B codebooks**: the 128 x 5 `CODEBK` shape table
+  (Q11 integer values divided by 2048) and the 4-entry `GQ` gain
+  magnitude table (`33/64`, `231/256`, `1617/1024`, `11319/4096`),
+  transcribed verbatim from the 09/92 recommendation.
 - Exhaustive 128 x 8 analysis-by-synthesis search in the encoder, sharing
   its LPC / gain machinery verbatim with the decoder so a bitstream
   produced here round-trips cleanly through the in-tree decoder.
 - Encode -> decode round-trip coverage (sine carries non-trivial energy,
   silence decays after the initial transient, PTS rises monotonically).
+- Round-trip SNR sanity floor: 400 Hz sine reconstructs at ~44 dB SNR,
+  3-tone voiced-speech mix at ~30 dB, both measured after a 100 ms
+  adaptation transient.
 
 What is deliberately not shipped yet:
 
-- The exact ITU Annex A `CODEBK` / `GB` tables. The shipped shape / gain
-  codebooks in `crate::tables` are deterministic unit-RMS placeholders —
-  a one-table swap restores bit-compatibility, no code change required.
 - The spec's recursive Barnwell / logarithmic autocorrelation window;
   this crate uses a fixed 100-sample Hamming window instead.
 - The adaptive long-term (pitch) and short-term postfilters from the
   2012 edition, ITU-T G.728 section 5.5.
 
-Practical consequence: the crate is a functional, bounded, non-silent
-encoder + decoder pair that is **not** bit-compatible with reference
-G.728 streams until the exact codebooks are swapped in. It is
-deterministic, stable on long zero-excitation runs, and suitable for
-pipeline testing and round-trip transcodes within oxideav.
+Practical consequence: the excitation codebooks are spec-accurate, but
+the surrounding LPC / log-gain adaptation still uses a simplified window
+and no postfilter, so the decoder is not yet bit-compatible with ITU
+reference streams. It is deterministic, stable on long zero-excitation
+runs, and suitable for pipeline testing and round-trip transcodes within
+oxideav.
 
 ## License
 
