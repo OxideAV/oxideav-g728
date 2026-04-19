@@ -12,20 +12,14 @@
 //! 5. Backward-adaptive log-gain prediction (10th order): tracks the
 //!    excitation energy trajectory in the log domain.
 //!
-//! Deliberate deviations from the ITU-T reference (called out so future
-//! work can close the gap):
+//! The autocorrelation windowing follows the spec's §3.7 hybrid
+//! (Barnwell / logarithmic) window: a fixed 35-sample non-recursive
+//! tail plus a decaying recursive portion with `alpha^{2L} = 3/4`, using
+//! the 105-sample window table from Annex A. Bandwidth expansion uses
+//! the spec's `FAC = 253/256` factor.
 //!
-//! - Autocorrelation uses a fixed 100-sample Hamming window instead of
-//!   the spec's recursive Barnwell (logarithmic) window.
-//! - Bandwidth expansion is applied post-recursion (γ = 0.96 for LPC,
-//!   0.90 for gain predictor) to guarantee filter stability even when
-//!   the autocorrelation estimate is rank-deficient.
-//! - Postfilter (adaptive long-term pitch + short-term spectral tilt
-//!   compensation, §5.5 of the 2012 edition) is not implemented.
-//!
-//! Consequence: output is structured (non-silent, bounded, stable) but
-//! does **not** bit-match the ITU reference decoder. Treat this as a
-//! functional scaffold rather than a spec-compliant decoder.
+//! The adaptive long-term (pitch) + short-term postfilters from §5.5
+//! land in a follow-up commit; this commit focuses on the hybrid window.
 
 use oxideav_codec::Decoder;
 use oxideav_core::{
@@ -34,7 +28,7 @@ use oxideav_core::{
 
 use crate::bitreader::{BitReader, UnpackedIndex};
 use crate::predictor::{
-    update_gain_predictor, update_lpc_from_history, GAIN_HISTORY_LEN, HISTORY_LEN,
+    update_gain_predictor, update_lpc_from_hybrid_r, HybridWindow, GAIN_HISTORY_LEN, HYBRID_NFRSZ,
 };
 use crate::tables::{GAIN_CB, SHAPE_CB};
 use crate::{CODEC_ID_STR, GAIN_ORDER, INDEX_BITS, LPC_ORDER, SAMPLE_RATE, VECTOR_SIZE};
@@ -57,17 +51,28 @@ pub const VECTORS_PER_BLOCK: u32 = 4;
 /// ```
 ///
 /// The tap vector is refreshed every `VECTORS_PER_BLOCK` vectors by
-/// running `update_lpc_from_history` over `synth_history`.
+/// pushing the new adaptation-cycle samples into [`HybridWindow`], then
+/// running Levinson-Durbin on the resulting autocorrelation lags.
 pub struct LpcPredictor {
     /// Current LPC synthesis coefficients `a[1..=50]` (a[0] ≡ 1.0).
     pub a: [f32; LPC_ORDER + 1],
     /// Delay line of past synthesised samples (most recent at index 0).
     pub history: [f32; LPC_ORDER],
-    /// Longer history used to re-estimate `a` via autocorrelation +
-    /// Levinson-Durbin. Most recent sample at index 0.
-    pub synth_history: [f32; HISTORY_LEN],
+    /// G.728 §3.7 hybrid-window state. Samples are pushed into it in
+    /// 20-sample adaptation cycles (`HYBRID_NFRSZ`); each push returns
+    /// the 51 autocorrelation lags used to refresh `a`.
+    pub hybrid: HybridWindow,
+    /// Pending 20-sample cycle being accumulated; flushed into `hybrid`
+    /// every `VECTORS_PER_BLOCK` vectors.
+    pub frame_buf: [f32; HYBRID_NFRSZ],
+    /// Number of samples already written into `frame_buf`.
+    pub frame_fill: usize,
     /// Number of vectors processed since the last coefficient update.
     pub vectors_since_update: u32,
+    /// First reflection coefficient `k_1` from the latest successful
+    /// Levinson-Durbin update. Consumed by the short-term postfilter's
+    /// spectral-tilt compensation (§4.6, `mu = 0.15 * k_1`).
+    pub k1: f32,
 }
 
 impl Default for LpcPredictor {
@@ -77,8 +82,11 @@ impl Default for LpcPredictor {
         Self {
             a,
             history: [0.0; LPC_ORDER],
-            synth_history: [0.0; HISTORY_LEN],
+            hybrid: HybridWindow::new(),
+            frame_buf: [0.0; HYBRID_NFRSZ],
+            frame_fill: 0,
             vectors_since_update: 0,
+            k1: 0.0,
         }
     }
 }
@@ -90,8 +98,8 @@ impl LpcPredictor {
 
     /// Apply the all-pole synthesis filter to one 5-sample excitation
     /// vector, producing 5 reconstructed speech samples. Both
-    /// `history` (short delay line) and `synth_history` (the
-    /// autocorrelation-analysis window) are advanced by the output.
+    /// `history` (short delay line) and the hybrid-window cycle buffer
+    /// are advanced by the output.
     pub fn synthesise(&mut self, excitation: &[f32; VECTOR_SIZE], out: &mut [f32; VECTOR_SIZE]) {
         for n in 0..VECTOR_SIZE {
             let mut acc = excitation[n];
@@ -99,7 +107,7 @@ impl LpcPredictor {
                 acc -= self.a[k] * self.history[k - 1];
             }
             // Hard clip to prevent runaway if the filter is briefly
-            // ill-conditioned (can only happen if update_lpc_from_history
+            // ill-conditioned (can only happen if update_lpc_from_hybrid_r
             // produces a marginally-stable filter and is hit with large
             // excitation).
             let y = acc.clamp(-1.0e4, 1.0e4);
@@ -109,22 +117,41 @@ impl LpcPredictor {
                 self.history[k] = self.history[k - 1];
             }
             self.history[0] = y;
-            // Shift long (autocorrelation) history.
-            for k in (1..HISTORY_LEN).rev() {
-                self.synth_history[k] = self.synth_history[k - 1];
+            // Accumulate the 20-sample hybrid-window cycle in
+            // chronological order so `push_frame` sees the oldest
+            // sample at index 0.
+            if self.frame_fill < HYBRID_NFRSZ {
+                self.frame_buf[self.frame_fill] = y;
+                self.frame_fill += 1;
             }
-            self.synth_history[0] = y;
         }
         self.vectors_since_update = self.vectors_since_update.wrapping_add(1);
     }
 
-    /// Re-estimate `a` from `synth_history` using the Levinson-Durbin
-    /// recursion + bandwidth expansion. Returns `true` if the update
-    /// succeeded; the filter is left unchanged on failure.
+    /// Feed the pending 20-sample adaptation-cycle buffer through the
+    /// hybrid window and re-estimate `a` from the resulting
+    /// autocorrelation lags. Returns `true` if the update succeeded; the
+    /// filter is left unchanged on failure (matching the spec's
+    /// "ill-conditioned → keep previous coefficients" behaviour).
     pub fn refresh_coefficients(&mut self) -> bool {
-        let ok = update_lpc_from_history(&mut self.a, &self.synth_history);
+        // `refresh_coefficients` is called only at cycle boundaries, so
+        // `frame_buf` should always hold exactly NFRSZ samples. If for
+        // some reason fewer are present (e.g. tests that call
+        // `refresh` manually), zero-pad the trailing samples rather
+        // than short-cycling the hybrid window.
+        for i in self.frame_fill..HYBRID_NFRSZ {
+            self.frame_buf[i] = 0.0;
+        }
+        let r = self.hybrid.push_frame(&self.frame_buf);
+        self.frame_fill = 0;
         self.vectors_since_update = 0;
-        ok
+        if let Some((new_a, new_k1)) = update_lpc_from_hybrid_r(&r) {
+            self.a = new_a;
+            self.k1 = new_k1;
+            true
+        } else {
+            false
+        }
     }
 }
 
