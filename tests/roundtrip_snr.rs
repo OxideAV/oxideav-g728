@@ -248,3 +248,80 @@ fn print_postfilter_delta() {
         assert!(s != i16::MIN && s != i16::MAX, "postfilter saturated: {s}");
     }
 }
+
+/// Naive DFT magnitude at a single frequency, used to build a
+/// coarse spectrum without pulling in an FFT dependency.
+fn bin_magnitude(samples: &[i16], freq_hz: f64) -> f64 {
+    let sr = SAMPLE_RATE as f64;
+    let w = 2.0 * core::f64::consts::PI * freq_hz / sr;
+    let mut re = 0.0_f64;
+    let mut im = 0.0_f64;
+    for (n, &s) in samples.iter().enumerate() {
+        re += (s as f64) * (w * n as f64).cos();
+        im -= (s as f64) * (w * n as f64).sin();
+    }
+    (re * re + im * im).sqrt()
+}
+
+/// Assert the postfilter reshapes the spectrum on a non-trivial input.
+/// The spec's short-term postfilter deliberately attenuates the region
+/// between formant peaks and emphasises the peaks themselves; the
+/// spectral-tilt compensation further modifies the HF roll-off. We
+/// don't check a specific shape (it depends on the current LPC state)
+/// — only that the ratio of a low-band bin to a mid-band bin moves
+/// *at all*, proving the filter has frequency-dependent effect.
+#[test]
+fn postfilter_reshapes_spectrum() {
+    let params = make_params();
+
+    let input = build_voiced(TOTAL_SAMPLES);
+    let mut enc = oxideav_g728::encoder::make_encoder(&params).unwrap();
+    let packets = encode_all(&mut enc, &input);
+
+    let mut dec_raw = oxideav_g728::decoder::make_decoder_with_options(&params, false).unwrap();
+    let raw = decode_all(&mut dec_raw, &packets);
+    let mut dec_pf = oxideav_g728::decoder::make_decoder_with_options(&params, true).unwrap();
+    let pf = decode_all(&mut dec_pf, &packets);
+
+    let skip = (SAMPLE_RATE as usize) / 4; // skip 250 ms transient
+    let raw_tail = &raw[skip..];
+    let pf_tail = &pf[skip..];
+
+    // Sample the spectrum at three probe frequencies that straddle the
+    // voiced-speech test signal's tones (150 / 700 / 1600 Hz).
+    let probes = [200.0, 800.0, 2500.0];
+    let raw_mag: Vec<f64> = probes.iter().map(|&f| bin_magnitude(raw_tail, f)).collect();
+    let pf_mag: Vec<f64> = probes.iter().map(|&f| bin_magnitude(pf_tail, f)).collect();
+
+    println!(
+        "raw spectrum  @ 200/800/2500 Hz: {:.1} / {:.1} / {:.1}",
+        raw_mag[0], raw_mag[1], raw_mag[2]
+    );
+    println!(
+        "post spectrum @ 200/800/2500 Hz: {:.1} / {:.1} / {:.1}",
+        pf_mag[0], pf_mag[1], pf_mag[2]
+    );
+
+    // All three bins should have non-zero energy on the voiced mix
+    // (the 150 Hz fundamental has a fat skirt).
+    for &m in &raw_mag {
+        assert!(m > 0.0, "raw magnitude was zero somewhere");
+    }
+    for &m in &pf_mag {
+        assert!(m > 0.0, "postfilter magnitude was zero somewhere");
+    }
+
+    // The postfilter must move the low-vs-high band ratio by more than
+    // 1% — otherwise it's an identity filter and the wiring is broken.
+    let raw_lh = raw_mag[2] / raw_mag[0];
+    let pf_lh = pf_mag[2] / pf_mag[0];
+    let ratio_shift = (pf_lh / raw_lh).ln().abs();
+    println!(
+        "low/high ratio shift: {:.3} nats (raw {:.3}, pf {:.3})",
+        ratio_shift, raw_lh, pf_lh
+    );
+    assert!(
+        ratio_shift > 0.01,
+        "postfilter did not reshape the spectrum ({ratio_shift:.4} nats)"
+    );
+}
