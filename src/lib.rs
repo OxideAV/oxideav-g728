@@ -58,6 +58,7 @@ pub mod bitreader;
 pub mod codec;
 pub mod decoder;
 pub mod encoder;
+pub mod postfilter;
 pub mod predictor;
 pub mod tables;
 

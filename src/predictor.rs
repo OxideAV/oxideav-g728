@@ -267,11 +267,22 @@ pub fn levinson_durbin(r: &[f32], order: usize) -> Option<Vec<f32>> {
 }
 
 /// Levinson-Durbin recursion that also returns the first reflection
-/// coefficient `k_1`. The short-term postfilter's spectral tilt
-/// compensation (`mu = 0.15 * k_1`) needs this separately from the final
-/// predictor vector.
-pub fn levinson_durbin_with_refl(r: &[f32], order: usize) -> Option<(Vec<f32>, f32)> {
+/// coefficient `k_1` and a snapshot of the predictor taps at a chosen
+/// intermediate order. The short-term postfilter's spectral tilt
+/// compensation (`mu = 0.15 * k_1`) needs `k_1` separately from the
+/// final predictor vector, and §5.5 of G.728 extracts the 10th-order
+/// predictor as a by-product of the 50th-order run by snapshotting at
+/// order 10.
+///
+/// `snapshot_order` should be in `[0, order]`. When set to `0`, no
+/// snapshot is returned (only the final `a` and `k_1`).
+pub fn levinson_durbin_with_refl(
+    r: &[f32],
+    order: usize,
+    snapshot_order: usize,
+) -> Option<(Vec<f32>, f32, Option<Vec<f32>>)> {
     assert_eq!(r.len(), order + 1);
+    assert!(snapshot_order <= order);
     if r[0] <= 0.0 {
         return None;
     }
@@ -280,6 +291,7 @@ pub fn levinson_durbin_with_refl(r: &[f32], order: usize) -> Option<(Vec<f32>, f
     let mut e = r[0];
     let mut tmp = vec![0.0_f32; order + 1];
     let mut k1 = 0.0_f32;
+    let mut snapshot: Option<Vec<f32>> = None;
 
     for i in 1..=order {
         let mut acc = r[i];
@@ -302,8 +314,11 @@ pub fn levinson_durbin_with_refl(r: &[f32], order: usize) -> Option<(Vec<f32>, f
         if e <= 0.0 || !e.is_finite() {
             return None;
         }
+        if i == snapshot_order && snapshot_order > 0 {
+            snapshot = Some(a[..=snapshot_order].to_vec());
+        }
     }
-    Some((a, k1))
+    Some((a, k1, snapshot))
 }
 
 /// Apply bandwidth expansion: a[k] := a[k] * γ^k for k = 1..=order.
@@ -434,25 +449,45 @@ impl HybridWindow {
 // LPC + gain predictor updates
 // ---------------------------------------------------------------------------
 
+/// Result of refreshing the 50th-order LPC predictor from a fresh set
+/// of hybrid-window autocorrelation lags. Exposes the bandwidth-expanded
+/// 50th-order vector used by the synthesis filter, the first reflection
+/// coefficient (for the short-term postfilter's tilt compensation), and
+/// the unexpanded 10th-order predictor snapshot that the §5.5 postfilter
+/// uses for its LPC inverse filter and pole-zero shaping.
+///
+/// "Unexpanded" on the order-10 snapshot matches the reference: the spec
+/// scales the 10-th order predictor by its own `SPFPCF = 0.75` and
+/// `SPFZCF = 0.65` factors inside the postfilter coefficient calculator,
+/// not by the synthesis filter's `FAC = 253/256`.
+pub struct LpcUpdate {
+    pub a: [f32; LPC_ORDER + 1],
+    pub k1: f32,
+    pub order10: [f32; 11],
+}
+
 /// Recompute the 50th-order LPC coefficient vector from a fresh set of
-/// hybrid-window autocorrelation lags. On success, returns the
-/// bandwidth-expanded `a[1..=LPC]` vector (with `a[0] ≡ 1.0`) together
-/// with the first reflection coefficient `k_1` — the short-term
-/// postfilter's tilt compensation needs the latter.
+/// hybrid-window autocorrelation lags.
 ///
 /// Returns `None` if the Levinson-Durbin recursion hits a non-positive
 /// prediction error, matching the spec's "skip update if ill-conditioned"
 /// behaviour.
-pub fn update_lpc_from_hybrid_r(r: &[f32; LPC_ORDER + 1]) -> Option<([f32; LPC_ORDER + 1], f32)> {
+pub fn update_lpc_from_hybrid_r(r: &[f32; LPC_ORDER + 1]) -> Option<LpcUpdate> {
     if r[0] <= 0.0 {
         return None;
     }
     let r_vec = r.to_vec();
-    let (mut a_vec, k1) = levinson_durbin_with_refl(&r_vec, LPC_ORDER)?;
+    let (mut a_vec, k1, snap10) = levinson_durbin_with_refl(&r_vec, LPC_ORDER, 10)?;
     bandwidth_expand(&mut a_vec, BW_EXPANSION);
     let mut a = [0.0_f32; LPC_ORDER + 1];
     a.copy_from_slice(&a_vec[..=LPC_ORDER]);
-    Some((a, k1))
+    let mut order10 = [0.0_f32; 11];
+    if let Some(s) = snap10 {
+        order10[..=10].copy_from_slice(&s[..=10]);
+    } else {
+        order10[0] = 1.0;
+    }
+    Some(LpcUpdate { a, k1, order10 })
 }
 
 /// Update a gain-predictor coefficient vector from the log-gain history.
@@ -502,10 +537,26 @@ mod tests {
     #[test]
     fn levinson_with_refl_returns_k1() {
         let r = vec![2.7778, 2.2222];
-        let (a, k1) = levinson_durbin_with_refl(&r, 1).expect("recursion");
+        let (a, k1, _snap) = levinson_durbin_with_refl(&r, 1, 0).expect("recursion");
         assert!((a[1] + 0.8).abs() < 1e-3);
         // For a single-tap predictor k_1 = -r[1] / r[0] = -0.8.
         assert!((k1 + 0.8).abs() < 1e-3, "k1 = {k1} expected ≈ -0.8");
+    }
+
+    #[test]
+    fn levinson_with_refl_snapshot_is_order_10_when_requested() {
+        // Construct a decaying autocorrelation that produces a stable
+        // higher-order predictor and verify the order-10 snapshot is
+        // returned.
+        let mut r = vec![0.0_f32; 16];
+        r[0] = 1.0;
+        for i in 1..16 {
+            r[i] = 0.3_f32.powi(i as i32);
+        }
+        let (_a, _k1, snap) = levinson_durbin_with_refl(&r, 15, 10).expect("recursion");
+        let snap = snap.expect("snapshot");
+        assert_eq!(snap.len(), 11);
+        assert_eq!(snap[0], 1.0);
     }
 
     #[test]

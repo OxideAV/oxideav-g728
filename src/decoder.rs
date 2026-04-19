@@ -19,7 +19,9 @@
 //! the spec's `FAC = 253/256` factor.
 //!
 //! The adaptive long-term (pitch) + short-term postfilters from §5.5
-//! land in a follow-up commit; this commit focuses on the hybrid window.
+//! are wired through [`crate::postfilter`] and are enabled by default.
+//! Callers that want the raw synthesis output can disable the postfilter
+//! via [`G728Decoder::set_postfilter_enabled`].
 
 use oxideav_codec::Decoder;
 use oxideav_core::{
@@ -27,6 +29,7 @@ use oxideav_core::{
 };
 
 use crate::bitreader::{BitReader, UnpackedIndex};
+use crate::postfilter::Postfilter;
 use crate::predictor::{
     update_gain_predictor, update_lpc_from_hybrid_r, HybridWindow, GAIN_HISTORY_LEN, HYBRID_NFRSZ,
 };
@@ -73,12 +76,23 @@ pub struct LpcPredictor {
     /// Levinson-Durbin update. Consumed by the short-term postfilter's
     /// spectral-tilt compensation (§4.6, `mu = 0.15 * k_1`).
     pub k1: f32,
+    /// 10th-order predictor snapshot taken during the 50th-order
+    /// recursion (§5.5 "by-product of the 50th-order Levinson-Durbin").
+    /// Consumed by the postfilter's LPC inverse filter and pole-zero
+    /// coefficients. `apf[0] ≡ 1.0`.
+    pub apf: [f32; 11],
+    /// Whether the latest refresh produced usable coefficients. Lets
+    /// downstream consumers (postfilter) skip updates on the first
+    /// few frames, where the recursion may be starved.
+    pub last_update_ok: bool,
 }
 
 impl Default for LpcPredictor {
     fn default() -> Self {
         let mut a = [0.0_f32; LPC_ORDER + 1];
         a[0] = 1.0;
+        let mut apf = [0.0_f32; 11];
+        apf[0] = 1.0;
         Self {
             a,
             history: [0.0; LPC_ORDER],
@@ -87,6 +101,8 @@ impl Default for LpcPredictor {
             frame_fill: 0,
             vectors_since_update: 0,
             k1: 0.0,
+            apf,
+            last_update_ok: false,
         }
     }
 }
@@ -145,11 +161,14 @@ impl LpcPredictor {
         let r = self.hybrid.push_frame(&self.frame_buf);
         self.frame_fill = 0;
         self.vectors_since_update = 0;
-        if let Some((new_a, new_k1)) = update_lpc_from_hybrid_r(&r) {
-            self.a = new_a;
-            self.k1 = new_k1;
+        if let Some(update) = update_lpc_from_hybrid_r(&r) {
+            self.a = update.a;
+            self.k1 = update.k1;
+            self.apf = update.order10;
+            self.last_update_ok = true;
             true
         } else {
+            self.last_update_ok = false;
             false
         }
     }
@@ -343,6 +362,17 @@ impl G728State {
 // ---------------------------------------------------------------------------
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+    make_decoder_with_options(params, true)
+}
+
+/// Build a G.728 decoder with explicit control over the §5.5 postfilter.
+/// Set `postfilter_enabled` to `false` for raw synthesis output (useful
+/// for bit-exact testing and for non-speech signals where the pitch
+/// postfilter would hurt SNR more than it helps perception).
+pub fn make_decoder_with_options(
+    params: &CodecParameters,
+    postfilter_enabled: bool,
+) -> Result<Box<dyn Decoder>> {
     let sample_rate = params.sample_rate.unwrap_or(SAMPLE_RATE);
     if sample_rate != SAMPLE_RATE {
         return Err(Error::unsupported(format!(
@@ -361,12 +391,23 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
             params.codec_id
         )));
     }
-    Ok(Box::new(G728Decoder::new()))
+    let mut dec = G728Decoder::new();
+    dec.set_postfilter_enabled(postfilter_enabled);
+    Ok(Box::new(dec))
 }
 
 struct G728Decoder {
     codec_id: CodecId,
     state: G728State,
+    /// Optional §5.5 adaptive postfilter — enabled by default. Disable
+    /// via [`G728Decoder::set_postfilter_enabled`] when an application
+    /// wants the raw synthesis output (e.g. non-speech test tones where
+    /// perceptual shaping gets in the way).
+    postfilter: Postfilter,
+    postfilter_enabled: bool,
+    /// Vector index within the current 4-vector frame (0..=3). Used to
+    /// drive the once-a-frame pitch / long-term postfilter refresh.
+    vec_in_frame: u32,
     pending: Option<Packet>,
     eof: bool,
     time_base: TimeBase,
@@ -377,10 +418,20 @@ impl G728Decoder {
         Self {
             codec_id: CodecId::new(CODEC_ID_STR),
             state: G728State::new(),
+            postfilter: Postfilter::new(),
+            postfilter_enabled: true,
+            vec_in_frame: 0,
             pending: None,
             eof: false,
             time_base: TimeBase::new(1, SAMPLE_RATE as i64),
         }
+    }
+
+    /// Enable or disable the §5.5 adaptive postfilter. Defaults to
+    /// enabled. Disabling yields the raw synthesis output (without
+    /// pitch emphasis, formant sharpening, or AGC).
+    pub fn set_postfilter_enabled(&mut self, enabled: bool) {
+        self.postfilter_enabled = enabled;
     }
 
     /// Decode a packet's worth of 10-bit indices into an f32 PCM buffer.
@@ -401,10 +452,27 @@ impl G728Decoder {
         let mut br = BitReader::new(data);
         let mut pcm = Vec::with_capacity((vectors as usize) * VECTOR_SIZE);
         let mut vec_out = [0.0_f32; VECTOR_SIZE];
+        let mut post_out = [0.0_f32; VECTOR_SIZE];
         for _ in 0..vectors {
             let raw = br.read_index10()?;
+            // Track whether the main LPC predictor *just* refreshed, so
+            // we can hand its by-product 10th-order coefficients to the
+            // postfilter. Check before decode_vector (which may trigger
+            // the refresh).
+            let will_refresh = self.state.lpc.vectors_since_update + 1 >= VECTORS_PER_BLOCK;
             self.state.decode_vector(raw, &mut vec_out);
-            pcm.extend_from_slice(&vec_out);
+            if will_refresh && self.state.lpc.last_update_ok {
+                self.postfilter
+                    .set_lpc(&self.state.lpc.apf, self.state.lpc.k1);
+            }
+            if self.postfilter_enabled {
+                self.postfilter
+                    .process_vector(&vec_out, self.vec_in_frame, &mut post_out);
+                pcm.extend_from_slice(&post_out);
+            } else {
+                pcm.extend_from_slice(&vec_out);
+            }
+            self.vec_in_frame = (self.vec_in_frame + 1) % VECTORS_PER_BLOCK;
         }
         Ok(pcm)
     }
