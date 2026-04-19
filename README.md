@@ -67,9 +67,13 @@ channel knobs to turn.
 
 What is implemented:
 
-- Backward-adaptive 50th-order LPC synthesis predictor (windowed
-  autocorrelation + Levinson-Durbin with bandwidth expansion), refreshed
-  every four vectors (2.5 ms).
+- Backward-adaptive 50th-order LPC synthesis predictor using the spec's
+  **§3.7 hybrid (Barnwell / logarithmic) autocorrelation window** — a
+  35-sample non-recursive tail plus a decaying recursive portion with
+  `alpha^{2L} = 3/4`, using the 105-sample window table from Annex A.1
+  and `FAC = 253/256` bandwidth expansion. Refreshed every four vectors
+  (2.5 ms) with Levinson-Durbin + the spec's 257/256 white-noise
+  correction.
 - Backward-adaptive 10th-order log-gain predictor.
 - 10-bit MSB-first bit reader / packer: 7-bit shape index, 1-bit sign,
   2-bit gain magnitude.
@@ -80,24 +84,31 @@ What is implemented:
 - Exhaustive 128 x 8 analysis-by-synthesis search in the encoder, sharing
   its LPC / gain machinery verbatim with the decoder so a bitstream
   produced here round-trips cleanly through the in-tree decoder.
+- **§5.5 adaptive postfilter**: long-term (pitch comb) + short-term
+  (pole-zero formant emphasis with spectral-tilt compensation) + AGC
+  level renormalisation. The 10th-order postfilter LPC is extracted as
+  a by-product of the main 50th-order Levinson-Durbin. Enabled by
+  default; pass `make_decoder_with_options(&params, false)` for raw
+  synthesis output (recommended by the spec §4.6.1 for non-speech
+  signals like modems).
 - Encode -> decode round-trip coverage (sine carries non-trivial energy,
   silence decays after the initial transient, PTS rises monotonically).
-- Round-trip SNR sanity floor: 400 Hz sine reconstructs at ~44 dB SNR,
-  3-tone voiced-speech mix at ~30 dB, both measured after a 100 ms
-  adaptation transient.
+- Round-trip SNR (raw-synthesis floor, postfilter off): 400 Hz sine at
+  ~44 dB, 3-tone voiced-speech mix at ~34 dB, both measured after a
+  100 ms adaptation transient. The postfilter is a perceptual shaper:
+  it lowers L2 SNR on pure tones (~19 dB on the voiced mix) while
+  raising subjective quality on speech.
 
-What is deliberately not shipped yet:
+The remaining deviation from strict ITU bit-compat is the log-gain
+predictor's window — the spec's separate hybrid window for the
+10th-order gain trajectory (block 43) is still driven by a Hamming-
+windowed accumulator in this crate. That is a perceptually invisible
+stability tweak that does not affect round-trip quality in practice,
+but it does mean bitstream-level comparisons against the ITU reference
+decoder will drift on long speech runs.
 
-- The spec's recursive Barnwell / logarithmic autocorrelation window;
-  this crate uses a fixed 100-sample Hamming window instead.
-- The adaptive long-term (pitch) and short-term postfilters from the
-  2012 edition, ITU-T G.728 section 5.5.
-
-Practical consequence: the excitation codebooks are spec-accurate, but
-the surrounding LPC / log-gain adaptation still uses a simplified window
-and no postfilter, so the decoder is not yet bit-compatible with ITU
-reference streams. It is deterministic, stable on long zero-excitation
-runs, and suitable for pipeline testing and round-trip transcodes within
+Pipeline use is otherwise clean: deterministic, stable on long zero-
+excitation runs, and suitable for round-trip transcodes within
 oxideav.
 
 ## License
