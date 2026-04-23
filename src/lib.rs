@@ -34,6 +34,13 @@
 //! - Synthesis loop: excitation → all-pole IIR → optional postfilter →
 //!   S16 PCM, exposed via the standard [`oxideav_codec::Decoder`]
 //!   trait.
+//! - Frame-erasure concealment (Annex A.3 / §5.8). A `Packet` whose
+//!   `flags.corrupt` bit is set triggers synthesis from the last
+//!   transmitted excitation, attenuated across successive erased
+//!   packets (0.9 → 0.7 → 0.5 → 0.3 → 0.0) so burst losses fade to
+//!   silence rather than freezing a tone. The backward-adaptive
+//!   LPC + gain predictors keep running on the concealment output
+//!   so they resume cleanly when the next clean packet arrives.
 //!
 //! Residual deviation: the log-gain predictor still uses the scaffold's
 //! Hamming-window autocorrelation for block 43's hybrid-window module;

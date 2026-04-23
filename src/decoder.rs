@@ -324,6 +324,18 @@ impl G728State {
     /// gain track the signal envelope in real time without transmitting
     /// any side information.
     pub fn decode_vector(&mut self, raw: u16, out: &mut [f32; VECTOR_SIZE]) {
+        self.decode_vector_with_excitation(raw, out);
+    }
+
+    /// Same as [`decode_vector`] but also returns the excitation vector
+    /// that was fed into the synthesis filter. Concealment replays this
+    /// (attenuated) across erased packets so the synthesis filter has
+    /// something to extrapolate from.
+    pub fn decode_vector_with_excitation(
+        &mut self,
+        raw: u16,
+        out: &mut [f32; VECTOR_SIZE],
+    ) -> [f32; VECTOR_SIZE] {
         // Per-vector log-gain prediction. This updates `last_log_gain`,
         // which `excitation_from_index` reads for the adaptive scale.
         self.gain.predict();
@@ -354,6 +366,8 @@ impl G728State {
         if self.gain.vectors_since_update >= VECTORS_PER_BLOCK {
             self.gain.refresh_coefficients();
         }
+
+        excitation
     }
 }
 
@@ -411,6 +425,15 @@ struct G728Decoder {
     pending: Option<Packet>,
     eof: bool,
     time_base: TimeBase,
+    /// Most recently decoded excitation vector. On a frame erasure we
+    /// replay this vector (attenuated) as the concealment excitation,
+    /// per Annex A.3. Initialised to zero so the first-packet erasure
+    /// emits silence.
+    last_excitation: [f32; VECTOR_SIZE],
+    /// Count of consecutive packets marked `corrupt` since the last
+    /// clean packet. Concealment attenuation ramps with this counter so
+    /// a long erasure fades to silence rather than freezing.
+    erasure_run: u32,
 }
 
 impl G728Decoder {
@@ -424,6 +447,8 @@ impl G728Decoder {
             pending: None,
             eof: false,
             time_base: TimeBase::new(1, SAMPLE_RATE as i64),
+            last_excitation: [0.0; VECTOR_SIZE],
+            erasure_run: 0,
         }
     }
 
@@ -460,7 +485,11 @@ impl G728Decoder {
             // postfilter. Check before decode_vector (which may trigger
             // the refresh).
             let will_refresh = self.state.lpc.vectors_since_update + 1 >= VECTORS_PER_BLOCK;
-            self.state.decode_vector(raw, &mut vec_out);
+            // Remember the driving excitation so concealment can replay
+            // it with attenuation if the next packet is lost.
+            self.last_excitation = self
+                .state
+                .decode_vector_with_excitation(raw, &mut vec_out);
             if will_refresh && self.state.lpc.last_update_ok {
                 self.postfilter
                     .set_lpc(&self.state.lpc.apf, self.state.lpc.k1);
@@ -475,6 +504,79 @@ impl G728Decoder {
             self.vec_in_frame = (self.vec_in_frame + 1) % VECTORS_PER_BLOCK;
         }
         Ok(pcm)
+    }
+
+    /// Produce a concealment replacement for a packet whose payload we
+    /// cannot trust (`flags.corrupt == true`). Implements the spirit of
+    /// G.728 Annex A.3: freeze the transmitted-parameter search and
+    /// repeat the last excitation with an attenuation that ramps to
+    /// zero across successive erased packets. The backward-adaptive
+    /// LPC + log-gain predictors still run on the concealment output,
+    /// so they track the fade and resume cleanly on the next clean
+    /// packet.
+    fn conceal_packet(&mut self, approx_vectors: usize) -> Vec<f32> {
+        self.erasure_run = self.erasure_run.saturating_add(1);
+        // Attenuation ladder. First erased packet keeps most of the
+        // last-excitation energy; subsequent ones ramp down so a burst
+        // loss doesn't freeze a tone in the output.
+        let attenuation: f32 = match self.erasure_run {
+            1 => 0.9,
+            2 => 0.7,
+            3 => 0.5,
+            4 => 0.3,
+            _ => 0.0,
+        };
+        let mut pcm = Vec::with_capacity(approx_vectors * VECTOR_SIZE);
+        let mut vec_out = [0.0_f32; VECTOR_SIZE];
+        let mut post_out = [0.0_f32; VECTOR_SIZE];
+        for _ in 0..approx_vectors {
+            // Build the replacement excitation by scaling the last-known
+            // one. When attenuation hits 0 we effectively run a
+            // zero-input synthesiser, which lets the LPC filter's memory
+            // decay to silence on its own.
+            let mut exc = [0.0_f32; VECTOR_SIZE];
+            for k in 0..VECTOR_SIZE {
+                exc[k] = self.last_excitation[k] * attenuation;
+            }
+            // Track whether the LPC adapter is about to refresh so the
+            // postfilter can pick up the new 10th-order by-product.
+            let will_refresh = self.state.lpc.vectors_since_update + 1 >= VECTORS_PER_BLOCK;
+            // Drive the gain predictor with the concealment excitation's
+            // RMS so the log-gain trajectory tracks the fade rather than
+            // staying pinned at the last transmitted gain.
+            self.state.gain.predict();
+            self.state.lpc.synthesise(&exc, &mut vec_out);
+            let mut ss = 0.0_f32;
+            for &e in exc.iter() {
+                ss += e * e;
+            }
+            let rms = (ss / VECTOR_SIZE as f32).sqrt();
+            let log_g = rms.max(1.0e-6).ln();
+            self.state.gain.push(log_g);
+            self.state.vector_count = self.state.vector_count.wrapping_add(1);
+            if self.state.lpc.vectors_since_update >= VECTORS_PER_BLOCK {
+                self.state.lpc.refresh_coefficients();
+            }
+            if self.state.gain.vectors_since_update >= VECTORS_PER_BLOCK {
+                self.state.gain.refresh_coefficients();
+            }
+            if will_refresh && self.state.lpc.last_update_ok {
+                self.postfilter
+                    .set_lpc(&self.state.lpc.apf, self.state.lpc.k1);
+            }
+            if self.postfilter_enabled {
+                self.postfilter
+                    .process_vector(&vec_out, self.vec_in_frame, &mut post_out);
+                pcm.extend_from_slice(&post_out);
+            } else {
+                pcm.extend_from_slice(&vec_out);
+            }
+            self.vec_in_frame = (self.vec_in_frame + 1) % VECTORS_PER_BLOCK;
+            // Shift the concealment excitation so repeated packet loss
+            // doesn't replay the same 5-sample pattern.
+            self.last_excitation = exc;
+        }
+        pcm
     }
 }
 
@@ -501,7 +603,21 @@ impl Decoder for G728Decoder {
                 Err(Error::NeedMore)
             };
         };
-        let samples = self.decode_packet(&pkt.data)?;
+        let samples = if pkt.flags.corrupt {
+            // Frame erasure: estimate the affected vector count from
+            // `duration` (expressed in samples) or fall back to the
+            // standard 4-vector packet. Payload bytes (if any) are
+            // ignored — the `corrupt` flag says "don't trust these".
+            let vectors = match pkt.duration {
+                Some(d) if d > 0 => (d as usize).div_ceil(VECTOR_SIZE),
+                _ => crate::encoder::VECTORS_PER_PACKET,
+            };
+            self.conceal_packet(vectors)
+        } else {
+            // Clean packet: clear the erasure counter.
+            self.erasure_run = 0;
+            self.decode_packet(&pkt.data)?
+        };
         // Convert f32 -> S16 LE.
         let mut bytes = Vec::with_capacity(samples.len() * 2);
         for &s in &samples {
