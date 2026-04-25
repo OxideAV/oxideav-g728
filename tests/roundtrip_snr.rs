@@ -17,10 +17,10 @@
 //! path end-to-end and asserts that it actually modifies the signal
 //! (non-trivially) without blowing up the level.
 
-use oxideav_codec::{Decoder, Encoder};
 use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, SampleFormat, TimeBase,
 };
+use oxideav_core::{Decoder, Encoder};
 use oxideav_g728::encoder::{PACKET_BYTES, PACKET_SAMPLES};
 use oxideav_g728::{CODEC_ID_STR, SAMPLE_RATE};
 

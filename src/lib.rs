@@ -32,7 +32,7 @@
 //!   zero formant emphasis with spectral-tilt compensation) + AGC
 //!   level renormalisation. See the [`postfilter`] module.
 //! - Synthesis loop: excitation → all-pole IIR → optional postfilter →
-//!   S16 PCM, exposed via the standard [`oxideav_codec::Decoder`]
+//!   S16 PCM, exposed via the standard [`oxideav_core::Decoder`]
 //!   trait.
 //! - Frame-erasure concealment (Annex A.3 / §5.8). A `Packet` whose
 //!   `flags.corrupt` bit is set triggers synthesis from the last
@@ -68,7 +68,7 @@ pub mod postfilter;
 pub mod predictor;
 pub mod tables;
 
-use oxideav_codec::CodecRegistry;
+use oxideav_core::CodecRegistry;
 
 pub const CODEC_ID_STR: &str = "g728";
 

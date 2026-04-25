@@ -11,7 +11,7 @@
 //! (non-zero energy, finite samples, bounded amplitude) rather than
 //! exact values.
 
-use oxideav_codec::Decoder;
+use oxideav_core::Decoder;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 use oxideav_g728::{CODEC_ID_STR, INDEX_BITS, SAMPLE_RATE, VECTOR_SIZE};
 

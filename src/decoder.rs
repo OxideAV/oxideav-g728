@@ -23,7 +23,7 @@
 //! Callers that want the raw synthesis output can disable the postfilter
 //! via [`G728Decoder::set_postfilter_enabled`].
 
-use oxideav_codec::Decoder;
+use oxideav_core::Decoder;
 use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
 };
@@ -487,9 +487,7 @@ impl G728Decoder {
             let will_refresh = self.state.lpc.vectors_since_update + 1 >= VECTORS_PER_BLOCK;
             // Remember the driving excitation so concealment can replay
             // it with attenuation if the next packet is lost.
-            self.last_excitation = self
-                .state
-                .decode_vector_with_excitation(raw, &mut vec_out);
+            self.last_excitation = self.state.decode_vector_with_excitation(raw, &mut vec_out);
             if will_refresh && self.state.lpc.last_update_ok {
                 self.postfilter
                     .set_lpc(&self.state.lpc.apf, self.state.lpc.k1);

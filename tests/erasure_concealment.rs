@@ -7,10 +7,10 @@
 //! across successive erasures. These tests exercise that path via the
 //! standard `Decoder` trait so no private APIs are touched.
 
-use oxideav_codec::{Decoder, Encoder};
 use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, SampleFormat, TimeBase,
 };
+use oxideav_core::{Decoder, Encoder};
 use oxideav_g728::encoder::{PACKET_BYTES, PACKET_SAMPLES};
 use oxideav_g728::{CODEC_ID_STR, SAMPLE_RATE, VECTOR_SIZE};
 
@@ -117,10 +117,7 @@ fn single_corrupt_packet_emits_plausible_audio() {
         peak = peak.max(s.abs());
     }
     assert!(peak > 50, "concealed output too quiet: peak = {peak}");
-    assert!(
-        peak < 20_000,
-        "concealed output too loud: peak = {peak}"
-    );
+    assert!(peak < 20_000, "concealed output too loud: peak = {peak}");
 
     // Resume clean decoding without error.
     for p in packets.iter().skip(21).take(5) {
@@ -264,13 +261,15 @@ fn first_packet_erasure_is_silent_not_a_crash() {
     assert_eq!(af.samples as usize, PACKET_SAMPLES);
     // Cold-start concealment: excitation history is zero, so output
     // must be silent.
-    let peak: i32 = af
-        .data[0]
+    let peak: i32 = af.data[0]
         .chunks_exact(2)
         .map(|c| (i16::from_le_bytes([c[0], c[1]]) as i32).abs())
         .max()
         .unwrap_or(0);
-    assert!(peak < 100, "cold-start erasure emitted audible content: {peak}");
+    assert!(
+        peak < 100,
+        "cold-start erasure emitted audible content: {peak}"
+    );
 }
 
 #[test]
@@ -308,8 +307,7 @@ fn clean_packet_clears_erasure_run() {
     let Frame::Audio(af) = dec.receive_frame().unwrap() else {
         panic!("expected audio");
     };
-    let peak: i32 = af
-        .data[0]
+    let peak: i32 = af.data[0]
         .chunks_exact(2)
         .map(|c| (i16::from_le_bytes([c[0], c[1]]) as i32).abs())
         .max()

@@ -7,8 +7,8 @@
 //! cleanly through the in-tree decoder (subject to the placeholder
 //! codebook caveat documented on both sides).
 
-use oxideav_codec::{CodecInfo, CodecRegistry, Decoder, Encoder};
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Result};
+use oxideav_core::{CodecInfo, CodecRegistry, Decoder, Encoder};
 
 pub fn register(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::audio("g728_sw")

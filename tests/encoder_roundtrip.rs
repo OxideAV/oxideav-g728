@@ -15,11 +15,11 @@
 //!   3. PTS values on the produced packets rise monotonically.
 //!   4. `register` exposes both decode and encode factories.
 
-use oxideav_codec::CodecRegistry;
-use oxideav_codec::{Decoder, Encoder};
+use oxideav_core::CodecRegistry;
 use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, SampleFormat, TimeBase,
 };
+use oxideav_core::{Decoder, Encoder};
 use oxideav_g728::encoder::{PACKET_BYTES, PACKET_SAMPLES};
 use oxideav_g728::{CODEC_ID_STR, SAMPLE_RATE};
 
