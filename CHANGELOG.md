@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-g728/compare/v0.0.4...v0.0.5) - 2026-04-25
+
+### Other
+
+- drop oxideav-codec/oxideav-container shims, import from oxideav-core
+- frame-erasure concealment (Annex A.3 / §5.8)
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-g728/compare/v0.0.3...v0.0.4) - 2026-04-19
 
 ### Other
