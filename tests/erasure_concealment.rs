@@ -50,12 +50,8 @@ fn pack_audio_frame(samples: &[i16]) -> AudioFrame {
         bytes.extend_from_slice(&s.to_le_bytes());
     }
     AudioFrame {
-        format: SampleFormat::S16,
-        channels: 1,
-        sample_rate: SAMPLE_RATE,
         samples: samples.len() as u32,
         pts: None,
-        time_base: TimeBase::new(1, SAMPLE_RATE as i64),
         data: vec![bytes],
     }
 }

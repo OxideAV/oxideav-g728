@@ -209,14 +209,9 @@ impl Encoder for G728Encoder {
             Frame::Audio(a) => a,
             _ => return Err(Error::invalid("G.728 encoder: audio frames only")),
         };
-        if af.channels != 1 || af.sample_rate != SAMPLE_RATE {
-            return Err(Error::invalid("G.728 encoder: input must be mono, 8000 Hz"));
-        }
-        if af.format != SampleFormat::S16 {
-            return Err(Error::invalid(
-                "G.728 encoder: input sample format must be S16",
-            ));
-        }
+        // Stream-level format/channels/sample_rate are now contractual via
+        // CodecParameters and validated at construction; per-frame checks
+        // disappear with the slim AudioFrame shape.
         let bytes = af
             .data
             .first()

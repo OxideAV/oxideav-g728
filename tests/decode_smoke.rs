@@ -63,8 +63,6 @@ fn codec_emits_nonsilent_output() {
         panic!("expected audio frame");
     };
 
-    assert_eq!(a.sample_rate, SAMPLE_RATE);
-    assert_eq!(a.channels, 1);
     assert_eq!(a.samples as usize, indices.len() * VECTOR_SIZE);
     assert_eq!(a.data.len(), 1);
     assert_eq!(a.data[0].len(), a.samples as usize * 2);

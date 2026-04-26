@@ -25,7 +25,7 @@
 
 use oxideav_core::Decoder;
 use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
+    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result,
 };
 
 use crate::bitreader::{BitReader, UnpackedIndex};
@@ -424,7 +424,6 @@ struct G728Decoder {
     vec_in_frame: u32,
     pending: Option<Packet>,
     eof: bool,
-    time_base: TimeBase,
     /// Most recently decoded excitation vector. On a frame erasure we
     /// replay this vector (attenuated) as the concealment excitation,
     /// per Annex A.3. Initialised to zero so the first-packet erasure
@@ -446,7 +445,6 @@ impl G728Decoder {
             vec_in_frame: 0,
             pending: None,
             eof: false,
-            time_base: TimeBase::new(1, SAMPLE_RATE as i64),
             last_excitation: [0.0; VECTOR_SIZE],
             erasure_run: 0,
         }
@@ -623,12 +621,8 @@ impl Decoder for G728Decoder {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
         Ok(Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels: 1,
-            sample_rate: SAMPLE_RATE,
             samples: samples.len() as u32,
             pts: pkt.pts,
-            time_base: self.time_base,
             data: vec![bytes],
         }))
     }

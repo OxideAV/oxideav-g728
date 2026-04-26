@@ -17,9 +17,7 @@
 //! path end-to-end and asserts that it actually modifies the signal
 //! (non-trivially) without blowing up the level.
 
-use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, SampleFormat, TimeBase,
-};
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, SampleFormat};
 use oxideav_core::{Decoder, Encoder};
 use oxideav_g728::encoder::{PACKET_BYTES, PACKET_SAMPLES};
 use oxideav_g728::{CODEC_ID_STR, SAMPLE_RATE};
@@ -52,12 +50,8 @@ fn pack_audio_frame(samples: &[i16]) -> AudioFrame {
         bytes.extend_from_slice(&s.to_le_bytes());
     }
     AudioFrame {
-        format: SampleFormat::S16,
-        channels: 1,
-        sample_rate: SAMPLE_RATE,
         samples: samples.len() as u32,
         pts: None,
-        time_base: TimeBase::new(1, SAMPLE_RATE as i64),
         data: vec![bytes],
     }
 }
