@@ -24,9 +24,7 @@
 //! via [`G728Decoder::set_postfilter_enabled`].
 
 use oxideav_core::Decoder;
-use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result,
-};
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result};
 
 use crate::bitreader::{BitReader, UnpackedIndex};
 use crate::postfilter::Postfilter;
