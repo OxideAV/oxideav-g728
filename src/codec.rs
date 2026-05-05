@@ -10,7 +10,7 @@
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Result};
 use oxideav_core::{CodecInfo, CodecRegistry, Decoder, Encoder};
 
-pub fn register(reg: &mut CodecRegistry) {
+pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::audio("g728_sw")
         .with_lossy(true)
         .with_intra_only(false)

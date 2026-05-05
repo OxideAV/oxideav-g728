@@ -236,7 +236,7 @@ fn packet_pts_rises_across_vectors() {
 #[test]
 fn register_exposes_both_directions() {
     let mut reg = CodecRegistry::new();
-    oxideav_g728::register(&mut reg);
+    oxideav_g728::register_codecs(&mut reg);
     let id = CodecId::new(CODEC_ID_STR);
     assert!(reg.has_decoder(&id), "decoder factory must be registered");
     assert!(reg.has_encoder(&id), "encoder factory must be registered");
