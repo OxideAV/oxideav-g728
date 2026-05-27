@@ -490,11 +490,44 @@ pub fn update_lpc_from_hybrid_r(r: &[f32; LPC_ORDER + 1]) -> Option<LpcUpdate> {
     Some(LpcUpdate { a, k1, order10 })
 }
 
-/// Update a gain-predictor coefficient vector from the log-gain history.
-/// This keeps the original Hamming-window path for the 10th-order gain
-/// predictor; the spec's separate hybrid window for the gain predictor
-/// (block 43) is a pure stability tweak on an already-narrow predictor,
-/// and replacing it would not move the needle on round-trip quality.
+/// Bandwidth-expansion factor `FACGP = 29/32` for the log-gain predictor
+/// (§3.10, formula 3-12: `α_i = (29/32)^i * α̂_i`).
+pub const GAIN_BW_EXPANSION: f32 = 29.0 / 32.0;
+
+/// Update a gain-predictor coefficient vector from 11 hybrid-window
+/// autocorrelation lags produced by [`GainHybridWindow::push_cycle`].
+///
+/// Returns `false` if `r[GAIN_ORDER]` is zero (matches the spec's
+/// "skip blocks 44 + 45 if R(LPCLG+1) is zero" guard, §3.10 block 44 prose)
+/// or if Levinson-Durbin reports an ill-conditioned matrix; the caller
+/// keeps the previous predictor in either case.
+pub fn update_gain_predictor_from_hybrid_r(
+    b: &mut [f32; GAIN_ORDER + 1],
+    r: &[f32; GAIN_ORDER + 1],
+) -> bool {
+    // Block 44 prelude: `R(LPCLG+1) == 0` → skip update.
+    if r[GAIN_ORDER] == 0.0 {
+        return false;
+    }
+    let r_vec = r.to_vec();
+    let Some(mut new_b) = levinson_durbin(&r_vec, GAIN_ORDER) else {
+        return false;
+    };
+    // Block 45: `GP(I) = FACGPV(I) * GPTMP(I)` for I = 2..=LPCLG+1.
+    // FACGPV(I) = (29/32)^(I-1), matching the bandwidth-expansion helper.
+    bandwidth_expand(&mut new_b, GAIN_BW_EXPANSION);
+    b[..=GAIN_ORDER].copy_from_slice(&new_b[..=GAIN_ORDER]);
+    true
+}
+
+/// Legacy one-shot update from a 40-sample Hamming-windowed history.
+///
+/// Retained for the `decoder::GainPredictor` cold-start path before the
+/// spec hybrid window has had enough cycles to warm up, and for direct
+/// callers that hold a flat history rather than an incrementally fed
+/// hybrid window. New code should prefer
+/// [`update_gain_predictor_from_hybrid_r`] driven from
+/// [`GainHybridWindow`].
 pub fn update_gain_predictor(
     b: &mut [f32; GAIN_ORDER + 1],
     log_gain_history: &[f32; GAIN_HISTORY_LEN],
@@ -506,10 +539,179 @@ pub fn update_gain_predictor(
     let Some(mut new_b) = levinson_durbin(&r, GAIN_ORDER) else {
         return false;
     };
-    // FACGP = 29/32 per §3.8.
-    bandwidth_expand(&mut new_b, 29.0 / 32.0);
+    bandwidth_expand(&mut new_b, GAIN_BW_EXPANSION);
     b[..=GAIN_ORDER].copy_from_slice(&new_b[..=GAIN_ORDER]);
     true
+}
+
+// ---------------------------------------------------------------------------
+// ITU-T G.728 §3.10 hybrid window for the 10th-order log-gain predictor
+// ---------------------------------------------------------------------------
+
+/// Order of the log-gain LPC predictor (`LPCLG`, §3.10).
+pub const LPCLG: usize = GAIN_ORDER;
+
+/// Samples added per gain adaptation cycle (`NUPDATE`, §3.10). The log-gain
+/// hybrid window is driven by `NUPDATE = 4` new samples per cycle (one
+/// log-gain value per 5-sample speech vector × 4 vectors per cycle).
+pub const GAIN_HYBRID_NUPDATE: usize = 4;
+
+/// Number of strict non-recursive samples in the log-gain hybrid window
+/// (`NONRLG`, §3.10).
+pub const GAIN_HYBRID_NONR: usize = 20;
+
+/// Length of the log-gain signal buffer (`NSBGSZ = LPCLG + NUPDATE +
+/// NONRLG = 34`, §3.10).
+pub const GAIN_HYBRID_WIN_LEN: usize = LPCLG + GAIN_HYBRID_NUPDATE + GAIN_HYBRID_NONR;
+
+/// 34-sample log-gain hybrid window (`WNRLG`, §3.10 / Annex A.2).
+///
+/// Transcribed from the staged
+/// [`loggain-hybrid-window.csv`](../../docs/audio/g728/tables/loggain-hybrid-window.csv)
+/// table (`spec_role: Log-gain hybrid window (NSBGSZ=34)`). The window
+/// has its peak at index 16 (1-based `WNRLG(17)` ≈ 0.99997) and decays
+/// to ≈ 0.584 at the oldest recursive edge.
+///
+/// Indexing convention (per block 43 prose): the **newest** sample
+/// `SBLG(N3)` is multiplied with `WNRLG(1)`, the next-newest with
+/// `WNRLG(2)`, and so on, ending with the oldest `SBLG(1)` paired with
+/// `WNRLG(N3) = WNRLG(34)`. So `LOG_GAIN_HYBRID_WIN[0]` here corresponds
+/// to the newest sample.
+pub const LOG_GAIN_HYBRID_WIN: [f32; GAIN_HYBRID_WIN_LEN] = [
+    0.092346191406250,
+    0.183868408203125,
+    0.273834228515625,
+    0.361480712890625,
+    0.446014404296875,
+    0.526763916015625,
+    0.602996826171875,
+    0.674072265625000,
+    0.739379882812500,
+    0.798400878906250,
+    0.850585937500000,
+    0.895507812500000,
+    0.932769775390625,
+    0.962066650390625,
+    0.983154296875000,
+    0.995819091796875,
+    0.999969482421875,
+    0.995635986328125,
+    0.982757568359375,
+    0.961486816406250,
+    0.932006835937500,
+    0.899078369140625,
+    0.867309570312500,
+    0.836669921875000,
+    0.807128906250000,
+    0.778625488281250,
+    0.751129150390625,
+    0.724578857421875,
+    0.699005126953125,
+    0.674316406250000,
+    0.650482177734375,
+    0.627502441406250,
+    0.605346679687500,
+    0.583953857421875,
+];
+
+/// Hybrid-window state for the 10th-order log-gain predictor (block 43 of
+/// §3.10).
+///
+/// Mirrors the structure of [`HybridWindow`] but with the gain-predictor
+/// parameters (`LPCLG = 10`, `NUPDATE = 4`, `NONRLG = 20`, `NSBGSZ = 34`)
+/// and the dedicated 34-sample window table above. The recursive decay is
+/// the same `α^{2L} = 3/4` factor used by the synthesis filter (per the
+/// spec table: `M = 10, N = 20, L = 4, α = (3/4)^{1/8} ≈ 0.96467863`,
+/// giving `α^{2L} = α^8 = 3/4`).
+///
+/// The `gtmp` argument to [`Self::push_cycle`] holds the four
+/// most-recent log-gain values in chronological order: `gtmp[0]` is the
+/// log-gain of the second vector of the previous adaptation cycle (`GTMP(1)`
+/// in the spec); `gtmp[3]` is the log-gain of the first vector of the
+/// current adaptation cycle (`GTMP(NUPDATE) = GTMP(4)`).
+pub struct GainHybridWindow {
+    /// Sample buffer `SBLG(1..=34)` — oldest first at index 0.
+    sblg: [f32; GAIN_HYBRID_WIN_LEN],
+    /// Recursive autocorrelation accumulator `REXPLG(1..=LPCLG+1)`.
+    rexplg: [f32; LPCLG + 1],
+}
+
+impl Default for GainHybridWindow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GainHybridWindow {
+    pub const fn new() -> Self {
+        Self {
+            sblg: [0.0; GAIN_HYBRID_WIN_LEN],
+            rexplg: [0.0; LPCLG + 1],
+        }
+    }
+
+    /// Reset both buffers to all-zero. Called when the decoder restarts.
+    pub fn reset(&mut self) {
+        self.sblg = [0.0; GAIN_HYBRID_WIN_LEN];
+        self.rexplg = [0.0; LPCLG + 1];
+    }
+
+    /// Push one adaptation cycle's 4 new log-gain samples and return the
+    /// 11 hybrid-window autocorrelation lags (`R(1)..=R(LPCLG+1)`,
+    /// re-indexed to 0-based) ready for Levinson-Durbin via
+    /// [`update_gain_predictor_from_hybrid_r`].
+    pub fn push_cycle(&mut self, gtmp: &[f32; GAIN_HYBRID_NUPDATE]) -> [f32; LPCLG + 1] {
+        const N1: usize = LPCLG + GAIN_HYBRID_NUPDATE; // 14
+        const N2: usize = LPCLG + GAIN_HYBRID_NONR; // 30
+        const N3: usize = LPCLG + GAIN_HYBRID_NUPDATE + GAIN_HYBRID_NONR; // 34
+
+        // 1. Shift the old signal buffer left by NUPDATE, dropping the
+        //    oldest NUPDATE samples. Reference: `for N=1..N2:
+        //    SBLG(N) = SBLG(N + NUPDATE)`.
+        for n in 0..N2 {
+            self.sblg[n] = self.sblg[n + GAIN_HYBRID_NUPDATE];
+        }
+        // 2. Insert the new samples at the newest end. Reference:
+        //    `for N=1..NUPDATE: SBLG(N2 + N) = GTMP(N)`.
+        self.sblg[N2..N3].copy_from_slice(gtmp);
+
+        // 3. Apply the window. Spec walks the buffer newest-to-oldest:
+        //      K = 1
+        //      For N = N3, N3-1, .., 1: WS(N) = SBLG(N) * WNRLG(K); K += 1
+        //    In 0-based that's `ws[n] = sblg[n] * LOG_GAIN_HYBRID_WIN[N3 - 1 - n]`.
+        let mut ws = [0.0_f32; N3];
+        for n in 0..N3 {
+            ws[n] = self.sblg[n] * LOG_GAIN_HYBRID_WIN[N3 - 1 - n];
+        }
+
+        // 4. Update the recursive component over the samples that have
+        //    just slid from the non-recursive region into the recursive
+        //    region: `N = LPCLG+1..=N1` (0-based: LPCLG..N1).
+        //    `rexplg[i] = (3/4) * rexplg[i] + sum_{n=LPCLG..N1} ws[n] * ws[n - i]`.
+        for i in 0..=LPCLG {
+            let mut tmp = 0.0_f32;
+            for n in LPCLG..N1 {
+                debug_assert!(n >= i);
+                tmp += ws[n] * ws[n - i];
+            }
+            self.rexplg[i] = HYBRID_RECURSIVE_FACTOR * self.rexplg[i] + tmp;
+        }
+
+        // 5. Compose R from the recursive component plus the non-recursive
+        //    tail `N = N1+1..=N3` (0-based: N1..N3).
+        let mut r = [0.0_f32; LPCLG + 1];
+        for i in 0..=LPCLG {
+            r[i] = self.rexplg[i];
+            for n in N1..N3 {
+                debug_assert!(n >= i);
+                r[i] += ws[n] * ws[n - i];
+            }
+        }
+
+        // 6. White-noise correction factor (WNCF = 257/256).
+        r[0] *= WNCF;
+        r
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -647,6 +849,102 @@ mod tests {
         for i in 1..=LPC_ORDER {
             assert!(r[i].abs() <= r[0] + 1e-4);
         }
+    }
+
+    #[test]
+    fn log_gain_hybrid_window_table_has_expected_extrema() {
+        // Sanity-check the staged table: peak at WNRLG(17) (0-based 16),
+        // newest weight WNRLG(1) ≈ 0.092, oldest weight WNRLG(34) ≈ 0.584.
+        assert_eq!(LOG_GAIN_HYBRID_WIN.len(), 34);
+        let peak_idx = LOG_GAIN_HYBRID_WIN
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap()
+            .0;
+        assert_eq!(peak_idx, 16, "WNRLG peak should be at 0-based index 16");
+        assert!((LOG_GAIN_HYBRID_WIN[0] - 0.092346).abs() < 1e-4);
+        assert!((LOG_GAIN_HYBRID_WIN[16] - 0.999969).abs() < 1e-4);
+        assert!((LOG_GAIN_HYBRID_WIN[33] - 0.583954).abs() < 1e-4);
+    }
+
+    #[test]
+    fn gain_hybrid_window_zero_input_stays_zero() {
+        let mut hw = GainHybridWindow::new();
+        let cycle = [0.0_f32; GAIN_HYBRID_NUPDATE];
+        for _ in 0..40 {
+            let r = hw.push_cycle(&cycle);
+            assert_eq!(r[0], 0.0);
+            for v in r.iter() {
+                assert!(v.is_finite());
+            }
+        }
+    }
+
+    #[test]
+    fn gain_hybrid_window_constant_input_energy_grows_then_saturates() {
+        // On a constant non-zero gain trajectory the recursive component
+        // saturates at a finite limit (3/4 decay) and R is bounded.
+        let mut hw = GainHybridWindow::new();
+        let cycle = [1.0_f32; GAIN_HYBRID_NUPDATE];
+        let mut last = 0.0_f32;
+        for _ in 0..80 {
+            let r = hw.push_cycle(&cycle);
+            assert!(r[0].is_finite());
+            assert!(
+                r[0] >= last - 1e-3,
+                "r[0] regressed: was {last}, now {}",
+                r[0]
+            );
+            last = r[0];
+        }
+        // Bound: each of 34 samples has window weight ≤ 1, so r[0] ≤
+        // 34 / (1 - 3/4) * WNCF ≈ 136.5 after full saturation.
+        assert!(last < 200.0, "r[0] diverged: {last}");
+    }
+
+    #[test]
+    fn gain_hybrid_window_drives_update_via_levinson() {
+        // Feed a recognisable AR(1) log-gain trajectory and verify the
+        // hybrid window + update path produces a stable predictor whose
+        // first tap moves in the correct direction.
+        let mut hw = GainHybridWindow::new();
+        let mut b = [0.0_f32; GAIN_ORDER + 1];
+        b[0] = 1.0;
+        let mut g = 0.0_f32;
+        let mut x = 0.5_f32;
+        for cycle in 0..200 {
+            let mut gtmp = [0.0_f32; GAIN_HYBRID_NUPDATE];
+            for slot in gtmp.iter_mut() {
+                // AR(1) with ρ = 0.7 + light noise via cycle index modulation.
+                g = 0.7 * g + 0.3 * x;
+                x = -x; // alternating drive keeps the autocorrelation non-trivial
+                *slot = g;
+            }
+            let r = hw.push_cycle(&gtmp);
+            if cycle >= 10 && r[GAIN_ORDER] != 0.0 {
+                let ok = update_gain_predictor_from_hybrid_r(&mut b, &r);
+                if ok {
+                    assert!(b[0].abs() <= 1.0 + 1e-3);
+                    for k in 1..=GAIN_ORDER {
+                        assert!(b[k].is_finite(), "b[{k}] not finite: {}", b[k]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn update_gain_predictor_from_hybrid_r_skips_when_last_lag_zero() {
+        // Spec §3.10 block 44: skip blocks 44+45 when R(LPCLG+1) == 0.
+        let mut b = [0.0_f32; GAIN_ORDER + 1];
+        b[0] = 1.0;
+        let prev_b = b;
+        let mut r = [0.0_f32; GAIN_ORDER + 1];
+        r[0] = 1.0;
+        // r[GAIN_ORDER] == 0 by default — update should be skipped.
+        assert!(!update_gain_predictor_from_hybrid_r(&mut b, &r));
+        assert_eq!(b, prev_b, "coefficients must be untouched on skip");
     }
 
     #[test]

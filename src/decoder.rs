@@ -29,7 +29,8 @@ use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, R
 use crate::bitreader::{BitReader, UnpackedIndex};
 use crate::postfilter::Postfilter;
 use crate::predictor::{
-    update_gain_predictor, update_lpc_from_hybrid_r, HybridWindow, GAIN_HISTORY_LEN, HYBRID_NFRSZ,
+    update_gain_predictor, update_gain_predictor_from_hybrid_r, update_lpc_from_hybrid_r,
+    GainHybridWindow, HybridWindow, GAIN_HISTORY_LEN, GAIN_HYBRID_NUPDATE, HYBRID_NFRSZ,
 };
 use crate::tables::{GAIN_CB, SHAPE_CB};
 use crate::{CODEC_ID_STR, GAIN_ORDER, INDEX_BITS, LPC_ORDER, SAMPLE_RATE, VECTOR_SIZE};
@@ -172,23 +173,46 @@ impl LpcPredictor {
     }
 }
 
-/// Backward-adaptive 10th-order log-gain predictor (§3.9 of G.728).
+/// Backward-adaptive 10th-order log-gain predictor (§3.10 of G.728).
 ///
 /// Predicts the log-domain excitation gain from the 10 most recent
 /// log-gains. Like the LPC predictor it is updated every
 /// `VECTORS_PER_BLOCK` vectors, but from the gain trajectory rather
-/// than the synthesis signal.
+/// than the synthesis signal. The coefficient refresh now drives the
+/// spec's §3.10 block-43 [`GainHybridWindow`] (4 samples per cycle,
+/// 34-sample buffer, 3/4 recursive decay) instead of the legacy
+/// Hamming-window autocorrelation.
 pub struct GainPredictor {
     /// Prediction coefficients `b[1..=GAIN_ORDER]` (b[0] ≡ 1.0).
     pub b: [f32; GAIN_ORDER + 1],
     /// Short delay line for prediction (newest at index 0).
     pub history: [f32; GAIN_ORDER],
-    /// Longer history window for the Levinson-Durbin update.
+    /// Longer history window kept for the cold-start fallback path and
+    /// for direct callers that consult `analysis_history` outside the
+    /// hybrid-window flow.
     pub analysis_history: [f32; GAIN_HISTORY_LEN],
     /// Most recently predicted log gain (linear dB-ish units).
     pub last_log_gain: f32,
     /// Vectors since the last coefficient update.
     pub vectors_since_update: u32,
+    /// §3.10 block 43 hybrid-window state (34-sample buffer, REXPLG
+    /// accumulator). Driven by [`Self::push`] in groups of
+    /// `GAIN_HYBRID_NUPDATE = 4` samples; the lags it produces feed
+    /// [`update_gain_predictor_from_hybrid_r`] from
+    /// [`Self::refresh_coefficients`].
+    pub hybrid: GainHybridWindow,
+    /// Pending log-gain samples waiting to be flushed to the hybrid
+    /// window. Filled by `push` in chronological order; flushed every
+    /// `GAIN_HYBRID_NUPDATE` samples.
+    pub gtmp_buf: [f32; GAIN_HYBRID_NUPDATE],
+    /// Number of samples already written into `gtmp_buf`.
+    pub gtmp_fill: usize,
+    /// Number of full adaptation cycles successfully pushed through
+    /// `hybrid`. Used as the "warm-up" gate: until the buffer has seen
+    /// enough cycles for the recursive component to be meaningful, the
+    /// coefficient refresh falls back to the Hamming-window path on
+    /// `analysis_history`.
+    pub hybrid_cycles: u32,
 }
 
 impl Default for GainPredictor {
@@ -201,6 +225,10 @@ impl Default for GainPredictor {
             analysis_history: [0.0; GAIN_HISTORY_LEN],
             last_log_gain: 0.0,
             vectors_since_update: 0,
+            hybrid: GainHybridWindow::new(),
+            gtmp_buf: [0.0; GAIN_HYBRID_NUPDATE],
+            gtmp_fill: 0,
+            hybrid_cycles: 0,
         }
     }
 }
@@ -240,8 +268,13 @@ impl GainPredictor {
         self.last_log_gain
     }
 
-    /// Slide histories, inserting the latest observed log-gain.
-    pub fn push(&mut self, log_gain: f32) {
+    /// Slide histories, inserting the latest observed log-gain. Also
+    /// accumulates the sample into the §3.10 hybrid-window scratch
+    /// buffer and flushes it into `hybrid` every `GAIN_HYBRID_NUPDATE`
+    /// samples (= every 4 vectors). The returned `Some(r)` carries the
+    /// 11 autocorrelation lags ready for Levinson-Durbin when a flush
+    /// occurred; `None` otherwise.
+    pub fn push(&mut self, log_gain: f32) -> Option<[f32; GAIN_ORDER + 1]> {
         let g = log_gain.clamp(-6.0, 6.0);
         for k in (1..GAIN_ORDER).rev() {
             self.history[k] = self.history[k - 1];
@@ -252,9 +285,44 @@ impl GainPredictor {
         }
         self.analysis_history[0] = g;
         self.vectors_since_update = self.vectors_since_update.wrapping_add(1);
+
+        // Feed the spec's §3.10 hybrid window in NUPDATE-sample cycles.
+        self.gtmp_buf[self.gtmp_fill] = g;
+        self.gtmp_fill += 1;
+        if self.gtmp_fill == GAIN_HYBRID_NUPDATE {
+            let r = self.hybrid.push_cycle(&self.gtmp_buf);
+            self.gtmp_fill = 0;
+            self.hybrid_cycles = self.hybrid_cycles.saturating_add(1);
+            Some(r)
+        } else {
+            None
+        }
     }
 
-    /// Re-estimate `b` from `analysis_history`.
+    /// Re-estimate `b` from the §3.10 hybrid window's autocorrelation
+    /// lags. Returns `true` if Levinson-Durbin produced a stable
+    /// predictor; the previous coefficients are kept on `false`.
+    ///
+    /// The first few cycles after a reset (before the recursive component
+    /// has had time to accumulate) fall back to the legacy Hamming-window
+    /// path on `analysis_history`, matching the spec's "skip blocks 44+45
+    /// if R(LPCLG+1) is zero" guard with a working approximation.
+    pub fn refresh_coefficients_from_hybrid(&mut self, r: &[f32; GAIN_ORDER + 1]) -> bool {
+        let ok = update_gain_predictor_from_hybrid_r(&mut self.b, r);
+        self.vectors_since_update = 0;
+        if ok {
+            return true;
+        }
+        // Hybrid path declined (R(LPCLG+1) == 0 or matrix ill-conditioned)
+        // — fall back to the Hamming-window path so the predictor still
+        // tracks during warm-up.
+        update_gain_predictor(&mut self.b, &self.analysis_history)
+    }
+
+    /// Re-estimate `b` from `analysis_history` only (no hybrid-window
+    /// dependency). Retained for callers that want the legacy path
+    /// directly, and used as the cold-start fallback by
+    /// [`Self::refresh_coefficients_from_hybrid`].
     pub fn refresh_coefficients(&mut self) -> bool {
         let ok = update_gain_predictor(&mut self.b, &self.analysis_history);
         self.vectors_since_update = 0;
@@ -353,7 +421,10 @@ impl G728State {
         let rms = (ss / VECTOR_SIZE as f32).sqrt();
         // ln(max(rms, eps))
         let log_g = rms.max(1.0e-6).ln();
-        self.gain.push(log_g);
+        // `push` accumulates into the §3.10 hybrid window in 4-sample
+        // groups and returns the autocorrelation lags whenever a full
+        // cycle is flushed.
+        let hybrid_r = self.gain.push(log_g);
 
         self.vector_count = self.vector_count.wrapping_add(1);
 
@@ -361,8 +432,8 @@ impl G728State {
         if self.lpc.vectors_since_update >= VECTORS_PER_BLOCK {
             self.lpc.refresh_coefficients();
         }
-        if self.gain.vectors_since_update >= VECTORS_PER_BLOCK {
-            self.gain.refresh_coefficients();
+        if let Some(r) = hybrid_r {
+            self.gain.refresh_coefficients_from_hybrid(&r);
         }
 
         excitation
@@ -546,13 +617,13 @@ impl G728Decoder {
             }
             let rms = (ss / VECTOR_SIZE as f32).sqrt();
             let log_g = rms.max(1.0e-6).ln();
-            self.state.gain.push(log_g);
+            let hybrid_r = self.state.gain.push(log_g);
             self.state.vector_count = self.state.vector_count.wrapping_add(1);
             if self.state.lpc.vectors_since_update >= VECTORS_PER_BLOCK {
                 self.state.lpc.refresh_coefficients();
             }
-            if self.state.gain.vectors_since_update >= VECTORS_PER_BLOCK {
-                self.state.gain.refresh_coefficients();
+            if let Some(r) = hybrid_r {
+                self.state.gain.refresh_coefficients_from_hybrid(&r);
             }
             if will_refresh && self.state.lpc.last_update_ok {
                 self.postfilter

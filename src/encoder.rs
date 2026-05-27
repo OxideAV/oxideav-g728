@@ -390,13 +390,13 @@ fn advance_state(state: &mut G728State, raw: u16, out: &mut [f32; VECTOR_SIZE]) 
     }
     let rms = (ss / VECTOR_SIZE as f32).sqrt();
     let log_g = rms.max(1.0e-6).ln();
-    state.gain.push(log_g);
+    let hybrid_r = state.gain.push(log_g);
     state.vector_count = state.vector_count.wrapping_add(1);
     if state.lpc.vectors_since_update >= VECTORS_PER_BLOCK {
         state.lpc.refresh_coefficients();
     }
-    if state.gain.vectors_since_update >= VECTORS_PER_BLOCK {
-        state.gain.refresh_coefficients();
+    if let Some(r) = hybrid_r {
+        state.gain.refresh_coefficients_from_hybrid(&r);
     }
 }
 

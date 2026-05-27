@@ -27,7 +27,14 @@
 //!   3/4` and the 105-sample window table from Annex A.1. Refreshed
 //!   every 4 vectors (2.5 ms) via Levinson-Durbin with `FAC = 253/256`
 //!   bandwidth expansion.
-//! - Backward-adaptive 10th-order log-gain predictor.
+//! - Backward-adaptive 10th-order log-gain predictor — now driven by the
+//!   spec's §3.10 block-43 hybrid window (34-sample `SBLG` buffer, `LPCLG
+//!   = 10`, `NUPDATE = 4`, `NONRLG = 20`, `3/4` recursive decay, `257/256`
+//!   white-noise correction). The 34-sample `WNRLG` table is transcribed
+//!   from the staged `loggain-hybrid-window.csv`. The legacy Hamming-
+//!   window autocorrelation path remains as the cold-start fallback for
+//!   the first few cycles, when the recursive accumulator hasn't seen
+//!   enough samples to be meaningful.
 //! - §5.5 adaptive postfilter: long-term (pitch) + short-term (pole-
 //!   zero formant emphasis with spectral-tilt compensation) + AGC
 //!   level renormalisation. See the [`postfilter`] module.
@@ -42,11 +49,20 @@
 //!   LPC + gain predictors keep running on the concealment output
 //!   so they resume cleanly when the next clean packet arrives.
 //!
-//! Residual deviation: the log-gain predictor still uses the scaffold's
-//! Hamming-window autocorrelation for block 43's hybrid-window module;
-//! this is a stability tweak with no measurable impact on round-trip
-//! quality but means bitstream-level output is not strictly bit-exact
-//! against the ITU reference decoder.
+//! Residual deviations from strict ITU bit-compat:
+//!
+//! - The log-gain trajectory is tracked in natural-log units rather than
+//!   the spec's offset-removed dB units (`GSTATE = ETRMS - GOFF`, with
+//!   `GOFF = 32` dB). The hybrid window and Levinson-Durbin path are
+//!   scale-invariant in the predictor coefficients themselves, but the
+//!   `R(1)` lag and per-vector predicted log-gain land at different
+//!   numerical values than the reference under the dB convention.
+//! - Hybrid-window flush triggers at every 4th log-gain push, regardless
+//!   of where that lands inside the LPC adaptation cycle. The spec's
+//!   block 43 fires at `ICOUNT = 2` of each cycle, i.e. 2 vectors
+//!   earlier in phase. The cadence is identical (4 samples per cycle)
+//!   so the predictor accuracy is unaffected on long runs; only the
+//!   first few cycles after a reset diverge from the reference.
 
 // Scaffold-only — symbols will be used once the full decoder body lands.
 // These allow()s come off when the decoder is exercised from end to end.

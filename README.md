@@ -74,7 +74,14 @@ What is implemented:
   and `FAC = 253/256` bandwidth expansion. Refreshed every four vectors
   (2.5 ms) with Levinson-Durbin + the spec's 257/256 white-noise
   correction.
-- Backward-adaptive 10th-order log-gain predictor.
+- Backward-adaptive 10th-order log-gain predictor — driven by the spec's
+  **§3.10 block-43 hybrid window** (34-sample `SBLG` buffer, `LPCLG = 10`,
+  `NUPDATE = 4`, `NONRLG = 20`, `3/4` recursive decay, `257/256` white-
+  noise correction). The 34-sample `WNRLG` table is transcribed verbatim
+  from the staged `loggain-hybrid-window.csv` extraction artefact. Block
+  44 + 45 follow with Levinson-Durbin and `FACGP = 29/32` bandwidth
+  expansion. A Hamming-window fallback covers the first few cycles after
+  a reset, when the recursive accumulator hasn't warmed up yet.
 - 10-bit MSB-first bit reader / packer: 7-bit shape index, 1-bit sign,
   2-bit gain magnitude.
 - **ITU-T G.728 Annex B codebooks**: the 128 x 5 `CODEBK` shape table
@@ -99,13 +106,18 @@ What is implemented:
   it lowers L2 SNR on pure tones (~19 dB on the voiced mix) while
   raising subjective quality on speech.
 
-The remaining deviation from strict ITU bit-compat is the log-gain
-predictor's window — the spec's separate hybrid window for the
-10th-order gain trajectory (block 43) is still driven by a Hamming-
-windowed accumulator in this crate. That is a perceptually invisible
-stability tweak that does not affect round-trip quality in practice,
-but it does mean bitstream-level comparisons against the ITU reference
-decoder will drift on long speech runs.
+Remaining deviations from strict ITU bit-compat:
+
+- The log-gain trajectory is carried in natural-log units rather than
+  the spec's offset-removed dB units (`GSTATE = ETRMS - GOFF`, with the
+  32 dB `GOFF` offset stored in block 41). The hybrid window and
+  Levinson-Durbin path are scale-invariant in the predictor coefficients
+  themselves; only `R(1)` and the per-vector predicted log-gain land at
+  different absolute numbers than the reference.
+- The hybrid-window flush triggers at every 4th `push()` rather than at
+  the spec's `ICOUNT = 2` of each adaptation cycle. Both fire once per
+  4 vectors, so coefficient accuracy is unaffected on long runs; only
+  the first few cycles after a reset diverge from the reference.
 
 Pipeline use is otherwise clean: deterministic, stable on long zero-
 excitation runs, and suitable for round-trip transcodes within

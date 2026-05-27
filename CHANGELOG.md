@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- port ITU-T §3.10 block-43 hybrid window for the 10th-order log-gain
+  predictor: 34-sample `SBLG` buffer (`LPCLG=10`, `NUPDATE=4`, `NONRLG=20`),
+  `3/4` recursive decay, `257/256` white-noise correction, 34-sample
+  `WNRLG` table transcribed from the staged `loggain-hybrid-window.csv`.
+  Wires `GainHybridWindow` into `GainPredictor::push` (flushes a cycle
+  every 4 samples) and `update_gain_predictor_from_hybrid_r` into the
+  refresh path with the spec's "skip blocks 44+45 when `R(LPCLG+1)=0`"
+  guard. The legacy Hamming-window path stays as the cold-start fallback.
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-g728/compare/v0.0.6...v0.0.7) - 2026-05-06
 
 ### Other
