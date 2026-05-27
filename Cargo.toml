@@ -1,0 +1,16 @@
+[package]
+name = "oxideav-g728"
+version = "0.0.7"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+authors = ["Mark Karpeles"]
+description = "Pure-Rust ITU-T G.728 Low-Delay CELP (LD-CELP, 16 kbit/s) codec — decoder + encoder"
+repository = "https://github.com/OxideAV/oxideav-g728"
+homepage = "https://github.com/OxideAV/oxideav-g728"
+readme = "README.md"
+keywords = ["multimedia", "audio", "g728", "telephony", "codec"]
+categories = ["multimedia::encoding", "multimedia::audio"]
+
+[dependencies]
+oxideav-core = "0.1"
