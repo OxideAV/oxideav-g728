@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-g728/releases/tag/v0.0.7) - 2026-05-29
+
+### Other
+
+- r189 decoder front end + Annex A/B/C/D tables
+- orphan rebuild: reset to scaffold under clean-room policy (round 171)
+
 ### Added
 
 - **Annex A.1 / A.2 / A.3 hybrid windows** — synthesis-filter (105
