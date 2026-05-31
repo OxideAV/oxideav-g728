@@ -4,6 +4,41 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Backward synthesis-filter adapter (block 33)** — new
+  `SynthesisAdapter` type wires the spec's three §5.6 sub-blocks
+  (block 49 hybrid window → block 50 Levinson-Durbin → block 51
+  bandwidth expansion via `FACV`) so the decoder can derive its
+  50th-order LPC predictor autonomously from quantised speech, one
+  NFRSZ-sample adaptation cycle at a time.
+- **Backward vector gain adapter (block 30)** — new `GainAdapter`
+  type wires the per-vector chain of §5.7 blocks
+  67/39/40/42/46/47/48 plus the once-per-cycle (ICOUNT=2)
+  43/44/45 hybrid-window → Levinson → `FACGPV` expansion path.
+  Produces one σ(n) per call; preserves the previous-cycle
+  log-gain predictor on Levinson failure.
+- **`hybrid_window` module** — single transcription of the
+  block-36 / block-43 / block-49 pseudocode shape, parameterised
+  by order / per-call input length / non-recursive tail length /
+  window data. Both adapters share the same code path; their state
+  (`SB` / `SBLG` buffers + `REXP` / `REXPLG` recursive
+  autocorrelation) lives in per-adapter `HybridWindowState`
+  instances.
+- **`Decoder::decode_vector(ichan)`** — autonomous decode path
+  that walks block 29 → 30 → 31 → 32 → 33 per Figure 3/G.728 on
+  every call, with the gain adapter producing σ(n) and the
+  synthesis adapter producing A() internally. The earlier
+  `Decoder::decode_index` / `set_synthesis_predictor` hooks are
+  preserved for the register-only path.
+- New tests: 12 added (hybrid-window dimensions / WNCF / zero
+  input, synthesis-adapter A(1)=1 invariant / zero-input
+  ill-conditioning / nonzero-input convergence / decoder
+  integration, gain-adapter Table 2 initial state / ICOUNT cycle /
+  σ(n) limiter / first-vector 10^(GOFF/20), full-chain
+  decode_vector finiteness / state propagation / cycle update).
+  Total crate tests: 56 → 68.
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-g728/releases/tag/v0.0.7) - 2026-05-29
 
 ### Other

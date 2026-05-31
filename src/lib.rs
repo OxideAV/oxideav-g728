@@ -4,7 +4,7 @@
 //! Prediction) speech codec — 16 kbit/s, 8 kHz sampling, 0.625 ms
 //! algorithmic delay.
 //!
-//! ## Status: clean-room rebuild — decoder front end + Annex tables
+//! ## Status: clean-room rebuild — autonomous decoder pipeline
 //!
 //! The crate was reset to a register-only scaffold (round 171, master
 //! `14e3bad`) under the workspace clean-room policy: the previous
@@ -13,35 +13,39 @@
 //! tree is being re-grown one spec-cited unit at a time from the
 //! published ITU-T G.728 (1992-09) Recommendation prose alone.
 //!
-//! Round 189 lands:
+//! Round 195 adds the two **backward adapters** that drive the
+//! decoder autonomously off the raw bitstream:
 //!
-//! * The complete set of Table 1/G.728 codec parameters (see
-//!   [`consts`]).
-//! * Annex A.1, A.2 and A.3 hybrid windows (synthesis, log-gain and
-//!   weighting filter), transcribed as their normative Q15 integers
-//!   plus float views derived by the spec-stated `value / 2¹⁵` rule.
-//! * The complete Annex B excitation codebook: 128 shape codevectors
-//!   × 5 components (Q11) plus the 8-level Q13 gain codebook with
-//!   pre-computed `g2` and `gsq` arrays (equations 3-21 / 3-22).
-//! * Annex C bandwidth-broadening vectors for the synthesis filter,
-//!   the log-gain predictor, the perceptual-weighting filter, and
-//!   the short-term postfilter (Q14).
-//! * Annex D 1 kHz lowpass coefficients for the pitch extractor.
-//! * A Levinson-Durbin recursion that the synthesis-filter adapter,
-//!   the log-gain adapter and the weighting-filter adapter will all
-//!   share once a future round wires up the backward-adapter blocks
-//!   (see [`levinson`]).
-//! * The decoder excitation front end (codebook lookup → gain scaling
-//!   → 50th-order all-pole synthesis filter with `±MAX` memory
-//!   saturation), behind a stable [`Decoder`] entry point.
+//! * **Block 33 — backward synthesis-filter adapter** ([`SynthesisAdapter`])
+//!   wires the spec's three sub-blocks together: block 49 (hybrid
+//!   window on quantised speech → autocorrelation), block 50 (the
+//!   Levinson-Durbin recursion landed in r189), and block 51
+//!   (bandwidth expansion via the Annex C `FACV` vector). The
+//!   adapter consumes one NFRSZ-sample adaptation cycle per call
+//!   and emits the cycle's bandwidth-expanded predictor in the
+//!   spec's `A(1..LPC+1)` layout.
+//! * **Block 30 — backward vector gain adapter** ([`GainAdapter`])
+//!   wires blocks 67 / 39 / 40 (1-vector delay + RMS + log10), 42
+//!   (offset subtractor), 43 / 44 / 45 (hybrid window → Levinson →
+//!   bandwidth expansion via `FACGPV`) at ICOUNT=2, 46 (log-gain
+//!   linear predictor), 47 (limiter, clamp to `[0, 60]` dB) and
+//!   48 (inverse logarithm). One call produces one σ(n) for the
+//!   vector that is about to be decoded.
+//! * **[`hybrid_window`]** — the spec's block-36 / block-43 /
+//!   block-49 pseudocode shares a single shape; this module
+//!   transcribes it once and dispatches by parameter object.
+//! * **`Decoder::decode_vector`** — autonomous decode path that
+//!   walks block 29 → 30 → 31 → 32 → 33 per Figure 3/G.728.
+//!
+//! Round 189 (preserved) provides the Annex A.1/A.2/A.3 hybrid
+//! windows, the Annex B excitation codebook (128 × 5 shape + 8
+//! gain), the Annex C bandwidth-broadening vectors (Q14), the
+//! Annex D 1 kHz lowpass coefficients, Table 1/G.728 parameter
+//! constants, the Levinson-Durbin recursion, and the
+//! [`Decoder::decode_index`] caller-driven entry point.
 //!
 //! ## What is NOT yet wired up
 //!
-//! * **Backward adapters (blocks 30, 33).** The synthesis-filter
-//!   predictor is currently caller-supplied via
-//!   [`decoder::Synthesizer::set_predictor`]; the next round will plug
-//!   the Annex A hybrid window → Levinson-Durbin → Annex C bandwidth
-//!   expansion chain in.
 //! * **Adaptive postfilter (blocks 71–77).** The postfilter is a
 //!   perceptual quality enhancement: it does not affect bit-exactness
 //!   against the standard's reference output, so it lands later.
@@ -76,11 +80,17 @@ use oxideav_core::RuntimeContext;
 
 pub mod consts;
 pub mod decoder;
+pub mod gain_adapter;
+pub mod hybrid_window;
 pub mod levinson;
+pub mod synthesis_adapter;
 pub mod tables;
 
 pub use decoder::{pack_channel_index, ExcitationVector, Synthesizer, DEFAULT_MAX, FRAME_LEN};
+pub use gain_adapter::GainAdapter;
+pub use hybrid_window::{HybridWindow, HybridWindowState};
 pub use levinson::{levinson_durbin, LevinsonError};
+pub use synthesis_adapter::SynthesisAdapter;
 
 /// Crate-local error type.
 ///
@@ -122,18 +132,37 @@ pub type Result<T> = core::result::Result<T, Error>;
 
 /// LD-CELP decoder front end.
 ///
-/// One [`Decoder`] instance carries the synthesis-filter memory across
-/// vectors. Construct it with [`Decoder::new`] and feed one 10-bit
-/// channel index at a time through [`Decoder::decode_index`] to
-/// receive a `FRAME_LEN`-sample decoded-PCM vector.
+/// One [`Decoder`] instance carries the synthesis-filter memory and
+/// both backward adapters across vectors. Construct it with
+/// [`Decoder::new`] and feed one 10-bit channel index at a time
+/// through [`Decoder::decode_vector`] to receive a
+/// `FRAME_LEN`-sample decoded-PCM vector with the spec's full
+/// blocks 29 → 30 → 31 → 32 → 33 chain wired up.
 ///
-/// The decoder is currently parameterised by the predictor coefficients
-/// the caller provides via [`Decoder::set_synthesis_predictor`]; a
-/// follow-up round will replace that hook with the spec's backward
-/// adapter so the decoder runs autonomously off the raw bitstream.
-#[derive(Debug, Clone)]
+/// For pre-r195 callers, [`Decoder::decode_index`] (no gain adapter,
+/// no synthesis adapter — caller-supplied predictor) and
+/// [`Decoder::set_synthesis_predictor`] remain available as the
+/// register-only entry points.
+#[derive(Debug)]
 pub struct Decoder {
     synth: Synthesizer,
+    /// Backward synthesis-filter adapter (block 33). Updated once per
+    /// adaptation cycle (NUPDATE = 4 vectors), consumed by `synth`.
+    synth_adapter: SynthesisAdapter,
+    /// Backward vector gain adapter (block 30). Updated every vector;
+    /// produces `σ(n)` consumed by the block-31 gain scaling step.
+    gain_adapter: GainAdapter,
+    /// Previous gain-scaled excitation vector `ET(1..IDIM)` — fed
+    /// into block 67 / block 30 on the next vector. Initialised to
+    /// zero per Table 2/G.728 (`ET` initial `0,0,...,0`).
+    et_prev: [f64; FRAME_LEN],
+    /// Rolling NFRSZ-sample quantised-speech buffer. Filled NUPDATE
+    /// (= 4) vectors at a time before being handed to the synthesis
+    /// adapter, mirroring the `STTMP(1..NFRSZ)` cycle-rate input.
+    sttmp_buf: [f64; consts::NFRSZ],
+    /// Write cursor into `sttmp_buf`; when it reaches NFRSZ the
+    /// adapter is run and the cursor resets.
+    sttmp_idx: usize,
 }
 
 impl Default for Decoder {
@@ -145,32 +174,117 @@ impl Default for Decoder {
 impl Decoder {
     /// Construct a fresh decoder with all internal state initialised
     /// to the values listed in Table 2/G.728 (synthesis-filter memory
-    /// zeroed, all-pass predictor).
+    /// zeroed, all-pass predictor, hybrid-window buffers zeroed, log-
+    /// gain state filled with `-GOFF` dB).
     pub fn new() -> Self {
         Self {
             synth: Synthesizer::new(),
+            synth_adapter: SynthesisAdapter::new(),
+            gain_adapter: GainAdapter::new(),
+            et_prev: [0.0; FRAME_LEN],
+            sttmp_buf: [0.0; consts::NFRSZ],
+            sttmp_idx: 0,
         }
     }
 
     /// Inject a fresh set of synthesis-filter coefficients for the
     /// next vector. The leading entry must be `1.0` (the spec's
     /// `A(1) = 1` invariant).
+    ///
+    /// This bypasses the built-in synthesis adapter (block 33).
+    /// Callers wanting the spec's autonomous adapter should use
+    /// [`Decoder::decode_vector`] instead.
     pub fn set_synthesis_predictor(&mut self, coeffs: [f64; consts::LPC + 1]) {
         self.synth.set_predictor(coeffs);
     }
 
     /// Decode one channel index into one [`FRAME_LEN`]-sample PCM
-    /// vector in the spec's `±4 095` linear range. Channel indices
-    /// outside `[0, 1024)` are masked to their low 10 bits.
+    /// vector, using a caller-supplied synthesis predictor (see
+    /// [`Decoder::set_synthesis_predictor`]) and **no gain scaling**.
+    ///
+    /// Retained for the original r189 API. New callers should use
+    /// [`Decoder::decode_vector`].
     pub fn decode_index(&mut self, ichan: u16) -> [f64; FRAME_LEN] {
         let exc = ExcitationVector::from_channel_index(ichan);
         self.synth.filter_vector(&exc)
     }
 
-    /// Borrow the synthesiser (useful for tests and for the future
-    /// backward-adapter wiring).
+    /// Decode one channel index into one [`FRAME_LEN`]-sample PCM
+    /// vector through the **full** block 29 → 30 → 31 → 32 → 33 chain.
+    ///
+    /// Order of operations (per Figure 3/G.728, §3 and §5.14):
+    ///
+    /// 1. Look up the gain-codebook entry `σ(n)` via the backward
+    ///    vector gain adapter (block 30) from the previous vector's
+    ///    gain-scaled excitation.
+    /// 2. Look up the shape codevector via block 29 (`y_j`).
+    /// 3. Scale: `ET(n) = σ(n) · y_j` (block 31).
+    /// 4. Run the 50th-order synthesis filter (block 32) using the
+    ///    most recently produced bandwidth-expanded predictor from
+    ///    the synthesis adapter (block 33).
+    /// 5. Push the decoded vector into the adapter's rolling
+    ///    quantised-speech buffer; once a full adaptation cycle of
+    ///    NFRSZ = 20 samples is accumulated, run the synthesis
+    ///    adapter to produce the next cycle's predictor.
+    pub fn decode_vector(&mut self, ichan: u16) -> [f64; FRAME_LEN] {
+        // ----- Block 30: predict σ(n) from previous ET ---------------
+        let sigma = self.gain_adapter.predict_next(&self.et_prev);
+
+        // ----- Block 29: shape codevector lookup ---------------------
+        // ExcitationVector::from_channel_index pre-applies the gain-
+        // codebook scaling; we want the raw shape codevector only,
+        // because block 30 supplies σ(n) and block 31 multiplies it
+        // explicitly. So redo the lookup unscaled here.
+        let ichan_masked = (ichan & 0x03FF) as usize;
+        let is_index = ichan_masked / consts::NG;
+        let y_row = &tables::Y_Q11[is_index];
+        let mut et = [0.0f64; FRAME_LEN];
+        for k in 0..FRAME_LEN {
+            // Annex B: divide by 2^11 to obtain float; then multiply
+            // by σ(n) per block 31.
+            et[k] = sigma * (y_row[k] as f64 / 2_048.0);
+        }
+
+        // ----- Block 32: synthesis filter ---------------------------
+        // Use the most recently produced predictor from block 33.
+        self.synth.set_predictor(*self.synth_adapter.coefficients());
+        let exc = ExcitationVector(et);
+        let out = self.synth.filter_vector(&exc);
+
+        // ----- Block 33 preparation: accumulate quantised speech ----
+        // STTMP for the next call is the rolling buffer of decoded
+        // speech vectors. We push the current output and, once a full
+        // NFRSZ-sample cycle is accumulated, run the synthesis
+        // adapter to produce a refreshed predictor for the next cycle.
+        for k in 0..FRAME_LEN {
+            self.sttmp_buf[self.sttmp_idx] = out[k];
+            self.sttmp_idx += 1;
+        }
+        if self.sttmp_idx >= consts::NFRSZ {
+            let _ = self.synth_adapter.adapt(&self.sttmp_buf);
+            self.sttmp_idx = 0;
+        }
+
+        // ----- Block 67 wrap-around: save ET for the next call -------
+        self.et_prev = et;
+
+        out
+    }
+
+    /// Borrow the synthesiser (useful for tests and audit).
     pub fn synthesizer(&self) -> &Synthesizer {
         &self.synth
+    }
+
+    /// Borrow the synthesis-filter adapter (useful for tests and
+    /// audit).
+    pub fn synthesis_adapter(&self) -> &SynthesisAdapter {
+        &self.synth_adapter
+    }
+
+    /// Borrow the gain adapter (useful for tests and audit).
+    pub fn gain_adapter(&self) -> &GainAdapter {
+        &self.gain_adapter
     }
 }
 
@@ -264,5 +378,62 @@ mod tests {
         for &s in dec.synthesizer().state() {
             assert_eq!(s, 0.0);
         }
+    }
+
+    // ---------- Block 29 → 30 → 31 → 32 → 33 chain (r195) -----------
+
+    #[test]
+    fn decode_vector_full_chain_runs_finite() {
+        // Drive the full block 29 → 33 chain over enough vectors to
+        // exercise at least three adaptation cycles (3 × 4 = 12
+        // vectors). Every output sample must be finite and within
+        // the saturation envelope.
+        let mut dec = Decoder::new();
+        for i in 0..16u16 {
+            let ichan = (i * 31) & 0x03FF;
+            let out = dec.decode_vector(ichan);
+            assert_eq!(out.len(), FRAME_LEN);
+            for &v in &out {
+                assert!(v.is_finite(), "decode_vector produced NaN/Inf");
+                assert!(
+                    v.abs() <= DEFAULT_MAX,
+                    "decode_vector escaped saturation envelope"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decode_vector_drives_gain_adapter_state() {
+        // After enough vectors the gain adapter's GSTATE memory must
+        // diverge from the initial -32 dB filler (the Table 2 init).
+        let mut dec = Decoder::new();
+        for i in 0..20u16 {
+            // Use mid-codebook indices so the excitation is large
+            // enough to flow through ETRMS away from the clamp.
+            dec.decode_vector(((i + 1) * 13) & 0x03FF);
+        }
+        let gstate = dec.gain_adapter().gstate();
+        assert!(
+            gstate
+                .iter()
+                .any(|&v| (v - gain_adapter::GSTATE_INIT_DB).abs() > 1e-6),
+            "GSTATE should have diverged from initial -32 dB after 20 vectors; got {:?}",
+            gstate
+        );
+    }
+
+    #[test]
+    fn decode_vector_runs_synthesis_adapter_each_full_cycle() {
+        // After NUPDATE = 4 vectors a full STTMP cycle is collected
+        // and the synthesis adapter should have produced a new
+        // predictor (or kept the previous on Levinson failure).
+        // Either way the leading tap A(1) must equal 1.0.
+        let mut dec = Decoder::new();
+        for i in 0..(consts::NUPDATE as u16 * 3) {
+            dec.decode_vector(((i + 7) * 19) & 0x03FF);
+        }
+        let a = dec.synthesis_adapter().coefficients();
+        assert_eq!(a[0], 1.0, "block-33 must preserve A(1) = 1");
     }
 }
