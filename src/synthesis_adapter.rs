@@ -34,6 +34,16 @@ use crate::hybrid_window::{HybridWindow, HybridWindowState};
 use crate::levinson::{levinson_durbin, LevinsonError};
 use crate::tables::{facv_f64, wnr_f64, FACV_Q14, Q14};
 
+/// Order at which the synthesis-filter Levinson recursion is stopped to
+/// extract the postfilter's `ã_1..ã_10` by-products and the first
+/// reflection coefficient `k1` (decode-trace §7.2, base spec §4.6 last
+/// paragraph: "the 10 coefficients `ã_i` and the first reflection
+/// coefficient `k1` … the recursion is stopped at order 10, `k1` and
+/// `ã_1..ã_10` copied, then resumed to order 50"). The value matches
+/// the log-gain predictor order [`crate::consts::LPCLG`] coincidentally
+/// — they are independent quantities in the spec.
+pub const PF_LPC_ORDER: usize = 10;
+
 /// Static (table-derived) parameters for the synthesis-filter
 /// hybrid window. Constructed once per adapter; passed by reference to
 /// the per-cycle [`SynthesisAdapter::adapt`] call.
@@ -58,6 +68,12 @@ impl SynthCfg {
 /// the most recently produced bandwidth-expanded predictor. The
 /// predictor is in spec `A` layout: `coefficients()[0] = 1.0`,
 /// `coefficients()[i] = -aᵢ` for `1 ≤ i ≤ LPC`.
+///
+/// On every successful adaptation the adapter also caches the **order-10
+/// by-product** Levinson result `ã_1..ã_10` (re-run on the same RTMP)
+/// and the first reflection coefficient `k1`. These feed the short-term
+/// postfilter (block 72); see [`SynthesisAdapter::order10_predictor`]
+/// and [`SynthesisAdapter::k1`].
 #[derive(Debug)]
 pub struct SynthesisAdapter {
     cfg: SynthCfg,
@@ -67,6 +83,17 @@ pub struct SynthesisAdapter {
     /// at construction time so the adapter is safe to read from before
     /// any speech has been pushed.
     last_predictor: [f64; LPC + 1],
+    /// Most recently computed order-10 by-product predictor in our
+    /// canonical Levinson `A` layout: `[1.0, a_1, …, a_{10}]`. The
+    /// spec's `ã_i` (predictor convention `s(n) ≈ Σ ã_i s(n-i)`) maps
+    /// to `-a_i` of this array. No bandwidth expansion has been
+    /// applied. Defaults to the all-pass predictor.
+    last_order10: [f64; PF_LPC_ORDER + 1],
+    /// First reflection coefficient `k1 = -R(2)/R(1)` of the most
+    /// recently processed RTMP (the spec's "first reflection
+    /// coefficient" copied at the order-10 break point). Defaults to
+    /// `0.0` (synthesis filter is the identity before any adaptation).
+    last_k1: f64,
 }
 
 impl Default for SynthesisAdapter {
@@ -87,10 +114,15 @@ impl SynthesisAdapter {
         let mut last_predictor = [0.0f64; LPC + 1];
         last_predictor[0] = 1.0;
 
+        let mut last_order10 = [0.0f64; PF_LPC_ORDER + 1];
+        last_order10[0] = 1.0;
+
         Self {
             cfg,
             hw_state,
             last_predictor,
+            last_order10,
+            last_k1: 0.0,
         }
     }
 
@@ -108,6 +140,32 @@ impl SynthesisAdapter {
     /// `set_predictor` with an owned copy.
     pub fn coefficients(&self) -> &[f64; LPC + 1] {
         &self.last_predictor
+    }
+
+    /// Most recently computed **order-10 by-product** predictor.
+    ///
+    /// Layout matches our Levinson convention: `[1.0, a_1, …, a_{10}]`
+    /// such that the polynomial `A(z) = 1 + Σ a_i z^{-i}` is the
+    /// order-10 LPC inverse filter from the same RTMP autocorrelation
+    /// the order-50 predictor in [`Self::coefficients`] was derived
+    /// from. **No bandwidth expansion has been applied.** The spec's
+    /// `ã_i` (predictor sense `s(n) ≈ Σ ã_i s(n-i)`) is therefore
+    /// `-a_i` of this array.
+    ///
+    /// Used by the short-term postfilter (block 72, §4.6) to derive
+    /// `b̄_i = ã_i · SPFZCF^i` and `ā_i = ã_i · SPFPCF^i` after
+    /// bandwidth expansion.
+    pub fn order10_predictor(&self) -> &[f64; PF_LPC_ORDER + 1] {
+        &self.last_order10
+    }
+
+    /// First reflection coefficient `k_1 = −R(2)/R(1)` of the most
+    /// recently processed RTMP autocorrelation.
+    ///
+    /// Used by the short-term postfilter for the tilt-compensation
+    /// factor `µ = TILTF · k_1` (block 72, §4.6, eq. 4-5).
+    pub fn k1(&self) -> f64 {
+        self.last_k1
     }
 
     /// Process one adaptation cycle of quantised-speech samples
@@ -138,6 +196,42 @@ impl SynthesisAdapter {
         let mut atmp = vec![0.0f64; LPC + 1];
         levinson_durbin(&rtmp, &mut atmp, LPC)?;
 
+        // ----- Block 50 by-product: order-10 predictor + k1 ------------
+        //
+        // Decode trace §7.2 (and base spec §4.6 last paragraph): the
+        // postfilter consumes the 10 coefficients `ã_i` and the first
+        // reflection coefficient `k1` produced at the order-10 break
+        // point of this same Levinson. The spec's optimisation is to
+        // copy them off mid-recursion and resume to order 50; here we
+        // simply re-run a self-contained order-10 Levinson on the
+        // SAME RTMP. Since the recursion is deterministic and the
+        // RTMP unchanged, the order-10 output coefficients are
+        // bit-identical to what the embedded copy-off would yield.
+        // The runtime cost is negligible compared to the order-50
+        // recursion and the alternative would require an unrelated
+        // refactor of `levinson_durbin` to surface intermediate
+        // state. Only commit on success — preserves the spec's
+        // "keep previous predictor" semantics on failure.
+        //
+        // `k1 = -R(2)/R(1)` is the canonical first reflection
+        // coefficient (Levinson's first iteration `rc[0]`). We
+        // compute it explicitly here so that future callers can read
+        // it even when the order-10 recursion would otherwise drop
+        // it after the second iteration overwrites `a[1]`.
+        // The order-50 Levinson above already passed the R(1) > 0
+        // guard; the order-10 sub-recursion shares that opener so the
+        // only failure mode unique to it is R(11) = 0 (trailing-zero
+        // at order 10 even when order 50 is fine — rare but possible).
+        // On order-10 failure we keep the previous cache, matching the
+        // spec's "skip block 51" intent at the postfilter scale.
+        let mut atmp10 = [0.0f64; PF_LPC_ORDER + 1];
+        let order10_ok = levinson_durbin(&rtmp[..=PF_LPC_ORDER], &mut atmp10, PF_LPC_ORDER).is_ok();
+        let k1 = if rtmp[0] > 0.0 {
+            -rtmp[1] / rtmp[0]
+        } else {
+            0.0
+        };
+
         // ----- Block 51: bandwidth expansion --------------------------
         // | For I = 2,3,...,LPC+1: ATMP(I) = FACV(I) * ATMP(I)
         //
@@ -153,6 +247,14 @@ impl SynthesisAdapter {
         // `Wait until ICOUNT = 3, then A(I) = ATMP(I)` step — in our
         // batched cycle model the wait collapses to "now").
         self.last_predictor[..=LPC].copy_from_slice(&atmp[..=LPC]);
+        // Commit the order-10 by-product (un-expanded) and k1 for the
+        // postfilter to consume. Only commit on success — preserves the
+        // postfilter's "keep previous coefficients" semantics that
+        // mirror the spec's order-50 rule.
+        if order10_ok {
+            self.last_order10.copy_from_slice(&atmp10);
+            self.last_k1 = k1;
+        }
 
         Ok(&self.last_predictor)
     }
@@ -180,6 +282,18 @@ mod tests {
         let a = adapter.coefficients();
         assert_eq!(a[0], 1.0);
         assert!(a[1..].iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn fresh_adapter_has_allpass_order10_byproduct() {
+        // Pre-adapt the order-10 by-product should match the
+        // all-pass shape (leading 1, rest zero) and `k1 = 0` (no
+        // RTMP yet).
+        let adapter = SynthesisAdapter::new();
+        let a10 = adapter.order10_predictor();
+        assert_eq!(a10[0], 1.0);
+        assert!(a10[1..].iter().all(|&v| v == 0.0));
+        assert_eq!(adapter.k1(), 0.0);
     }
 
     #[test]
@@ -212,6 +326,61 @@ mod tests {
         let a = adapter.coefficients();
         assert_eq!(a[0], 1.0);
         assert!(a[1..].iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn nonzero_input_produces_order10_byproduct_with_a1_eq_unity() {
+        // After a few successful adaptation cycles on a non-trivial
+        // signal, the order-10 by-product must (a) preserve the
+        // A(1) = 1 invariant, (b) carry non-zero taps somewhere in
+        // a_1..a_10, and (c) have a non-zero k1 (the input is not
+        // white, so R(2) is not zero).
+        let mut adapter = SynthesisAdapter::new();
+        let mut input = [0.0f64; NFRSZ];
+        for k in 0..NFRSZ {
+            let t = k as f64;
+            input[k] = 100.0 * (0.4 * t).sin() + 50.0 * (0.9 * t).cos() + (t * 13.0).fract();
+        }
+        let mut success = false;
+        for _ in 0..6 {
+            if adapter.adapt(&input).is_ok() {
+                success = true;
+            }
+        }
+        assert!(success);
+        let a10 = adapter.order10_predictor();
+        assert_eq!(a10[0], 1.0, "A(1) = 1 invariant");
+        assert!(
+            a10[1..].iter().any(|&v| v != 0.0),
+            "expected non-zero order-10 taps after non-trivial input"
+        );
+        assert_ne!(adapter.k1(), 0.0, "k1 should be non-zero for AR signal");
+    }
+
+    #[test]
+    fn order10_byproduct_k1_matches_levinson_first_iter_convention() {
+        // The first reflection coefficient `k1 = -R(2)/R(1)` is the
+        // canonical Levinson opener. For an AR(1) test signal we know
+        // the closed-form: r[k] = ρ^|k|, so `k1 = -ρ` regardless of
+        // the final recursion order. We don't drive the synthesis
+        // adapter through a real cycle (its hybrid window doesn't
+        // produce a clean AR(1) RTMP from short inputs); instead we
+        // run a synthetic check on the public k1 / order10 layout
+        // by driving the adapter with smoothly correlated speech and
+        // checking that |k1| ≤ 1.
+        let mut adapter = SynthesisAdapter::new();
+        let mut input = [0.0f64; NFRSZ];
+        for k in 0..NFRSZ {
+            input[k] = 100.0 * (0.3 * k as f64).sin();
+        }
+        for _ in 0..4 {
+            let _ = adapter.adapt(&input);
+        }
+        // Reflection coefficients of a valid AR process are in (-1, 1);
+        // outside that range means the autocorrelation is not positive
+        // semidefinite, which Levinson would have flagged.
+        let k1 = adapter.k1();
+        assert!(k1.abs() < 1.0, "|k1| = {} should be < 1", k1.abs());
     }
 
     #[test]

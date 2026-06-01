@@ -2,7 +2,7 @@
 
 Pure-Rust ITU-T G.728 Low-Delay CELP (LD-CELP, 16 kbit/s) speech codec.
 
-## Status: clean-room rebuild — autonomous decoder + postfilter AGC tail (round 201)
+## Status: clean-room rebuild — autonomous decoder + short-term postfilter + AGC (round 207)
 
 The crate was reset to a register-only scaffold under the workspace
 clean-room policy (round 171, master `14e3bad`): the previous
@@ -49,8 +49,37 @@ without a caller-supplied predictor:
   `set_synthesis_predictor` hooks are preserved for the register-
   only path.
 
-Round 201 adds the **AGC tail of the postfilter** (blocks 73 / 74 / 75
-/ 76 / 77 of Figure 7/G.728):
+Round 207 adds the **short-term (spectral) postfilter** (block 72 of
+Figure 7/G.728):
+
+- **`ShortTermPostfilter` — block 72.** New module transcribes the
+  spec's `H_s(z) = (1 − Σ b̄_i z⁻ⁱ) / (1 − Σ ā_i z⁻ⁱ) · (1 + µ·z⁻¹)`
+  cascade (eq. 4-2..4-5). The bandwidth-expanded coefficients are
+  derived from the synthesis-filter Levinson recursion's **order-10
+  by-products** `ã_1..ã_10` (eq. 4-3..4-4 with `SPFZCF = 0.65`,
+  `SPFPCF = 0.75`) and the **first reflection coefficient `k1`** for
+  the tilt-compensation factor `µ = TILTF · k1 = 0.15·k1` (eq. 4-5).
+- **Order-10 by-product extraction** — `SynthesisAdapter::adapt`
+  now also runs an order-10 Levinson on the same RTMP autocorrelation
+  used for the order-50 synthesis predictor and caches `ã_1..ã_10`
+  + `k1` for the postfilter to consume. Exposed via
+  `SynthesisAdapter::order10_predictor()` and `::k1()`.
+- **`Decoder::decode_vector_postfiltered(ichan)` is now live.** It
+  runs the full decode chain, refreshes the short-term postfilter
+  coefficients at the first vector of each adaptation cycle, filters
+  `sd → sf` through `H_s(z)`, then runs the AGC against the real
+  `sd, sf` pair. The §4.6.1 "postfilter off" path is still the
+  cold-start fallback (all coefficients zero → identity; AGC stays at
+  SCALEFIL = 1) until the first cycle commits a non-trivial Levinson
+  result.
+- The long-term (block 71) pitch postfilter still follows §4.6.1
+  (`b = 0`, `g_l = 1`) because the block-81..85 pitch-extraction
+  front end is not yet implemented. When it lands, the long-term
+  filter slots in between `decode_vector` and `short_term_pf.filter_vector`
+  with no changes to the AGC stage.
+
+Round 201 (preserved) adds the **AGC tail of the postfilter** (blocks
+73 / 74 / 75 / 76 / 77 of Figure 7/G.728):
 
 - **`Agc` — blocks 73–77.** New standalone type transcribes the
   per-vector Σ|sd| / Σ|sf| ratio (blocks 73 / 74 / 75), the
@@ -83,13 +112,17 @@ order-parameterised Levinson-Durbin recursion, and the
 
 ## What is NOT yet wired up
 
-- Long-term postfilter (block 71) and short-term postfilter (block 72)
-  and their per-frame coefficient calculators (§4.7 blocks 81–85,
-  pitch extraction + LPC by-product). The AGC tail (blocks 73–77)
-  landed in r201 and acts as a §4.6.1 passthrough until 71 / 72
-  arrive. The Annex C postfilter bandwidth vectors and the Annex D
-  1 kHz prefilter coefficients are already in `tables/` for that
-  round.
+- Long-term (pitch) postfilter (block 71) and its block-81..85 pitch-
+  extraction front end (§4.7: 10th-order LPC residual via the inverse
+  filter Ã(z), Annex D 1 kHz lowpass + 4:1 decimate, coarse
+  correlation search over lags 5..35, full-resolution refinement
+  4τ−3..4τ+3, fundamental-vs-multiple resolution against the previous
+  frame's pitch, single-tap predictor weight β and `g_l = 1/(1+b)`,
+  `b = 0.15·β` clamped per eq. 4-13/4-14). With block 71 absent the
+  current code follows the §4.6.1 "long-term postfilter off" rule —
+  `b = 0`, `g_l = 1`, the long-term filter is the identity. The
+  short-term postfilter (block 72) and the AGC tail (blocks 73–77)
+  are wired up.
 - A-law / µ-law PCM I/O — `oxideav-g711` handles this per §5.3 / §3.1.
 - The encoder side (blocks 1..28 + 67..70 + the codebook search of
   §3.9 / blocks 12..18). The decoder-side synthesis-filter adapter
@@ -106,20 +139,24 @@ Every numeric value lives in `src/tables.rs` and is transcribed
 directly from the integer columns of Annexes A, B, C, D in the
 ITU-T G.728 1992-09 PDF that lives under `docs/audio/g728/`. Every
 control-flow line in the `hybrid_window`, `synthesis_adapter`,
-`gain_adapter` and `agc` modules carries a comment pointing at the
-spec's §5.6 / §5.7 / §4.6 pseudocode for blocks 36/43/49 (hybrid
-window), 50 (Levinson — already in `levinson.rs`), 51 / 45
-(bandwidth expansion), 67/39/40/42/46/47/48 (the per-vector gain
-chain) and 73/74/75/76/77 (the AGC tail with the lowpass form
-spelled out in §4.6 immediately after eq. 4-5). No external
-implementation source has been opened or consulted during this
-rebuild — the per-test cross-checks (peak Q15 values, AR(1)
-predictor round-trip, `λⁱ` geometric progression, codebook row
-spot-checks, ICOUNT cycle ordering, limiter clamp bounds, first-
-vector σ(n) = 10^(GOFF/20), AGC unity-DC convergence + AGCFAC
-geometric decay + §4.6.1 passthrough lockstep against
-`decode_vector`) act as in-repo audit anchors against transcription
-typos.
+`gain_adapter`, `short_term_postfilter` and `agc` modules carries a
+comment pointing at the spec's §5.6 / §5.7 / §4.6 pseudocode for
+blocks 36/43/49 (hybrid window), 50 (Levinson — already in
+`levinson.rs`), 51 / 45 (bandwidth expansion), 67/39/40/42/46/47/48
+(the per-vector gain chain), 72 (short-term postfilter pole-zero +
+tilt cascade with `SPFZCF / SPFPCF / TILTF` and the `ã_i = -a_i`
+sign-convention flip spelled out in `short_term_postfilter.rs`),
+and 73/74/75/76/77 (the AGC tail with the lowpass form spelled
+out in §4.6 immediately after eq. 4-5). No external implementation
+source has been opened or consulted during this rebuild — the
+per-test cross-checks (peak Q15 values, AR(1) predictor round-trip,
+`λⁱ` geometric progression, codebook row spot-checks, ICOUNT cycle
+ordering, limiter clamp bounds, first-vector σ(n) = 10^(GOFF/20),
+AGC unity-DC convergence + AGCFAC geometric decay, postfilter
+identity at cold start + non-identity divergence after the first
+adaptation cycle + bandwidth-expansion `ã_i · λ^i` invariants +
+tilt `µ = TILTF · k1` invariant) act as in-repo audit anchors
+against transcription typos.
 
 ## License
 

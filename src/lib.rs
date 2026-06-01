@@ -38,13 +38,19 @@
 //!   walks block 29 → 30 → 31 → 32 → 33 per Figure 3/G.728.
 //!
 //! Round 201 wires up the **AGC tail of the postfilter** (blocks
-//! 73 / 74 / 75 / 76 / 77) — see [`agc`] / [`Agc`]. The long-term
-//! (block 71) and short-term (block 72) postfilter coefficient
-//! calculators are not yet implemented, so
-//! [`Decoder::decode_vector_postfiltered`] runs the AGC against
-//! `sf = sd` per §4.6.1 (the spec's "postfilter off / raw synthesis
-//! output" path). The AGC's state carry-over and decoder field
-//! layout are already in place for blocks 71 / 72 to slot in.
+//! 73 / 74 / 75 / 76 / 77) — see [`agc`] / [`Agc`].
+//!
+//! Round 207 wires up the **short-term (spectral) postfilter**
+//! (block 72) — see [`short_term_postfilter`] / [`ShortTermPostfilter`].
+//! The coefficients are derived from the order-10 by-product of the
+//! synthesis-filter Levinson recursion (`ã_1..ã_10` with bandwidth
+//! expansion by `SPFZCF^i` / `SPFPCF^i`) plus the tilt-compensation
+//! `µ = TILTF · k1` from the same RTMP's first reflection
+//! coefficient. They refresh at the first vector of every adaptation
+//! cycle (§7.2). [`Decoder::decode_vector_postfiltered`] runs the
+//! full block 32 → 72 → 73..77 chain; the long-term (block 71) pitch
+//! postfilter is still on the §4.6.1 "off" path (`b = 0`, `g_l = 1`)
+//! pending its block-81..85 pitch-extraction front end.
 //!
 //! Round 189 (preserved) provides the Annex A.1/A.2/A.3 hybrid
 //! windows, the Annex B excitation codebook (128 × 5 shape + 8
@@ -55,12 +61,12 @@
 //!
 //! ## What is NOT yet wired up
 //!
-//! * **Long-term (block 71) and short-term (block 72) postfilter
-//!   coefficient calculators.** The AGC tail (blocks 73–77) is now in
-//!   place; the pitch-extraction front end (§4.7 blocks 81–85) and the
-//!   per-frame coefficient updates still need to land before
-//!   `decode_vector_postfiltered` does anything more than a §4.6.1
-//!   pass-through.
+//! * **Long-term (block 71) pitch postfilter and its block-81..85
+//!   pitch-extraction front end (§4.7).** The short-term postfilter
+//!   (block 72) and AGC tail (blocks 73–77) are wired up; the long-
+//!   term filter follows the §4.6.1 "long-term off" rule (`b = 0`,
+//!   `g_l = 1`) until the residual / lowpass-decimate / coarse +
+//!   refined correlation search lands.
 //! * **PCM format conversion (blocks 1, 28).** A-law / µ-law I/O is
 //!   delegated to `oxideav-g711` per §5.3 / §3.1.
 //! * **Encoder.** The encoder side will come once the decoder runs
@@ -96,6 +102,7 @@ pub mod decoder;
 pub mod gain_adapter;
 pub mod hybrid_window;
 pub mod levinson;
+pub mod short_term_postfilter;
 pub mod synthesis_adapter;
 pub mod tables;
 
@@ -104,6 +111,7 @@ pub use decoder::{pack_channel_index, ExcitationVector, Synthesizer, DEFAULT_MAX
 pub use gain_adapter::GainAdapter;
 pub use hybrid_window::{HybridWindow, HybridWindowState};
 pub use levinson::{levinson_durbin, LevinsonError};
+pub use short_term_postfilter::ShortTermPostfilter;
 pub use synthesis_adapter::SynthesisAdapter;
 
 /// Crate-local error type.
@@ -166,13 +174,16 @@ pub struct Decoder {
     /// Backward vector gain adapter (block 30). Updated every vector;
     /// produces `σ(n)` consumed by the block-31 gain scaling step.
     gain_adapter: GainAdapter,
-    /// Output gain control (blocks 73–77). Always present; in the
-    /// current build the long-term + short-term postfilter stages
-    /// (blocks 71 / 72) are not yet wired up, so [`Decoder::
-    /// decode_vector_postfiltered`] feeds `sd` to the AGC as both
-    /// `sd` and `sf` per the §4.6.1 "postfilter off" path. When
-    /// postfilter coefficient calculation lands in a later round
-    /// this field starts receiving the real `sf` stream.
+    /// Short-term postfilter (block 72). Refreshed at the first
+    /// vector of each adaptation cycle from the synthesis adapter's
+    /// order-10 by-product + first reflection coefficient; runs
+    /// sample-by-sample inside [`Decoder::decode_vector_postfiltered`].
+    short_term_pf: ShortTermPostfilter,
+    /// Output gain control (blocks 73–77). Always present; the long-
+    /// term postfilter (block 71) is still on the §4.6.1 "off" path
+    /// pending its block-81..85 pitch-extraction front end. The
+    /// short-term postfilter (block 72) is live, so the AGC now sees
+    /// a real `sf` ≠ `sd` stream once any adaptation cycle has run.
     agc: Agc,
     /// Previous gain-scaled excitation vector `ET(1..IDIM)` — fed
     /// into block 67 / block 30 on the next vector. Initialised to
@@ -185,6 +196,11 @@ pub struct Decoder {
     /// Write cursor into `sttmp_buf`; when it reaches NFRSZ the
     /// adapter is run and the cursor resets.
     sttmp_idx: usize,
+    /// Vector index within the current adaptation cycle (0..NUPDATE).
+    /// Wraps at NUPDATE = 4. The short-term postfilter coefficients
+    /// refresh at the first vector of each cycle (icount == 0 here,
+    /// mapping to spec ICOUNT = 1).
+    icount: usize,
 }
 
 impl Default for Decoder {
@@ -203,10 +219,12 @@ impl Decoder {
             synth: Synthesizer::new(),
             synth_adapter: SynthesisAdapter::new(),
             gain_adapter: GainAdapter::new(),
+            short_term_pf: ShortTermPostfilter::new(),
             agc: Agc::new(),
             et_prev: [0.0; FRAME_LEN],
             sttmp_buf: [0.0; consts::NFRSZ],
             sttmp_idx: 0,
+            icount: 0,
         }
     }
 
@@ -295,26 +313,63 @@ impl Decoder {
     }
 
     /// Decode one channel index into one [`FRAME_LEN`]-sample PCM
-    /// vector with the **postfilter AGC stage** (blocks 73–77) applied
-    /// at the tail.
+    /// vector through the **short-term postfilter (block 72) + AGC
+    /// stage (blocks 73-77)** of Figure 7/G.728.
     ///
-    /// The long-term (block 71) and short-term (block 72) postfilter
-    /// stages are not yet wired up; per §4.6.1 the AGC is fed
-    /// `sf = sd`, which makes `GAINSF = 1` and reduces the AGC to a
-    /// no-op steady-state pass. When blocks 71 / 72 land in a later
-    /// round this entry point is where they slot in — the AGC state
-    /// (`SCALEFIL` carry-over) and field layout are already correct.
+    /// Per-vector dataflow:
     ///
-    /// Callers that want the bit-equivalent of [`Decoder::decode_vector`]
-    /// (no AGC, no postfilter coefficient updates) should keep using
-    /// [`Decoder::decode_vector`]; it is the §4.6.1 "postfilter
-    /// disabled" raw output of the synthesis filter.
+    /// 1. Run [`Decoder::decode_vector`] for `sd(n)` (block 32).
+    /// 2. If this is the first vector of an adaptation cycle, refresh
+    ///    the short-term postfilter coefficients from the synthesis
+    ///    adapter's order-10 by-product and first reflection
+    ///    coefficient (§7.2, eq. 4-3..4-5).
+    /// 3. Filter `sd(n)` through the short-term postfilter (block 72)
+    ///    to obtain `sf(n)`.
+    /// 4. Apply the AGC (blocks 73-77) with the spec's per-vector
+    ///    `Σ|sd|` / `Σ|sf|` ratio.
+    ///
+    /// The long-term (block 71) postfilter is still on the §4.6.1
+    /// "off" path (`b = 0`, `g_l = 1`) because the block-81..85 pitch
+    /// extraction front end is not yet implemented. Once it lands,
+    /// step 3 will wrap `sd` through the pitch postfilter first,
+    /// then the short-term postfilter — the AGC stage needs no
+    /// further changes.
+    ///
+    /// Callers that want the raw synthesis-filter output (no
+    /// postfilter, no AGC — exactly the §4.6.1 "postfilter off"
+    /// path) should keep using [`Decoder::decode_vector`].
     pub fn decode_vector_postfiltered(&mut self, ichan: u16) -> [f64; FRAME_LEN] {
+        // Step 1: raw synthesis-filter output (advances synth_adapter
+        // state when a full adaptation cycle is collected).
         let sd = self.decode_vector(ichan);
-        // §4.6.1 postfilter-off path: sf = sd. The AGC settles to
-        // SCALEFIL = 1 and acts as a passthrough until the postfilter
-        // coefficient stages land.
-        self.agc.apply(&sd, &sd)
+
+        // Step 2: refresh the short-term postfilter coefficients at
+        // the first vector of every adaptation cycle (§7.2: "updated
+        // at the first vector of each frame as soon as ã_i / k1 are
+        // available from the order-10 by-product"). Vectors are
+        // 0-indexed here; spec ICOUNT = 1 maps to icount = 0.
+        if self.icount == 0 {
+            self.short_term_pf.set_from_synthesis_byproduct(
+                self.synth_adapter.order10_predictor(),
+                self.synth_adapter.k1(),
+            );
+        }
+        self.icount = (self.icount + 1) % consts::NUPDATE;
+
+        // Step 3: short-term postfilter (block 72). At cold start,
+        // before any adaptation cycle has completed, all coefficients
+        // are zero and the filter is the identity (sf = sd) —
+        // matching the §4.6.1 "postfilter off" path. Once the first
+        // cycle commits, sf starts diverging from sd.
+        let sf = self.short_term_pf.filter_vector(&sd);
+
+        // Step 4: AGC (blocks 73-77).
+        self.agc.apply(&sd, &sf)
+    }
+
+    /// Borrow the short-term postfilter (useful for tests and audit).
+    pub fn short_term_postfilter(&self) -> &ShortTermPostfilter {
+        &self.short_term_pf
     }
 
     /// Borrow the AGC (useful for tests and audit).
@@ -475,27 +530,38 @@ mod tests {
     }
 
     // ---------- AGC tail (r201, blocks 73-77) -----------------------
+    // ---------- Short-term postfilter (r207, block 72) --------------
 
     #[test]
-    fn decode_vector_postfiltered_matches_decode_vector_in_pf_off_mode() {
-        // §4.6.1: with the postfilter disabled (sf = sd), the AGC
-        // converges to SCALEFIL = 1 and is a no-op. Two decoders run
-        // in lockstep — one via decode_vector, one via
-        // decode_vector_postfiltered — must agree exactly after the
-        // first vector (cold-start SCALEFIL = 1 makes the very first
-        // vector pass through unchanged too, modulo the IIR's tiny
-        // self-update with input GAINSF = 1 which keeps the state at
-        // 1.0 exactly).
+    fn decode_vector_postfiltered_cold_start_matches_decode_vector() {
+        // Before the first adaptation cycle commits (icount sweeps 0..3
+        // exactly NUPDATE times → first cycle commits at vector 4 in
+        // the 0-indexed view), the short-term postfilter coefficients
+        // are all zero (cold start) and `sf = sd`. The AGC's IIR with
+        // GAINSF = 1 keeps SCALEFIL = 1.0 exactly, so the postfiltered
+        // output equals the raw `decode_vector` output bit-for-bit
+        // for the first NUPDATE - 1 vectors.
+        //
+        // Vector 0: postfilter coefficients refreshed from the synth
+        // adapter (all-pass, k1 = 0 → all coefficients zero → identity).
+        // Vectors 0..3 (one full cycle): sf = sd, AGC passthrough.
+        // After vector 3 completes, the synth adapter has accumulated
+        // 4 vectors × 5 samples = 20 samples = NFRSZ; the next adapt()
+        // call commits a non-trivial predictor and the order-10
+        // by-product. The NEXT vector (4) then loads non-trivial
+        // postfilter coefficients and sf starts diverging from sd.
         let mut dec_a = Decoder::new();
         let mut dec_b = Decoder::new();
-        for i in 0..32u16 {
+        // First NUPDATE = 4 vectors: cold-start identity. We can
+        // assert equality on those.
+        for i in 0..consts::NUPDATE as u16 {
             let ichan = (i * 23) & 0x03FF;
             let raw = dec_a.decode_vector(ichan);
             let pf = dec_b.decode_vector_postfiltered(ichan);
             for k in 0..FRAME_LEN {
                 assert!(
                     (raw[k] - pf[k]).abs() < 1e-12,
-                    "vector {} sample {}: raw {} vs pf {} ({})",
+                    "cold-start vector {} sample {}: raw {} vs pf {} (diff {})",
                     i,
                     k,
                     raw[k],
@@ -507,17 +573,48 @@ mod tests {
     }
 
     #[test]
-    fn decode_vector_postfiltered_holds_scalefil_at_unity() {
-        // Direct invariant: with sf = sd the AGC IIR steady-state is
-        // GAINSF = 1, which keeps SCALEFIL pinned at 1.0 indefinitely.
+    fn decode_vector_postfiltered_diverges_from_raw_after_first_adaptation() {
+        // Once the synthesis adapter commits a non-trivial predictor
+        // (first cycle completes after NUPDATE = 4 vectors) the
+        // short-term postfilter gets non-zero coefficients and `sf`
+        // diverges from `sd`. The AGC then sees a non-unity GAINSF
+        // and starts gain-correcting. We confirm at least one sample
+        // differs measurably from the raw `decode_vector` output by
+        // vector 8 (well after the first cycle has committed).
+        let mut dec_a = Decoder::new();
+        let mut dec_b = Decoder::new();
+        let mut diverged = false;
+        for i in 0..16u16 {
+            // Use mid-range indices so the synth has enough signal to
+            // produce a non-trivial Levinson result.
+            let ichan = ((i + 1) * 17) & 0x03FF;
+            let raw = dec_a.decode_vector(ichan);
+            let pf = dec_b.decode_vector_postfiltered(ichan);
+            if i >= consts::NUPDATE as u16
+                && raw.iter().zip(&pf).any(|(&a, &b)| (a - b).abs() > 1e-6)
+            {
+                diverged = true;
+            }
+        }
+        assert!(
+            diverged,
+            "postfilter should produce non-identity output after first adaptation cycle"
+        );
+    }
+
+    #[test]
+    fn decode_vector_postfiltered_holds_scalefil_at_unity_in_cold_start() {
+        // During the cold-start cycle (the first NUPDATE vectors) the
+        // postfilter is the identity, GAINSF = 1, and SCALEFIL stays
+        // at 1.0 exactly.
         let mut dec = Decoder::new();
-        for i in 0..32u16 {
-            dec.decode_vector_postfiltered((i * 41) & 0x03FF);
+        for i in 0..consts::NUPDATE as u16 {
+            dec.decode_vector_postfiltered(i & 0x03FF);
         }
         assert_eq!(
             dec.agc().scalefil(),
             1.0,
-            "SCALEFIL must stay at 1.0 in §4.6.1 passthrough mode"
+            "SCALEFIL must stay at 1.0 during the cold-start cycle"
         );
     }
 
@@ -530,6 +627,29 @@ mod tests {
                 assert!(v.is_finite());
             }
         }
+    }
+
+    #[test]
+    fn decode_vector_postfiltered_coefficients_update_each_cycle() {
+        // After enough vectors to commit at least one adaptation
+        // cycle on an excited synthesis state, the postfilter's
+        // coefficient state should have diverged from the all-zero
+        // cold start. We use mid-codebook channel indices (the same
+        // pattern as `decode_vector_postfiltered_diverges_from_raw_*`)
+        // so the synthesis filter has enough excitation to drive a
+        // non-trivial Levinson result through the adapter.
+        let mut dec = Decoder::new();
+        for i in 0..(consts::NUPDATE as u16 * 4) {
+            dec.decode_vector_postfiltered(((i + 1) * 17) & 0x03FF);
+        }
+        let pf = dec.short_term_postfilter();
+        let any_nz = pf.numerator()[1..].iter().any(|&v| v != 0.0)
+            || pf.denominator()[1..].iter().any(|&v| v != 0.0)
+            || pf.tilt() != 0.0;
+        assert!(
+            any_nz,
+            "postfilter coefficients should be non-zero after >=1 cycle"
+        );
     }
 
     #[test]

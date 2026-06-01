@@ -6,6 +6,57 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Short-term (spectral) postfilter (block 72, Figure 7/G.728, r207)**
+  — new `ShortTermPostfilter` type transcribes the spec's
+  `H_s(z) = (1 − Σ b̄_i z⁻ⁱ) / (1 − Σ ā_i z⁻ⁱ) · (1 + µ·z⁻¹)` cascade
+  (eq. 4-2..4-5). Coefficient bandwidth expansion: `b̄_i = ã_i·SPFZCF^i`
+  (`SPFZCF = 0.65`), `ā_i = ã_i·SPFPCF^i` (`SPFPCF = 0.75`),
+  `µ = TILTF · k1` (`TILTF = 0.15`). The spec's `ã_i = -a_i` sign
+  flip is applied inside `set_from_synthesis_byproduct`; the
+  pole-zero + tilt filter cascade carries per-tap memory across
+  vector boundaries.
+- **Order-10 by-product extraction from the synthesis adapter** —
+  `SynthesisAdapter::adapt` runs a second Levinson on the first 11
+  entries of RTMP to produce `ã_1..ã_10`, and computes
+  `k1 = -R(2)/R(1)` directly. New accessors:
+  `SynthesisAdapter::order10_predictor()` and
+  `SynthesisAdapter::k1()`. On order-10 Levinson failure (R(11) = 0
+  case) the previous cache is retained, matching the spec's "skip
+  block 51" semantics at the postfilter scale. New public constant
+  `synthesis_adapter::PF_LPC_ORDER = 10`.
+- **`Decoder::decode_vector_postfiltered(ichan)` is now live.** Runs
+  the full block 29 → 33 chain, refreshes the short-term postfilter
+  coefficients at the first vector of each adaptation cycle (spec
+  ICOUNT = 1), filters `sd → sf` through `H_s(z)`, then runs the
+  AGC against the real `sd, sf` pair. The §4.6.1 "postfilter off"
+  path is the cold-start fallback (all coefficients zero → identity)
+  until the first cycle commits a non-trivial Levinson result.
+- **`Decoder::short_term_postfilter()` accessor** for tests and audit.
+- 15 new tests (`synthesis_adapter`: order-10 by-product all-pass
+  cold start, non-trivial-input order-10 with A(1) = 1 invariant,
+  `|k1| < 1` reflection-coefficient bound; `short_term_postfilter`:
+  fresh-filter identity, zero-coefficient cold-start invariants,
+  bandwidth-expansion `ã_i · λ^i` match for both pole and zero
+  arrays, `µ = TILTF · k1` invariant across signs, non-zero
+  coefficients change output, memory state advances per sample,
+  finite-output stability on synthetic speech, reset restores
+  identity, DC steady-state stays finite, zero-coefficient
+  passthrough for every input; `Decoder`-level: cold-start cycle
+  matches `decode_vector` exactly, post-cycle output diverges from
+  raw, SCALEFIL pinned at 1.0 during cold-start cycle, coefficients
+  update each cycle, finite-output stability over 64 vectors). Total
+  crate tests: 81 → 96.
+
+### Changed
+
+- `Decoder::decode_vector_postfiltered` semantics: previously a strict
+  §4.6.1 passthrough (sf = sd, GAINSF = 1, SCALEFIL pinned at 1.0).
+  Now: the cold-start cycle (first NUPDATE vectors before the
+  synthesis adapter commits) still matches `decode_vector` bit-for-bit,
+  but once a non-trivial Levinson result lands the short-term
+  postfilter coefficients refresh and `sf` diverges from `sd`. The
+  long-term (block 71) stage is still on §4.6.1.
+
 - **Output gain control / postfilter AGC tail (blocks 73 / 74 / 75 /
   76 / 77, Figure 7/G.728, r201)** — new `Agc` type transcribes the
   per-vector Σ|sd| / Σ|sf| ratio (blocks 73 / 74 / 75), the first-
