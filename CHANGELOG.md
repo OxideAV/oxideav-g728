@@ -6,6 +6,26 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Output gain control / postfilter AGC tail (blocks 73 / 74 / 75 /
+  76 / 77, Figure 7/G.728, r201)** — new `Agc` type transcribes the
+  per-vector Σ|sd| / Σ|sf| ratio (blocks 73 / 74 / 75), the first-
+  order lowpass `H(z) = 0.01 / (1 − 0.99·z⁻¹)` with `AGCFAC = 0.99`
+  (block 76), and the per-sample multiplication into the post-
+  filtered output (block 77). Includes the §4.6.1 "postfilter off"
+  passthrough path that pins `SCALEFIL` at `1.0` when `sf = sd`.
+- **`Decoder::decode_vector_postfiltered(ichan)`** — new entry that
+  runs the full block 29 → 33 chain followed by the AGC pass. Until
+  blocks 71 / 72 land it follows the §4.6.1 passthrough rule and is
+  provably equal to `decode_vector` (regression test
+  `decode_vector_postfiltered_matches_decode_vector_in_pf_off_mode`).
+- **`Decoder::agc()` accessor** for tests and audit.
+- 13 new tests (`agc` module: cold-start invariants, lowpass DC =
+  unity convergence, AGCFAC geometric decay, sf = sd passthrough,
+  zero-sf safe fallback, finite-output stability, reset, IIR
+  trajectory cross-check, drift-free steady-state; `Decoder`-level:
+  AGC pass equals raw decode in §4.6.1 mode, SCALEFIL stays at 1.0,
+  output finite). Total crate tests: 68 → 81.
+
 - **Backward synthesis-filter adapter (block 33)** — new
   `SynthesisAdapter` type wires the spec's three §5.6 sub-blocks
   (block 49 hybrid window → block 50 Levinson-Durbin → block 51

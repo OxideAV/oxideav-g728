@@ -2,7 +2,7 @@
 
 Pure-Rust ITU-T G.728 Low-Delay CELP (LD-CELP, 16 kbit/s) speech codec.
 
-## Status: clean-room rebuild — autonomous decoder pipeline (round 195)
+## Status: clean-room rebuild — autonomous decoder + postfilter AGC tail (round 201)
 
 The crate was reset to a register-only scaffold under the workspace
 clean-room policy (round 171, master `14e3bad`): the previous
@@ -49,6 +49,31 @@ without a caller-supplied predictor:
   `set_synthesis_predictor` hooks are preserved for the register-
   only path.
 
+Round 201 adds the **AGC tail of the postfilter** (blocks 73 / 74 / 75
+/ 76 / 77 of Figure 7/G.728):
+
+- **`Agc` — blocks 73–77.** New standalone type transcribes the
+  per-vector Σ|sd| / Σ|sf| ratio (blocks 73 / 74 / 75), the
+  first-order lowpass `H(z) = 0.01 / (1 − 0.99·z⁻¹)` with the spec's
+  `AGCFAC = 0.99` (block 76), and the per-sample multiplication into
+  the post-filtered output (block 77). The lowpass has unity DC gain
+  by construction, so a constant input ratio settles to the same
+  ratio at steady state — the property the AGC relies on.
+- **`Decoder::decode_vector_postfiltered(ichan)`** — new entry point
+  that runs the full block 29 → 33 chain and then the block 73–77
+  AGC pass. Until the long-term (block 71) and short-term (block 72)
+  postfilter coefficient calculators land, this entry follows the
+  §4.6.1 "postfilter disabled, raw synthesis output" path and feeds
+  `sf = sd` to the AGC; the AGC's IIR pins SCALEFIL at `1.0` and the
+  pass is provably a no-op (the regression test
+  `decode_vector_postfiltered_matches_decode_vector_in_pf_off_mode`
+  asserts exact equality with `decode_vector` across 32 vectors).
+- The Decoder field layout (`agc: Agc` always present) and the
+  `Agc::apply(&sd, &sf)` signature are already correct for blocks
+  71 / 72 to slot in: a future round drops the §4.6.1 passthrough,
+  feeds the real `sf` stream into `Agc::apply`, and the AGC stage
+  needs no further changes.
+
 Round 189 (preserved) provides the Annex A.1/A.2/A.3 hybrid windows,
 the full Annex B excitation codebook (128 × 5 shape + 8-level gain),
 the Annex C bandwidth-broadening vectors (Q14), the Annex D 1 kHz
@@ -58,11 +83,13 @@ order-parameterised Levinson-Durbin recursion, and the
 
 ## What is NOT yet wired up
 
-- The adaptive postfilter (blocks 71–77). Long-term + short-term +
-  AGC stages are perceptual; they do not affect bit-exact agreement
-  against the standard's reference decoded vectors. The Annex C
-  postfilter bandwidth vectors and the Annex D 1 kHz prefilter
-  coefficients are already in `tables/` for that round.
+- Long-term postfilter (block 71) and short-term postfilter (block 72)
+  and their per-frame coefficient calculators (§4.7 blocks 81–85,
+  pitch extraction + LPC by-product). The AGC tail (blocks 73–77)
+  landed in r201 and acts as a §4.6.1 passthrough until 71 / 72
+  arrive. The Annex C postfilter bandwidth vectors and the Annex D
+  1 kHz prefilter coefficients are already in `tables/` for that
+  round.
 - A-law / µ-law PCM I/O — `oxideav-g711` handles this per §5.3 / §3.1.
 - The encoder side (blocks 1..28 + 67..70 + the codebook search of
   §3.9 / blocks 12..18). The decoder-side synthesis-filter adapter
@@ -78,17 +105,21 @@ order-parameterised Levinson-Durbin recursion, and the
 Every numeric value lives in `src/tables.rs` and is transcribed
 directly from the integer columns of Annexes A, B, C, D in the
 ITU-T G.728 1992-09 PDF that lives under `docs/audio/g728/`. Every
-control-flow line in the new `hybrid_window`, `synthesis_adapter`
-and `gain_adapter` modules carries a comment pointing at the
-spec's §5.6 / §5.7 pseudocode for blocks 36/43/49 (hybrid window),
-50 (Levinson — already in `levinson.rs`), 51 / 45 (bandwidth
-expansion), and 67/39/40/42/46/47/48 (the per-vector gain chain).
-No external implementation source has been opened or consulted
-during this rebuild — the per-test cross-checks (peak Q15 values,
-AR(1) predictor round-trip, `λⁱ` geometric progression, codebook
-row spot-checks, ICOUNT cycle ordering, limiter clamp bounds,
-first-vector σ(n) = 10^(GOFF/20)) act as in-repo audit anchors
-against transcription typos.
+control-flow line in the `hybrid_window`, `synthesis_adapter`,
+`gain_adapter` and `agc` modules carries a comment pointing at the
+spec's §5.6 / §5.7 / §4.6 pseudocode for blocks 36/43/49 (hybrid
+window), 50 (Levinson — already in `levinson.rs`), 51 / 45
+(bandwidth expansion), 67/39/40/42/46/47/48 (the per-vector gain
+chain) and 73/74/75/76/77 (the AGC tail with the lowpass form
+spelled out in §4.6 immediately after eq. 4-5). No external
+implementation source has been opened or consulted during this
+rebuild — the per-test cross-checks (peak Q15 values, AR(1)
+predictor round-trip, `λⁱ` geometric progression, codebook row
+spot-checks, ICOUNT cycle ordering, limiter clamp bounds, first-
+vector σ(n) = 10^(GOFF/20), AGC unity-DC convergence + AGCFAC
+geometric decay + §4.6.1 passthrough lockstep against
+`decode_vector`) act as in-repo audit anchors against transcription
+typos.
 
 ## License
 

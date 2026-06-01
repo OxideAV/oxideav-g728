@@ -37,6 +37,15 @@
 //! * **`Decoder::decode_vector`** — autonomous decode path that
 //!   walks block 29 → 30 → 31 → 32 → 33 per Figure 3/G.728.
 //!
+//! Round 201 wires up the **AGC tail of the postfilter** (blocks
+//! 73 / 74 / 75 / 76 / 77) — see [`agc`] / [`Agc`]. The long-term
+//! (block 71) and short-term (block 72) postfilter coefficient
+//! calculators are not yet implemented, so
+//! [`Decoder::decode_vector_postfiltered`] runs the AGC against
+//! `sf = sd` per §4.6.1 (the spec's "postfilter off / raw synthesis
+//! output" path). The AGC's state carry-over and decoder field
+//! layout are already in place for blocks 71 / 72 to slot in.
+//!
 //! Round 189 (preserved) provides the Annex A.1/A.2/A.3 hybrid
 //! windows, the Annex B excitation codebook (128 × 5 shape + 8
 //! gain), the Annex C bandwidth-broadening vectors (Q14), the
@@ -46,9 +55,12 @@
 //!
 //! ## What is NOT yet wired up
 //!
-//! * **Adaptive postfilter (blocks 71–77).** The postfilter is a
-//!   perceptual quality enhancement: it does not affect bit-exactness
-//!   against the standard's reference output, so it lands later.
+//! * **Long-term (block 71) and short-term (block 72) postfilter
+//!   coefficient calculators.** The AGC tail (blocks 73–77) is now in
+//!   place; the pitch-extraction front end (§4.7 blocks 81–85) and the
+//!   per-frame coefficient updates still need to land before
+//!   `decode_vector_postfiltered` does anything more than a §4.6.1
+//!   pass-through.
 //! * **PCM format conversion (blocks 1, 28).** A-law / µ-law I/O is
 //!   delegated to `oxideav-g711` per §5.3 / §3.1.
 //! * **Encoder.** The encoder side will come once the decoder runs
@@ -78,6 +90,7 @@
 
 use oxideav_core::RuntimeContext;
 
+pub mod agc;
 pub mod consts;
 pub mod decoder;
 pub mod gain_adapter;
@@ -86,6 +99,7 @@ pub mod levinson;
 pub mod synthesis_adapter;
 pub mod tables;
 
+pub use agc::Agc;
 pub use decoder::{pack_channel_index, ExcitationVector, Synthesizer, DEFAULT_MAX, FRAME_LEN};
 pub use gain_adapter::GainAdapter;
 pub use hybrid_window::{HybridWindow, HybridWindowState};
@@ -152,6 +166,14 @@ pub struct Decoder {
     /// Backward vector gain adapter (block 30). Updated every vector;
     /// produces `σ(n)` consumed by the block-31 gain scaling step.
     gain_adapter: GainAdapter,
+    /// Output gain control (blocks 73–77). Always present; in the
+    /// current build the long-term + short-term postfilter stages
+    /// (blocks 71 / 72) are not yet wired up, so [`Decoder::
+    /// decode_vector_postfiltered`] feeds `sd` to the AGC as both
+    /// `sd` and `sf` per the §4.6.1 "postfilter off" path. When
+    /// postfilter coefficient calculation lands in a later round
+    /// this field starts receiving the real `sf` stream.
+    agc: Agc,
     /// Previous gain-scaled excitation vector `ET(1..IDIM)` — fed
     /// into block 67 / block 30 on the next vector. Initialised to
     /// zero per Table 2/G.728 (`ET` initial `0,0,...,0`).
@@ -181,6 +203,7 @@ impl Decoder {
             synth: Synthesizer::new(),
             synth_adapter: SynthesisAdapter::new(),
             gain_adapter: GainAdapter::new(),
+            agc: Agc::new(),
             et_prev: [0.0; FRAME_LEN],
             sttmp_buf: [0.0; consts::NFRSZ],
             sttmp_idx: 0,
@@ -269,6 +292,34 @@ impl Decoder {
         self.et_prev = et;
 
         out
+    }
+
+    /// Decode one channel index into one [`FRAME_LEN`]-sample PCM
+    /// vector with the **postfilter AGC stage** (blocks 73–77) applied
+    /// at the tail.
+    ///
+    /// The long-term (block 71) and short-term (block 72) postfilter
+    /// stages are not yet wired up; per §4.6.1 the AGC is fed
+    /// `sf = sd`, which makes `GAINSF = 1` and reduces the AGC to a
+    /// no-op steady-state pass. When blocks 71 / 72 land in a later
+    /// round this entry point is where they slot in — the AGC state
+    /// (`SCALEFIL` carry-over) and field layout are already correct.
+    ///
+    /// Callers that want the bit-equivalent of [`Decoder::decode_vector`]
+    /// (no AGC, no postfilter coefficient updates) should keep using
+    /// [`Decoder::decode_vector`]; it is the §4.6.1 "postfilter
+    /// disabled" raw output of the synthesis filter.
+    pub fn decode_vector_postfiltered(&mut self, ichan: u16) -> [f64; FRAME_LEN] {
+        let sd = self.decode_vector(ichan);
+        // §4.6.1 postfilter-off path: sf = sd. The AGC settles to
+        // SCALEFIL = 1 and acts as a passthrough until the postfilter
+        // coefficient stages land.
+        self.agc.apply(&sd, &sd)
+    }
+
+    /// Borrow the AGC (useful for tests and audit).
+    pub fn agc(&self) -> &Agc {
+        &self.agc
     }
 
     /// Borrow the synthesiser (useful for tests and audit).
@@ -421,6 +472,64 @@ mod tests {
             "GSTATE should have diverged from initial -32 dB after 20 vectors; got {:?}",
             gstate
         );
+    }
+
+    // ---------- AGC tail (r201, blocks 73-77) -----------------------
+
+    #[test]
+    fn decode_vector_postfiltered_matches_decode_vector_in_pf_off_mode() {
+        // §4.6.1: with the postfilter disabled (sf = sd), the AGC
+        // converges to SCALEFIL = 1 and is a no-op. Two decoders run
+        // in lockstep — one via decode_vector, one via
+        // decode_vector_postfiltered — must agree exactly after the
+        // first vector (cold-start SCALEFIL = 1 makes the very first
+        // vector pass through unchanged too, modulo the IIR's tiny
+        // self-update with input GAINSF = 1 which keeps the state at
+        // 1.0 exactly).
+        let mut dec_a = Decoder::new();
+        let mut dec_b = Decoder::new();
+        for i in 0..32u16 {
+            let ichan = (i * 23) & 0x03FF;
+            let raw = dec_a.decode_vector(ichan);
+            let pf = dec_b.decode_vector_postfiltered(ichan);
+            for k in 0..FRAME_LEN {
+                assert!(
+                    (raw[k] - pf[k]).abs() < 1e-12,
+                    "vector {} sample {}: raw {} vs pf {} ({})",
+                    i,
+                    k,
+                    raw[k],
+                    pf[k],
+                    (raw[k] - pf[k]).abs()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decode_vector_postfiltered_holds_scalefil_at_unity() {
+        // Direct invariant: with sf = sd the AGC IIR steady-state is
+        // GAINSF = 1, which keeps SCALEFIL pinned at 1.0 indefinitely.
+        let mut dec = Decoder::new();
+        for i in 0..32u16 {
+            dec.decode_vector_postfiltered((i * 41) & 0x03FF);
+        }
+        assert_eq!(
+            dec.agc().scalefil(),
+            1.0,
+            "SCALEFIL must stay at 1.0 in §4.6.1 passthrough mode"
+        );
+    }
+
+    #[test]
+    fn decode_vector_postfiltered_output_is_finite() {
+        let mut dec = Decoder::new();
+        for i in 0..64u16 {
+            let out = dec.decode_vector_postfiltered((i * 11) & 0x03FF);
+            for &v in &out {
+                assert!(v.is_finite());
+            }
+        }
     }
 
     #[test]
