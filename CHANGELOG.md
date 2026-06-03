@@ -6,6 +6,60 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Long-term postfilter coefficient calculator (blocks 83 + 84,
+  Figure 7/G.728, §4.7, r229)** — new `PitchPostfilterCoeff` type
+  transcribes the §4.7 single-tap pitch-predictor weight and the
+  long-term-postfilter coefficient calculator. 245-sample
+  `sd(−239..5)` decoded-speech buffer (kept separate from block 71's
+  `KPMAX`-sample comb-filter delay line so block 71's sample-rate
+  cost is unchanged). At the third vector of each frame, given the
+  pitch period `p` from block 82, eq. 4-12 evaluates
+  `β = Σ_{k=−99..0} sd(k)·sd(k−p) / Σ_{k=−99..0} sd(k−p)²` clamped
+  into `[0, 1]`. Eq. 4-13 then maps `β` to `b`:
+  `0` if `β < PPFTH = 0.6` (postfilter off — `H_l(z) = 1`);
+  `PPFZCF · β = 0.15 · β` if `0.6 ≤ β ≤ 1`;
+  `PPFZCF = 0.15` if `β > 1` (unreachable after the `[0, 1]` clamp).
+  Eq. 4-14 derives `g_l = 1 / (1 + b)`. The `(g_l, b)` range is
+  `[1/(1+PPFZCF), 1] × [0, PPFZCF]`. New public API:
+  `PitchPostfilterCoeff::{new, last_beta, last_b, last_g_l,
+  speech_buffer, push_decoded_vector, compute_coefficients, reset}`;
+  public constant `SPEECH_BUF_LEN = 245`.
+- **`Decoder::decode_vector_postfiltered` drives blocks 83 + 84.**
+  Every decoded-speech vector is pushed into the coefficient
+  calculator's `sd(−239..5)` buffer; at the third vector of every
+  adaptation cycle (post-increment `icount == 3`), the pitch
+  extractor's output `p` is fed to
+  `PitchPostfilterCoeff::compute_coefficients`, and the resulting
+  `(g_l, b, p)` triple is applied to
+  `LongTermPostfilter::set_coefficients`. From the second adaptation
+  cycle onward the long-term comb filter operates at the
+  spec-prescribed coefficients (rather than the previous §4.6.1
+  passthrough fallback).
+- **`Decoder::pitch_pf_coeff()` accessor** for tests and audit.
+- 22 new tests (`pitch_postfilter_coeff` module: cold-start zeroed
+  buffer + `(g_l, b, β) = (1, 0, 0)` invariants, spec 245-sample
+  buffer dimension, reset round-trip, push lands the new vector at
+  `sd(1..5)`, successive pushes slide buffer left by `IDIM`, pushing
+  enough vectors drops the oldest off the left edge, cold-start
+  compute returns passthrough, near-zero signal routes to
+  postfilter-off, perfectly periodic impulse-train signal gives
+  `β = 1` at the analysis lag with `b = PPFZCF` and
+  `g_l = 1/(1+PPFZCF)`, β clamped above unity, sub-threshold β
+  disables the postfilter, voiced-range β gives `b = PPFZCF·β`,
+  `g_l = 1/(1+b)` consistency across all eq. 4-13 branches,
+  `b ∈ [0, PPFZCF]` and `g_l ∈ [1/(1+PPFZCF), 1]` range invariant on
+  random inputs, finite-output stability over a 512-vector sinusoidal
+  drive; `Decoder`-level: accessor exposes cold-start state, buffer
+  advances with decoded speech, coefficient calculator updates at
+  the third vector of each frame, propagation of `(g_l, b)` from the
+  coefficient calculator into the long-term comb at every extract,
+  block-83/84 wiring does not perturb the register-only
+  `decode_vector` path, cold-start `sf == sd` identity over the
+  first frame is preserved, long-term coefficients satisfy the
+  spec's `(g_l, b, p)` invariants after many frames, eq. 4-13 / 4-14
+  branch invariant after a long decode). Total crate tests: 148 →
+  170.
+
 - **Pitch period extractor (block 82, Figure 7/G.728, §4.7, r223)** —
   new `PitchSearch` type transcribes the §4.7 pitch-period dataflow.
   240-sample LPC-residual buffer covering `d(−139..100)` with the

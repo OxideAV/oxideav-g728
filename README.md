@@ -2,7 +2,7 @@
 
 Pure-Rust ITU-T G.728 Low-Delay CELP (LD-CELP, 16 kbit/s) speech codec.
 
-## Status: clean-room rebuild — autonomous decoder + long-term + short-term postfilter + AGC + block-81 pitch inverse filter + block-82 pitch period extractor (round 223)
+## Status: clean-room rebuild — autonomous decoder + full §4.7 pitch postfilter (blocks 81/82/83/84) + long-term comb + short-term postfilter + AGC (round 229)
 
 The crate was reset to a register-only scaffold under the workspace
 clean-room policy (round 171, master `14e3bad`): the previous
@@ -49,8 +49,44 @@ without a caller-supplied predictor:
   `set_synthesis_predictor` hooks are preserved for the register-
   only path.
 
-Round 223 lands the **second stage of the §4.7 pitch-extraction
-pipeline** — block 82, the pitch period extractor:
+Round 229 lands the **third and fourth stages of the §4.7
+pitch-extraction pipeline** — blocks 83 and 84:
+
+- **`PitchPostfilterCoeff` — blocks 83 + 84.** New module transcribes
+  the §4.7 single-tap pitch-predictor weight and the long-term
+  postfilter coefficient calculator. Block 83 maintains a 245-sample
+  `sd(−239..5)` decoded-speech buffer (separate from block 71's
+  `KPMAX`-sample comb-filter delay line so block 71's sample-rate
+  cost is unchanged) and at the third vector of each frame evaluates
+  the eq. 4-12 correlation `β = Σ_{k=−99..0} sd(k)·sd(k−p) /
+  Σ_{k=−99..0} sd(k−p)²` clamped into `[0, 1]`, where `p` is the
+  pitch period from block 82. Block 84 maps `β` to `(b, g_l)` via
+  the eq. 4-13 / 4-14 piecewise table:
+  - `β < PPFTH = 0.6` → `b = 0, g_l = 1` (postfilter off, `H_l(z) = 1`).
+  - `0.6 ≤ β ≤ 1` → `b = PPFZCF · β = 0.15·β, g_l = 1/(1+b)`.
+  - `β > 1` → `b = PPFZCF = 0.15, g_l = 1/(1+0.15)` (clamped form
+    handled inside; the `[0, 1]` clamp on β makes this branch
+    unreachable from compute_coefficients in practice but it is kept
+    explicit to mirror the spec table).
+- **`Decoder::decode_vector_postfiltered` drives blocks 83 + 84 each
+  third-vector extract.** Every decoded-speech vector is pushed into
+  the coefficient calculator's `sd(−239..5)` buffer; at the third
+  vector of each frame the pitch period from `PitchSearch::extract`
+  is fed to `PitchPostfilterCoeff::compute_coefficients`, and the
+  resulting `(g_l, b, p)` triple is applied to
+  `LongTermPostfilter::set_coefficients`. From that point on the comb
+  filter operates at the spec-prescribed coefficients for the
+  upcoming adaptation cycle.
+- **`Decoder::pitch_pf_coeff()` accessor** for tests and audit.
+
+With blocks 81 + 82 + 83 + 84 + 71 in place the §4.7 long-term
+postfilter pipeline is end-to-end complete: synthesis (block 32) →
+LPC inverse filter (block 81) → pitch extractor (block 82) →
+coefficient calculator (blocks 83 / 84) → long-term comb (block 71)
+→ short-term postfilter (block 72) → AGC (blocks 73–77).
+
+Round 223 (preserved) lands the **second stage of the §4.7
+pitch-extraction pipeline** — block 82, the pitch period extractor:
 
 - **`PitchSearch` — block 82.** New module transcribes the spec's
   §4.7 pitch-period dataflow: a 240-sample LPC-residual buffer
@@ -204,22 +240,6 @@ order-parameterised Levinson-Durbin recursion, and the
 
 ## What is NOT yet wired up
 
-- §4.7 blocks 83 / 84 of the pitch-extraction pipeline driving
-  block 71's `(g_l, b, p)`. Block 81 (10th-order LPC inverse filter
-  producing the residual `d(k)`) is wired up (r220). Block 82
-  (Annex D 1 kHz lowpass + 4:1 decimate, coarse correlation search
-  over lags 5..35, full-resolution refinement 4τ−3..4τ+3,
-  fundamental-vs-multiple resolution against the previous frame's
-  pitch) is wired up (r223) and produces `p ∈ [KPMIN, KPMAX]`
-  observable via `Decoder::pitch_search()`. Remaining are block 83
-  (single-tap pitch predictor weight `β` over the decoded-speech
-  buffer, eq. 4-12) and block 84 (`b = PPFZCF·β` / `g_l = 1/(1+b)`
-  clamped per eq. 4-13/4-14). The comb-filter machinery itself
-  (block 71) is wired up; until the block-83/84 calculator drives
-  non-trivial coefficients the comb follows the §4.6.1 "long-term
-  postfilter off" rule — `b = 0`, `g_l = 1`, the filter is the
-  identity. The short-term postfilter (block 72) and AGC tail
-  (blocks 73–77) are wired up.
 - A-law / µ-law PCM I/O — `oxideav-g711` handles this per §5.3 / §3.1.
 - The encoder side (blocks 1..28 + 67..70 + the codebook search of
   §3.9 / blocks 12..18). The decoder-side synthesis-filter adapter
@@ -237,8 +257,9 @@ directly from the integer columns of Annexes A, B, C, D in the
 ITU-T G.728 1992-09 PDF that lives under `docs/audio/g728/`. Every
 control-flow line in the `hybrid_window`, `synthesis_adapter`,
 `gain_adapter`, `long_term_postfilter`, `short_term_postfilter`,
-`pitch_inverse_filter`, `pitch_search` and `agc` modules carries a
-comment pointing at the spec's §5.6 / §5.7 / §4.6 / §4.7 pseudocode
+`pitch_inverse_filter`, `pitch_search`, `pitch_postfilter_coeff`
+and `agc` modules carries a comment pointing at the spec's §5.6 /
+§5.7 / §4.6 / §4.7 pseudocode
 for blocks 36/43/49 (hybrid window), 50 (Levinson — already in
 `levinson.rs`), 51 / 45 (bandwidth expansion), 67/39/40/42/46/47/48
 (the per-vector gain chain), 71 (long-term comb filter
@@ -258,7 +279,13 @@ decimator, coarse-search `ρ(i)` over decimated lags `5..=35` from
 eq. 4-7, full-resolution refinement `C(i)` over `4τ−3..=4τ+3`
 clamped into `[KPMIN, KPMAX]` from eq. 4-8, and the
 fundamental-vs-multiple `β0`/`β1` resolution of eqs 4-9..4-11 with
-`TAPTH = 0.4`). No external implementation has been opened or
+`TAPTH = 0.4`), and 83 + 84 (the §4.7 long-term postfilter
+coefficient calculator: 245-sample `sd(−239..5)` decoded-speech
+buffer, single-tap predictor weight `β = Σ_{k=−99..0} sd(k)·sd(k−p)
+/ Σ_{k=−99..0} sd(k−p)²` from eq. 4-12 clamped into `[0, 1]`, and
+the piecewise `(b, g_l)` map of eqs. 4-13 / 4-14 with `PPFTH = 0.6`
+and `PPFZCF = 0.15` driving `LongTermPostfilter::set_coefficients`
+at the third vector of each frame). No external implementation has been opened or
 consulted during this rebuild — the per-test cross-checks (peak Q15
 values, AR(1) predictor round-trip, `λⁱ` geometric progression,
 codebook row spot-checks, ICOUNT cycle ordering, limiter clamp
@@ -271,7 +298,14 @@ synthesis/inverse round-trip to zero excitation residual + block-82
 pitch lock at periods `KPMIN`, `KPMAX` and `40` on a unit-impulse
 train + spec-slot vector placement at `d(81..85) / d(86..90) /
 d(91..95) / d(96..100)` + post-extract residual buffer slide by
-`NFRSZ = 20` + cold-start `p̂ = KPMIN` invariant) act as in-repo
+`NFRSZ = 20` + cold-start `p̂ = KPMIN` invariant + block-83/84
+unity-β invariant on a perfectly periodic signal at the analysis
+lag + spec-table `b = PPFZCF·β`, `g_l = 1/(1+b)` mapping over the
+voiced range + sub-threshold β routing to `(b, g_l) = (0, 1)`
+postfilter-off + buffer slide by `IDIM` per push + cold-start
+identity `sf = sd` over the first frame + propagation of
+`(g_l, b)` from `PitchPostfilterCoeff::last_*` into
+`LongTermPostfilter` at every third-vector extract) act as in-repo
 audit anchors against transcription typos.
 
 ## License
