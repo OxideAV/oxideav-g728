@@ -6,6 +6,65 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Pitch period extractor (block 82, Figure 7/G.728, §4.7, r223)** —
+  new `PitchSearch` type transcribes the §4.7 pitch-period dataflow.
+  240-sample LPC-residual buffer covering `d(−139..100)` with the
+  §4.7-prescribed `d(81..85) / d(86..90) / d(91..95) / d(96..100)`
+  vector slot ordering (4th vector of the previous frame stored at
+  `d(81..85)`, then current frame's three vectors at the following
+  blocks). 60-sample decimated `d̄(−34..25)` buffer fed by the Annex
+  D third-order elliptic 1 kHz lowpass + 4:1 decimator (using `AL` /
+  `BL` coefficients already in `tables.rs`). Coarse correlation
+  search `ρ(i) = Σ d̄(n)·d̄(n−i)` for `n ∈ [1, 25]` over decimated
+  lags `i ∈ [5, 35]` (eq. 4-7) selects τ; full-resolution refinement
+  `C(i) = Σ d(k)·d(k−i)` for `k ∈ [1, 100]` over `[4τ−3, 4τ+3]`
+  clamped into `[KPMIN, KPMAX]` (eq. 4-8) selects `p0`. When `p̂` is
+  outside `[p0 − KPDELTA, p0 + KPDELTA]` a second `C(i)` search
+  over `[p̂−KPDELTA, p̂+KPDELTA]` selects `p1`; the single-tap
+  predictor weights `β0 = C(p0)/Σ d(k−p0)²` (eq. 4-9) and
+  `β1 = C(p1)/Σ d(k−p1)²` (eq. 4-10) clamped into `[0, 1]` drive
+  the eq. 4-11 selection `p = p0` if `β1 ≤ TAPTH·β0` else `p1`
+  (`TAPTH = 0.4`). The chosen `p ∈ [KPMIN, KPMAX] = [20, 140]` is
+  stashed as `p̂` for the next frame. New public API:
+  `PitchSearch::{new, previous_pitch, last_pitch, vector_cursor,
+  residual_buffer, decimated_buffer, push_residual, extract,
+  reset}`; public constants `RESIDUAL_BUF_LEN = 240`,
+  `DECIMATED_BUF_LEN = 60`, `FRAME_RESIDUAL = 20`,
+  `FRAME_DECIMATED = 5`.
+- **`Decoder::decode_vector_postfiltered` runs block 82 each call.**
+  After the inverse filter (block 81) produces the residual vector,
+  it is pushed into `PitchSearch`'s buffer; at the third vector of
+  every adaptation cycle (spec ICOUNT = 3 / our post-increment
+  `icount == 3`) the extractor runs the full lowpass + decimate +
+  correlation + refinement + resolution pipeline. The extracted
+  pitch is not yet driving the long-term postfilter — that stays at
+  the §4.6.1 passthrough until blocks 83 (single-tap `β` over the
+  decoded-speech buffer, eq. 4-12) and 84 (the `(g_l, b)`
+  calculator of eq. 4-13 / 4-14) land in a later round. Cold-start
+  `sf = sd` invariant is preserved bit-for-bit (regression test
+  `pitch_search_wiring_does_not_perturb_decode_vector_path`).
+- **`Decoder::pitch_search()` accessor** for tests and audit, and
+  as the read surface for blocks 83 / 84 when they land.
+- 23 new tests (`pitch_search` module: cold-start zeroed-buffer +
+  `p̂ = KPMIN` invariants, spec buffer dimensions, reset round-trip,
+  vector-cursor walks `0..3` then wraps, push-residual lands the
+  four per-frame vectors at the §4.7 prose's `d(81..85) / d(86..90) /
+  d(91..95) / d(96..100)` slots, extract on all-zero buffer returns
+  KPMIN with the `[KPMIN, KPMAX]` clamp surviving, extract sets
+  the cursor to 3 for the upcoming 4th-vector push, coarse search
+  locks to the spec-correct pitch at periods KPMIN / KPMAX / 40 on
+  a unit-impulse train, `p_prev` carry-over after extract,
+  fundamental-vs-multiple path runs without panic when `p̂` falls
+  outside the neighbourhood, post-extract residual buffer slide by
+  `NFRSZ = 20`, decimator advances by `FRAME_DECIMATED = 5` each
+  extract, finite-pitch output on random inputs, lowpass-filter
+  memory survives across extracts; `Decoder`-level: accessor
+  exposes cold-start state, vector cursor advances with each
+  postfiltered call, extract runs at the third vector of each
+  frame, output is finite over 64 vectors, wiring preserves cold-
+  start `sf == sd`, wiring leaves long-term postfilter at
+  `(g_l, b, p) = (1, 0, KPMIN)`). Total crate tests: 125 → 148.
+
 - **Pitch-extractor LPC inverse filter (block 81, Figure 7/G.728, §4.7,
   r220)** — new `PitchInverseFilter` type transcribes the spec's
   10th-order LPC inverse filter `Ã(z) = 1 − Σ ã_i · z^{-i}` (eq. 4-6)

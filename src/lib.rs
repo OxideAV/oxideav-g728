@@ -66,12 +66,26 @@
 //! [`PitchInverseFilter`]. The inverse filter shares the order-10
 //! by-product / first-reflection-coefficient surface already published
 //! by the synthesis-filter adapter, so it refreshes at the same
-//! adaptation-cycle boundary as the short-term postfilter. The residual
-//! stream it produces is the input to the (still-pending) block-82
-//! pitch-period search. Until block 82 lands, the residual is computed
-//! and made observable via [`Decoder::pitch_inverse_filter`] but is not
-//! yet consumed by anything downstream — the long-term postfilter stays
-//! at its §4.6.1 passthrough.
+//! adaptation-cycle boundary as the short-term postfilter.
+//!
+//! Round 223 lands the **second stage of the §4.7 pitch-extraction
+//! pipeline** — block 82, the pitch period extractor — see
+//! [`pitch_search`] / [`PitchSearch`]. The extractor maintains a
+//! 240-sample residual buffer `d(−139..100)` (vector slot ordering
+//! per the §4.7 prose), a 60-sample decimated buffer `d̄(−34..25)`
+//! fed by the Annex D third-order elliptic 1 kHz lowpass + 4:1
+//! decimator, and runs the coarse correlation search `ρ(i)` of
+//! eq. 4-7 over decimated lags `5..=35`, the full-resolution
+//! refinement `C(i)` of eq. 4-8 over `4τ−3..=4τ+3` clamped into
+//! `[KPMIN, KPMAX]`, and the fundamental-vs-multiple resolution of
+//! eqs 4-9..4-11 with `TAPTH = 0.4`. The extracted pitch
+//! `p ∈ [KPMIN, KPMAX]` is stashed as `p̂` for the next frame and
+//! observable via [`Decoder::pitch_search`]. It is not yet consumed
+//! by the long-term postfilter — blocks 83 (eq. 4-12 single-tap `β`
+//! over the decoded-speech buffer) and 84 (the `(g_l, b)`
+//! calculator of eq. 4-13 / 4-14) still need to land before
+//! [`LongTermPostfilter::set_coefficients`] can be driven from the
+//! pitch chain.
 //!
 //! Round 189 (preserved) provides the Annex A.1/A.2/A.3 hybrid
 //! windows, the Annex B excitation codebook (128 × 5 shape + 8
@@ -82,16 +96,17 @@
 //!
 //! ## What is NOT yet wired up
 //!
-//! * **§4.7 blocks 82..84 of the pitch-extraction / coefficient
+//! * **§4.7 blocks 83 / 84 of the pitch-extraction / coefficient
 //!   pipeline.** Block 81 (the 10th-order LPC inverse filter producing
-//!   residual `d(k)`) is wired up (r220), but the long-term (block 71)
-//!   comb filter's `(g_l, b, p)` coefficients are still held at the
-//!   §4.6.1 passthrough because blocks 82 (1 kHz Annex D lowpass + 4:1
-//!   decimate + lag 5..35 coarse search + full-resolution refinement
-//!   over `4τ−3..4τ+3` + fundamental-vs-multiple resolution against
-//!   the previous frame's pitch), 83 (single-tap pitch predictor
-//!   weight `β`) and 84 (the `β < PPFTH` postfilter-off branch and
-//!   `b = PPFZCF · β` / `g_l = 1/(1+b)` calculator) are still to land.
+//!   residual `d(k)`, r220) and block 82 (the pitch period extractor,
+//!   r223) are wired up — `Decoder::pitch_search().last_pitch()`
+//!   surfaces the extracted `p ∈ [KPMIN, KPMAX]`. The long-term
+//!   (block 71) comb filter's `(g_l, b, p)` coefficients are still
+//!   held at the §4.6.1 passthrough because blocks 83 (single-tap
+//!   pitch predictor weight `β` over the decoded-speech buffer,
+//!   eq. 4-12) and 84 (the `β < PPFTH` postfilter-off branch and
+//!   `b = PPFZCF · β` / `g_l = 1/(1+b)` calculator, eq. 4-13 /
+//!   4-14) are still to land.
 //! * **PCM format conversion (blocks 1, 28).** A-law / µ-law I/O is
 //!   delegated to `oxideav-g711` per §5.3 / §3.1.
 //! * **Encoder.** The encoder side will come once the decoder runs
@@ -129,6 +144,7 @@ pub mod hybrid_window;
 pub mod levinson;
 pub mod long_term_postfilter;
 pub mod pitch_inverse_filter;
+pub mod pitch_search;
 pub mod short_term_postfilter;
 pub mod synthesis_adapter;
 pub mod tables;
@@ -140,6 +156,7 @@ pub use hybrid_window::{HybridWindow, HybridWindowState};
 pub use levinson::{levinson_durbin, LevinsonError};
 pub use long_term_postfilter::LongTermPostfilter;
 pub use pitch_inverse_filter::PitchInverseFilter;
+pub use pitch_search::PitchSearch;
 pub use short_term_postfilter::ShortTermPostfilter;
 pub use synthesis_adapter::SynthesisAdapter;
 
@@ -219,11 +236,18 @@ pub struct Decoder {
     /// Pitch-extractor LPC inverse filter (block 81 of §4.7).
     /// Refreshed at the first vector of each adaptation cycle from the
     /// synthesis adapter's order-10 by-product; produces the residual
-    /// `d(k)` consumed (in a later round) by the block-82 pitch search.
-    /// Until block 82 lands the residual is computed for audit / test
-    /// observability but is not fed anywhere — the long-term postfilter
-    /// stays at the §4.6.1 passthrough.
+    /// `d(k)` consumed by [`pitch_search`].
     pitch_inv_filter: PitchInverseFilter,
+    /// Pitch-period extractor (block 82 of §4.7). Receives the
+    /// residual `d(k)` from `pitch_inv_filter`, runs the
+    /// lowpass+decimate, coarse correlation, refinement and
+    /// fundamental-vs-multiple resolution per the §4.7 prose
+    /// (eqs 4-7..4-11), and produces one pitch period per adaptation
+    /// frame. The output is not yet driving the long-term postfilter
+    /// — blocks 83 / 84 still need to land — so the result is
+    /// observable via [`Self::pitch_search`] for audit but does not
+    /// yet feed back into [`LongTermPostfilter::set_coefficients`].
+    pitch_search: PitchSearch,
     /// Output gain control (blocks 73–77). Always present; the long-
     /// term postfilter (block 71) is still on the §4.6.1 "off" path
     /// pending its block-81..85 pitch-extraction front end. The
@@ -267,6 +291,7 @@ impl Decoder {
             long_term_pf: LongTermPostfilter::new(),
             short_term_pf: ShortTermPostfilter::new(),
             pitch_inv_filter: PitchInverseFilter::new(),
+            pitch_search: PitchSearch::new(),
             agc: Agc::new(),
             et_prev: [0.0; FRAME_LEN],
             sttmp_buf: [0.0; consts::NFRSZ],
@@ -423,14 +448,33 @@ impl Decoder {
 
         // Block 81 (§4.7): run the 10th-order LPC inverse filter on
         // `sd` to produce the residual `d(k)`. The residual is the
-        // input to block 82's pitch-period search; until that block
-        // lands the result is computed for state continuity and
-        // test/audit observability via
-        // [`Self::pitch_inverse_filter`], but not yet consumed
-        // downstream. Discarding the return value here is intentional —
-        // the filter's per-sample memory still advances, which is the
-        // load-bearing side effect for the upcoming block-82 work.
-        let _residual = self.pitch_inv_filter.filter_vector(&sd);
+        // input to block 82's pitch-period search.
+        let residual = self.pitch_inv_filter.filter_vector(&sd);
+
+        // Block 82 (§4.7): push the residual vector into the pitch
+        // extractor's 240-sample buffer. The spec's vector-slot
+        // ordering (vec 1 → d(86..90), vec 2 → d(91..95), vec 3 →
+        // d(96..100), vec 4 → d(81..85)) is realised inside
+        // PitchSearch::push_residual via its own per-frame cursor.
+        // At the third vector of each frame (spec ICOUNT = 3, our
+        // 0-indexed icount == 2 *after* the increment above wraps it
+        // back; but we want to extract right after the 3rd vector's
+        // residual is pushed) the extractor runs the full pitch
+        // search and stashes the result as p̂ for the next frame.
+        //
+        // Because `self.icount` was advanced after step 2, the value
+        // at this point is the *next* icount; spec ICOUNT = 3 maps
+        // to our pre-increment icount == 2, which corresponds to
+        // post-increment icount == 3 here. We therefore trigger the
+        // extract when post-increment icount == 3.
+        //
+        // The pitch output is not yet consumed by the long-term
+        // postfilter — blocks 83 / 84 still need to land. Until they
+        // do, the comb filter stays at the §4.6.1 passthrough.
+        self.pitch_search.push_residual(&residual);
+        if self.icount == 3 {
+            let _p = self.pitch_search.extract();
+        }
 
         // Step 3: long-term (pitch) postfilter (block 71). With the
         // §4.6.1 passthrough coefficients the comb filter is the
@@ -468,6 +512,17 @@ impl Decoder {
     /// to read the residual stream once it lands.
     pub fn pitch_inverse_filter(&self) -> &PitchInverseFilter {
         &self.pitch_inv_filter
+    }
+
+    /// Borrow the pitch-period extractor (block 82) — receives the
+    /// residual `d(k)` from the inverse filter and produces one pitch
+    /// period `p ∈ [KPMIN, KPMAX]` per adaptation frame, available via
+    /// [`PitchSearch::last_pitch`]. Until blocks 83 / 84 land the
+    /// extracted pitch is not yet driving the long-term postfilter's
+    /// `(g_l, b, p)` coefficients, but the extractor's state advances
+    /// every call to [`Self::decode_vector_postfiltered`].
+    pub fn pitch_search(&self) -> &PitchSearch {
+        &self.pitch_search
     }
 
     /// Borrow the AGC (useful for tests and audit).
@@ -883,6 +938,124 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---------- Pitch-period extractor wiring (r223, block 82) ----
+
+    #[test]
+    fn decoder_exposes_pitch_search_at_cold_start() {
+        // Fresh decoder: pitch_search starts at the cold-start state
+        // (residual + decimated buffers zeroed, p̂ = KPMIN).
+        let dec = Decoder::new();
+        let ps = dec.pitch_search();
+        assert!(ps.residual_buffer().iter().all(|&v| v == 0.0));
+        assert!(ps.decimated_buffer().iter().all(|&v| v == 0.0));
+        assert_eq!(ps.previous_pitch(), consts::KPMIN);
+        assert_eq!(ps.last_pitch(), consts::KPMIN);
+        assert_eq!(ps.vector_cursor(), 0);
+    }
+
+    #[test]
+    fn pitch_search_vector_cursor_advances_with_each_postfiltered_call() {
+        // Each decode_vector_postfiltered call pushes one residual
+        // vector into pitch_search; the per-frame cursor walks
+        // 0 → 1 → 2 → 3 → … with the third-vector push triggering
+        // the extract and leaving the cursor at 3 (so the 4th
+        // vector lands at d(81..85)). After the 4th vector's push
+        // the cursor wraps to 0 and the next frame begins.
+        //
+        // Cursor sequence observable from outside across one full
+        // adaptation cycle: {1, 2, 3, 0} (post-push values, with
+        // the third entry reflecting the extract's "cursor → 3"
+        // post-set, which OVERWRITES the cursor-after-push value
+        // of 3 ... so it stays 3).
+        let mut dec = Decoder::new();
+        // Vector 1 (push at cursor=0 → d(86..90), cursor becomes 1).
+        let _ = dec.decode_vector_postfiltered(0);
+        assert_eq!(dec.pitch_search().vector_cursor(), 1);
+        // Vector 2 (push at cursor=1 → d(91..95), cursor becomes 2).
+        let _ = dec.decode_vector_postfiltered(0);
+        assert_eq!(dec.pitch_search().vector_cursor(), 2);
+        // Vector 3 (push at cursor=2 → d(96..100), cursor becomes 3;
+        // then extract runs and sets cursor to 3 again per §4.7
+        // "next push is the 4th vector").
+        let _ = dec.decode_vector_postfiltered(0);
+        assert_eq!(dec.pitch_search().vector_cursor(), 3);
+        // Vector 4 (push at cursor=3 → d(81..85), cursor wraps to 0
+        // — the start of the next frame).
+        let _ = dec.decode_vector_postfiltered(0);
+        assert_eq!(dec.pitch_search().vector_cursor(), 0);
+    }
+
+    #[test]
+    fn pitch_search_extracts_at_third_vector_of_each_frame() {
+        // After 3 vectors of a non-trivial decode, the pitch
+        // extractor should have run extract() at least once and
+        // its last_pitch should still be in [KPMIN, KPMAX].
+        let mut dec = Decoder::new();
+        for i in 0..(consts::NUPDATE as u16) {
+            dec.decode_vector_postfiltered(((i + 1) * 17) & 0x03FF);
+        }
+        let p = dec.pitch_search().last_pitch();
+        assert!((consts::KPMIN..=consts::KPMAX).contains(&p));
+    }
+
+    #[test]
+    fn pitch_search_runs_finite_over_long_stream() {
+        // 16 frames of decode. Confirm the pitch never escapes
+        // [KPMIN, KPMAX] and the per-call cost doesn't blow up.
+        let mut dec = Decoder::new();
+        for i in 0..64u16 {
+            let _ = dec.decode_vector_postfiltered((i * 23) & 0x03FF);
+            let p = dec.pitch_search().last_pitch();
+            assert!((consts::KPMIN..=consts::KPMAX).contains(&p));
+        }
+    }
+
+    #[test]
+    fn pitch_search_wiring_does_not_perturb_decode_vector_path() {
+        // The block-82 wiring lives ENTIRELY inside
+        // decode_vector_postfiltered. The register-only
+        // decode_vector path should be untouched: bit-identical
+        // outputs to a decoder of the previous structure (proxied
+        // here by running two equally-fresh decoders in parallel,
+        // one through decode_vector and one through
+        // decode_vector_postfiltered for the cold-start cycle where
+        // the latter is provably identity-equal to the former).
+        let mut dec_a = Decoder::new();
+        let mut dec_b = Decoder::new();
+        for i in 0..consts::NUPDATE as u16 {
+            let ichan = (i * 23) & 0x03FF;
+            let raw = dec_a.decode_vector(ichan);
+            let pf = dec_b.decode_vector_postfiltered(ichan);
+            for k in 0..FRAME_LEN {
+                assert!(
+                    (raw[k] - pf[k]).abs() < 1e-12,
+                    "block-82 wiring perturbed cold-start sf == sd; vec={i} k={k}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pitch_search_keeps_long_term_postfilter_at_passthrough() {
+        // Block 82 produces a pitch period but does NOT yet drive
+        // the long-term postfilter — that stays at the §4.6.1
+        // passthrough until blocks 83 / 84 land. Confirm the long-
+        // term coefficients remain at cold-start values even after
+        // many frames.
+        let mut dec = Decoder::new();
+        for i in 0..(consts::NUPDATE as u16 * 8) {
+            let _ = dec.decode_vector_postfiltered(((i + 1) * 19) & 0x03FF);
+        }
+        let lt = dec.long_term_postfilter();
+        assert_eq!(lt.g_l(), 1.0, "long-term g_l must stay at 1.0");
+        assert_eq!(lt.b(), 0.0, "long-term b must stay at 0.0");
+        assert_eq!(
+            lt.p(),
+            consts::KPMIN,
+            "long-term p must stay at KPMIN until blocks 83/84 land"
+        );
     }
 
     #[test]

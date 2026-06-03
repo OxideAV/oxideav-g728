@@ -2,7 +2,7 @@
 
 Pure-Rust ITU-T G.728 Low-Delay CELP (LD-CELP, 16 kbit/s) speech codec.
 
-## Status: clean-room rebuild — autonomous decoder + long-term + short-term postfilter + AGC + block-81 pitch inverse filter (round 220)
+## Status: clean-room rebuild — autonomous decoder + long-term + short-term postfilter + AGC + block-81 pitch inverse filter + block-82 pitch period extractor (round 223)
 
 The crate was reset to a register-only scaffold under the workspace
 clean-room policy (round 171, master `14e3bad`): the previous
@@ -49,8 +49,48 @@ without a caller-supplied predictor:
   `set_synthesis_predictor` hooks are preserved for the register-
   only path.
 
-Round 220 lands the **first stage of the §4.7 pitch-extraction
-pipeline** — block 81, the 10th-order LPC inverse filter:
+Round 223 lands the **second stage of the §4.7 pitch-extraction
+pipeline** — block 82, the pitch period extractor:
+
+- **`PitchSearch` — block 82.** New module transcribes the spec's
+  §4.7 pitch-period dataflow: a 240-sample LPC-residual buffer
+  covering `d(−139..100)`, a 60-sample decimated-residual buffer
+  covering `d̄(−34..25)`, the third-order Annex D 1 kHz elliptic
+  lowpass + 4:1 decimator (`AL` / `BL` coefficients from
+  `tables.rs`), the coarse correlation search `ρ(i) = Σ d̄(n)·d̄(n−i)`
+  over decimated lags `5..=35` (eq. 4-7), the full-resolution
+  refinement `C(i) = Σ d(k)·d(k−i)` over `4τ−3..=4τ+3` (eq. 4-8)
+  clamped into `[KPMIN, KPMAX]`, and the fundamental-vs-multiple
+  resolution: when `p̂` is outside `[p0 − KPDELTA, p0 + KPDELTA]`,
+  a second `C(i)` search over `p̂−KPDELTA..=p̂+KPDELTA` produces
+  `p1`, then the single-tap predictor weights `β0 = C(p0)/Σ d(k−p0)²`
+  and `β1 = C(p1)/Σ d(k−p1)²` clamped into `[0, 1]` (eqs. 4-9,
+  4-10) select `p = p0` if `β1 ≤ TAPTH·β0` else `p1` (eq. 4-11).
+  The output `p ∈ [KPMIN, KPMAX] = [20, 140]` is stashed as `p̂`
+  for the next frame.
+- **Spec slot ordering for `d(81..85)` / `d(86..90)` / `d(91..95)` /
+  `d(96..100)`.** The §4.7 prose explicitly assigns the 4th vector
+  of the previous frame to `d(81..85)`, current frame's 1st/2nd/3rd
+  vectors to `d(86..90)` / `d(91..95)` / `d(96..100)`. `PitchSearch`
+  realises this via a per-frame cursor that's reset to 3 after each
+  extract (so the next push — the 4th vector — lands at `d(81..85)`
+  of the post-slide buffer) and then wraps to 0 at the start of the
+  next frame.
+- **`Decoder::decode_vector_postfiltered` advances block 82 each call.**
+  After the inverse filter (block 81) produces the residual vector,
+  it is pushed into `PitchSearch`'s residual buffer; at the third
+  vector of every adaptation cycle (spec ICOUNT = 3) the extractor
+  runs the full lowpass + decimate + correlation + refinement +
+  resolution pipeline and stashes `p` as `p̂`. The output is not
+  yet consumed downstream — the long-term postfilter (block 71)
+  still follows the §4.6.1 passthrough until blocks 83 (single-tap
+  `β` over the decoded-speech buffer, eq. 4-12) and 84 (the
+  `(g_l, b)` calculator of eq. 4-13 / 4-14) land in a later round.
+- **`Decoder::pitch_search()` accessor** for tests and audit.
+
+Round 220 (preserved) lands the **first stage of the §4.7
+pitch-extraction pipeline** — block 81, the 10th-order LPC inverse
+filter:
 
 - **`PitchInverseFilter` — block 81.** New module transcribes the
   10th-order LPC inverse filter `Ã(z) = 1 − Σ ã_i · z^{-i}` (eq. 4-6)
@@ -164,19 +204,22 @@ order-parameterised Levinson-Durbin recursion, and the
 
 ## What is NOT yet wired up
 
-- §4.7 blocks 82 / 83 / 84 of the pitch-extraction pipeline driving
+- §4.7 blocks 83 / 84 of the pitch-extraction pipeline driving
   block 71's `(g_l, b, p)`. Block 81 (10th-order LPC inverse filter
-  producing the residual `d(k)`) is wired up (r220). Remaining are
-  block 82 (Annex D 1 kHz lowpass + 4:1 decimate, coarse correlation
-  search over lags 5..35, full-resolution refinement 4τ−3..4τ+3,
+  producing the residual `d(k)`) is wired up (r220). Block 82
+  (Annex D 1 kHz lowpass + 4:1 decimate, coarse correlation search
+  over lags 5..35, full-resolution refinement 4τ−3..4τ+3,
   fundamental-vs-multiple resolution against the previous frame's
-  pitch), 83 (single-tap predictor weight β) and 84
-  (`b = PPFZCF·β` / `g_l = 1/(1+b)` clamped per eq. 4-13/4-14). The
-  comb-filter machinery itself (block 71) is wired up; until the
-  block-82..84 sub-pipeline drives non-trivial coefficients the comb
-  follows the §4.6.1 "long-term postfilter off" rule — `b = 0`,
-  `g_l = 1`, the filter is the identity. The short-term postfilter
-  (block 72) and AGC tail (blocks 73–77) are wired up.
+  pitch) is wired up (r223) and produces `p ∈ [KPMIN, KPMAX]`
+  observable via `Decoder::pitch_search()`. Remaining are block 83
+  (single-tap pitch predictor weight `β` over the decoded-speech
+  buffer, eq. 4-12) and block 84 (`b = PPFZCF·β` / `g_l = 1/(1+b)`
+  clamped per eq. 4-13/4-14). The comb-filter machinery itself
+  (block 71) is wired up; until the block-83/84 calculator drives
+  non-trivial coefficients the comb follows the §4.6.1 "long-term
+  postfilter off" rule — `b = 0`, `g_l = 1`, the filter is the
+  identity. The short-term postfilter (block 72) and AGC tail
+  (blocks 73–77) are wired up.
 - A-law / µ-law PCM I/O — `oxideav-g711` handles this per §5.3 / §3.1.
 - The encoder side (blocks 1..28 + 67..70 + the codebook search of
   §3.9 / blocks 12..18). The decoder-side synthesis-filter adapter
@@ -194,28 +237,42 @@ directly from the integer columns of Annexes A, B, C, D in the
 ITU-T G.728 1992-09 PDF that lives under `docs/audio/g728/`. Every
 control-flow line in the `hybrid_window`, `synthesis_adapter`,
 `gain_adapter`, `long_term_postfilter`, `short_term_postfilter`,
-`pitch_inverse_filter` and `agc` modules carries a comment pointing
-at the spec's §5.6 / §5.7 / §4.6 / §4.7 pseudocode for blocks
-36/43/49 (hybrid window), 50 (Levinson — already in `levinson.rs`),
-51 / 45 (bandwidth expansion), 67/39/40/42/46/47/48 (the per-vector
-gain chain), 71 (long-term comb filter `g_l · (1 + b·z^{-p})` from
-eq. 4-1, KPMIN/KPMAX clamp), 72 (short-term postfilter pole-zero +
-tilt cascade with `SPFZCF / SPFPCF / TILTF` and the `ã_i = -a_i`
-sign-convention flip spelled out in `short_term_postfilter.rs`),
-73/74/75/76/77 (the AGC tail with the lowpass form spelled out in
-§4.6 immediately after eq. 4-5), and 81 (10th-order LPC inverse
-filter `Ã(z) = 1 − Σ ã_i · z^{-i}` from eq. 4-6, same `ã_i = -a_i`
-sign flip spelled out in `pitch_inverse_filter.rs`). No external
-implementation has been opened or consulted during this rebuild —
-the per-test cross-checks (peak Q15 values, AR(1) predictor round-
-trip, `λⁱ` geometric progression, codebook row spot-checks, ICOUNT
-cycle ordering, limiter clamp bounds, first-vector σ(n) = 10^(GOFF/20),
-AGC unity-DC convergence + AGCFAC geometric decay, postfilter
-identity at cold start + non-identity divergence after the first
-adaptation cycle + bandwidth-expansion `ã_i · λ^i` invariants +
-tilt `µ = TILTF · k1` invariant + block-81 impulse response matching
-`−ã_i` + AR(1) synthesis/inverse round-trip to zero excitation
-residual) act as in-repo audit anchors against transcription typos.
+`pitch_inverse_filter`, `pitch_search` and `agc` modules carries a
+comment pointing at the spec's §5.6 / §5.7 / §4.6 / §4.7 pseudocode
+for blocks 36/43/49 (hybrid window), 50 (Levinson — already in
+`levinson.rs`), 51 / 45 (bandwidth expansion), 67/39/40/42/46/47/48
+(the per-vector gain chain), 71 (long-term comb filter
+`g_l · (1 + b·z^{-p})` from eq. 4-1, KPMIN/KPMAX clamp), 72
+(short-term postfilter pole-zero + tilt cascade with
+`SPFZCF / SPFPCF / TILTF` and the `ã_i = -a_i` sign-convention flip
+spelled out in `short_term_postfilter.rs`), 73/74/75/76/77 (the AGC
+tail with the lowpass form spelled out in §4.6 immediately after
+eq. 4-5), 81 (10th-order LPC inverse filter
+`Ã(z) = 1 − Σ ã_i · z^{-i}` from eq. 4-6, same `ã_i = -a_i` sign
+flip spelled out in `pitch_inverse_filter.rs`), and 82 (the §4.7
+pitch period extractor: 240-sample `d(−139..100)` residual buffer
+with the §4.7-prescribed `d(81..85) / d(86..90) / d(91..95) /
+d(96..100)` vector slot ordering, 60-sample `d̄(−34..25)` decimated
+buffer fed by the Annex D third-order elliptic lowpass + 4:1
+decimator, coarse-search `ρ(i)` over decimated lags `5..=35` from
+eq. 4-7, full-resolution refinement `C(i)` over `4τ−3..=4τ+3`
+clamped into `[KPMIN, KPMAX]` from eq. 4-8, and the
+fundamental-vs-multiple `β0`/`β1` resolution of eqs 4-9..4-11 with
+`TAPTH = 0.4`). No external implementation has been opened or
+consulted during this rebuild — the per-test cross-checks (peak Q15
+values, AR(1) predictor round-trip, `λⁱ` geometric progression,
+codebook row spot-checks, ICOUNT cycle ordering, limiter clamp
+bounds, first-vector σ(n) = 10^(GOFF/20), AGC unity-DC convergence
++ AGCFAC geometric decay, postfilter identity at cold start +
+non-identity divergence after the first adaptation cycle +
+bandwidth-expansion `ã_i · λ^i` invariants + tilt `µ = TILTF · k1`
+invariant + block-81 impulse response matching `−ã_i` + AR(1)
+synthesis/inverse round-trip to zero excitation residual + block-82
+pitch lock at periods `KPMIN`, `KPMAX` and `40` on a unit-impulse
+train + spec-slot vector placement at `d(81..85) / d(86..90) /
+d(91..95) / d(96..100)` + post-extract residual buffer slide by
+`NFRSZ = 20` + cold-start `p̂ = KPMIN` invariant) act as in-repo
+audit anchors against transcription typos.
 
 ## License
 
