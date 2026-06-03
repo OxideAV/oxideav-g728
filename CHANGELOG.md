@@ -6,6 +6,39 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Long-term (pitch) postfilter comb-filter machinery (block 71,
+  Figure 7/G.728, r213)** — new `LongTermPostfilter` type transcribes
+  the spec's `H_l(z) = g_l · (1 + b · z^{-p})` cascade (eq. 4-1) as
+  a `KPMAX`-sample circular FIR delay line. Pitch period `p` is
+  clamped into `[KPMIN, KPMAX] = [20, 140]` per Table 1/G.728.
+  Cold-start `(g_l, b, p) = (1, 0, KPMIN)` realises the §4.6.1
+  "postfilter off" identity for unvoiced / weakly-voiced frames
+  (decode-trace §7.1, equations 4-13/4-14). New public API:
+  `LongTermPostfilter::{new, g_l, b, p, set_coefficients, reset,
+  filter_vector}`.
+- **`Decoder::decode_vector_postfiltered` chain expanded to block 71.**
+  The long-term comb filter now slots between the synthesis output
+  `sd(n)` and the short-term postfilter (block 72) per Figure 7/G.728.
+  Per the same figure, the AGC numerator (block 73) reads the raw
+  decoded `sd` directly — only the `sf` denominator (block 74) sees
+  the long-term + short-term cascade. While block 71 stays in the
+  §4.6.1 passthrough (`g_l = 1, b = 0`) this is observationally
+  equivalent to the r207 chain; the cold-start `sf = sd` invariant
+  is preserved bit-for-bit (regression test
+  `long_term_passthrough_preserves_short_term_postfilter_behaviour`).
+- **`Decoder::long_term_postfilter()` accessor** for tests and audit.
+- 15 new tests (`long_term_postfilter` module: fresh-filter identity,
+  passthrough cold-start coefficients, 64-vector identity hold,
+  pitch clamp into `[KPMIN, KPMAX]`, gain+tap storage round-trip,
+  eq. 4-1 comb verification on a unit impulse at `p = KPMIN`, pure-
+  gain branch when `b = 0`, `b = 0` independence from `p`, echo
+  exactly at lag `KPMAX`, FIR no-recursion check (exactly two non-
+  zero samples), reset restores passthrough, sinusoidal-drive
+  finite-output stability, circular delay-line wrap-around past
+  `KPMAX`; `Decoder`-level: passthrough state still reported after
+  16 vectors, cold-start `sf = sd` invariant preserved). Total
+  crate tests: 96 → 111.
+
 - **Short-term (spectral) postfilter (block 72, Figure 7/G.728, r207)**
   — new `ShortTermPostfilter` type transcribes the spec's
   `H_s(z) = (1 − Σ b̄_i z⁻ⁱ) / (1 − Σ ā_i z⁻ⁱ) · (1 + µ·z⁻¹)` cascade

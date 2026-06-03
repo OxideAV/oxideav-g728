@@ -47,10 +47,17 @@
 //! expansion by `SPFZCF^i` / `SPFPCF^i`) plus the tilt-compensation
 //! `µ = TILTF · k1` from the same RTMP's first reflection
 //! coefficient. They refresh at the first vector of every adaptation
-//! cycle (§7.2). [`Decoder::decode_vector_postfiltered`] runs the
-//! full block 32 → 72 → 73..77 chain; the long-term (block 71) pitch
-//! postfilter is still on the §4.6.1 "off" path (`b = 0`, `g_l = 1`)
-//! pending its block-81..85 pitch-extraction front end.
+//! cycle (§7.2).
+//!
+//! Round 213 wires up the **long-term (pitch) postfilter** (block 71)
+//! comb-filter machinery — see [`long_term_postfilter`] /
+//! [`LongTermPostfilter`]. The transfer function
+//! `H_l(z) = g_l · (1 + b · z^{-p})` (eq. 4-1) is implemented as a
+//! `KPMAX`-sample FIR delay line; the comb stage holds at the §4.6.1
+//! passthrough `(g_l, b, p) = (1, 0, KPMIN)` until the §4.7
+//! block-81..84 pitch-extraction / coefficient pipeline lands.
+//! [`Decoder::decode_vector_postfiltered`] runs the full block
+//! 32 → 71 → 72 → 73..77 chain.
 //!
 //! Round 189 (preserved) provides the Annex A.1/A.2/A.3 hybrid
 //! windows, the Annex B excitation codebook (128 × 5 shape + 8
@@ -61,12 +68,16 @@
 //!
 //! ## What is NOT yet wired up
 //!
-//! * **Long-term (block 71) pitch postfilter and its block-81..85
-//!   pitch-extraction front end (§4.7).** The short-term postfilter
-//!   (block 72) and AGC tail (blocks 73–77) are wired up; the long-
-//!   term filter follows the §4.6.1 "long-term off" rule (`b = 0`,
-//!   `g_l = 1`) until the residual / lowpass-decimate / coarse +
-//!   refined correlation search lands.
+//! * **§4.7 block-81..84 pitch-extraction / coefficient pipeline.**
+//!   The long-term (block 71) comb filter is wired up, but its
+//!   `(g_l, b, p)` coefficients are still held at the §4.6.1
+//!   passthrough because blocks 81 (10th-order LPC inverse filter
+//!   producing residual `d(k)`), 82 (1 kHz Annex D lowpass + 4:1
+//!   decimate + lag 5..35 coarse search + full-resolution refinement
+//!   over `4τ−3..4τ+3` + fundamental-vs-multiple resolution against
+//!   the previous frame's pitch), 83 (single-tap pitch predictor
+//!   weight `β`) and 84 (the `β < PPFTH` postfilter-off branch and
+//!   `b = PPFZCF · β` / `g_l = 1/(1+b)` calculator) are still to land.
 //! * **PCM format conversion (blocks 1, 28).** A-law / µ-law I/O is
 //!   delegated to `oxideav-g711` per §5.3 / §3.1.
 //! * **Encoder.** The encoder side will come once the decoder runs
@@ -102,6 +113,7 @@ pub mod decoder;
 pub mod gain_adapter;
 pub mod hybrid_window;
 pub mod levinson;
+pub mod long_term_postfilter;
 pub mod short_term_postfilter;
 pub mod synthesis_adapter;
 pub mod tables;
@@ -111,6 +123,7 @@ pub use decoder::{pack_channel_index, ExcitationVector, Synthesizer, DEFAULT_MAX
 pub use gain_adapter::GainAdapter;
 pub use hybrid_window::{HybridWindow, HybridWindowState};
 pub use levinson::{levinson_durbin, LevinsonError};
+pub use long_term_postfilter::LongTermPostfilter;
 pub use short_term_postfilter::ShortTermPostfilter;
 pub use synthesis_adapter::SynthesisAdapter;
 
@@ -174,6 +187,14 @@ pub struct Decoder {
     /// Backward vector gain adapter (block 30). Updated every vector;
     /// produces `σ(n)` consumed by the block-31 gain scaling step.
     gain_adapter: GainAdapter,
+    /// Long-term (pitch) postfilter (block 71). Held at the §4.6.1
+    /// "postfilter off" passthrough (`g_l = 1`, `b = 0`) because the
+    /// block-81..84 pitch-extraction / coefficient-calculation front
+    /// end is not yet implemented. The filter machinery is wired up
+    /// inside [`Decoder::decode_vector_postfiltered`] so it slots in
+    /// transparently once §4.7 lands and starts driving non-trivial
+    /// `(g_l, b, p)` once per adaptation cycle.
+    long_term_pf: LongTermPostfilter,
     /// Short-term postfilter (block 72). Refreshed at the first
     /// vector of each adaptation cycle from the synthesis adapter's
     /// order-10 by-product + first reflection coefficient; runs
@@ -219,6 +240,7 @@ impl Decoder {
             synth: Synthesizer::new(),
             synth_adapter: SynthesisAdapter::new(),
             gain_adapter: GainAdapter::new(),
+            long_term_pf: LongTermPostfilter::new(),
             short_term_pf: ShortTermPostfilter::new(),
             agc: Agc::new(),
             et_prev: [0.0; FRAME_LEN],
@@ -313,8 +335,9 @@ impl Decoder {
     }
 
     /// Decode one channel index into one [`FRAME_LEN`]-sample PCM
-    /// vector through the **short-term postfilter (block 72) + AGC
-    /// stage (blocks 73-77)** of Figure 7/G.728.
+    /// vector through the **long-term postfilter (block 71) +
+    /// short-term postfilter (block 72) + AGC stage (blocks 73-77)**
+    /// of Figure 7/G.728.
     ///
     /// Per-vector dataflow:
     ///
@@ -322,18 +345,21 @@ impl Decoder {
     /// 2. If this is the first vector of an adaptation cycle, refresh
     ///    the short-term postfilter coefficients from the synthesis
     ///    adapter's order-10 by-product and first reflection
-    ///    coefficient (§7.2, eq. 4-3..4-5).
-    /// 3. Filter `sd(n)` through the short-term postfilter (block 72)
-    ///    to obtain `sf(n)`.
-    /// 4. Apply the AGC (blocks 73-77) with the spec's per-vector
-    ///    `Σ|sd|` / `Σ|sf|` ratio.
-    ///
-    /// The long-term (block 71) postfilter is still on the §4.6.1
-    /// "off" path (`b = 0`, `g_l = 1`) because the block-81..85 pitch
-    /// extraction front end is not yet implemented. Once it lands,
-    /// step 3 will wrap `sd` through the pitch postfilter first,
-    /// then the short-term postfilter — the AGC stage needs no
-    /// further changes.
+    ///    coefficient (§7.2, eq. 4-3..4-5). The long-term postfilter
+    ///    coefficients are held at the §4.6.1 passthrough
+    ///    (`g_l = 1`, `b = 0`) until the §4.7 block-81..84 pitch
+    ///    pipeline lands.
+    /// 3. Filter `sd(n)` through the long-term (block 71) comb
+    ///    filter `H_l(z) = g_l · (1 + b · z^{-p})` to obtain
+    ///    `sd_lt(n)`. Until block 84 starts driving non-trivial
+    ///    coefficients this is the identity (`sd_lt = sd`).
+    /// 4. Filter `sd_lt(n)` through the short-term postfilter
+    ///    (block 72) to obtain `sf(n)`.
+    /// 5. Apply the AGC (blocks 73-77) with the spec's per-vector
+    ///    `Σ|sd|` / `Σ|sf|` ratio. Per Figure 7/G.728 block 73 reads
+    ///    the *decoded* speech `sd` directly, **not** the long-term
+    ///    postfilter output — so the AGC numerator stays anchored to
+    ///    the raw decoded amplitude.
     ///
     /// Callers that want the raw synthesis-filter output (no
     /// postfilter, no AGC — exactly the §4.6.1 "postfilter off"
@@ -348,6 +374,12 @@ impl Decoder {
         // at the first vector of each frame as soon as ã_i / k1 are
         // available from the order-10 by-product"). Vectors are
         // 0-indexed here; spec ICOUNT = 1 maps to icount = 0.
+        //
+        // The long-term postfilter coefficients are NOT refreshed
+        // here yet — they require the §4.7 block-81..84 pitch
+        // extraction front end. Until that lands, the long-term
+        // filter stays at its cold-start `(g_l, b, p) = (1, 0, KPMIN)`
+        // §4.6.1 passthrough and step 3 is the identity (`sd_lt = sd`).
         if self.icount == 0 {
             self.short_term_pf.set_from_synthesis_byproduct(
                 self.synth_adapter.order10_predictor(),
@@ -356,15 +388,27 @@ impl Decoder {
         }
         self.icount = (self.icount + 1) % consts::NUPDATE;
 
-        // Step 3: short-term postfilter (block 72). At cold start,
-        // before any adaptation cycle has completed, all coefficients
-        // are zero and the filter is the identity (sf = sd) —
-        // matching the §4.6.1 "postfilter off" path. Once the first
-        // cycle commits, sf starts diverging from sd.
-        let sf = self.short_term_pf.filter_vector(&sd);
+        // Step 3: long-term (pitch) postfilter (block 71). With the
+        // §4.6.1 passthrough coefficients the comb filter is the
+        // identity (`sd_lt = sd`) — see [`LongTermPostfilter`] docs.
+        let sd_lt = self.long_term_pf.filter_vector(&sd);
 
-        // Step 4: AGC (blocks 73-77).
+        // Step 4: short-term postfilter (block 72). At cold start,
+        // before any adaptation cycle has completed, all coefficients
+        // are zero and the filter is the identity (sf = sd_lt) —
+        // matching the §4.6.1 "postfilter off" path. Once the first
+        // cycle commits, sf starts diverging from sd_lt.
+        let sf = self.short_term_pf.filter_vector(&sd_lt);
+
+        // Step 5: AGC (blocks 73-77). Block 73 takes the *raw*
+        // decoded-speech vector `sd` (Figure 7/G.728), keeping the
+        // power reference anchored at the synthesis filter output.
         self.agc.apply(&sd, &sf)
+    }
+
+    /// Borrow the long-term postfilter (useful for tests and audit).
+    pub fn long_term_postfilter(&self) -> &LongTermPostfilter {
+        &self.long_term_pf
     }
 
     /// Borrow the short-term postfilter (useful for tests and audit).
@@ -650,6 +694,48 @@ mod tests {
             any_nz,
             "postfilter coefficients should be non-zero after >=1 cycle"
         );
+    }
+
+    // ---------- Long-term postfilter wiring (r213, block 71) -------
+
+    #[test]
+    fn decoder_exposes_long_term_postfilter_in_passthrough_state() {
+        // Decoder construction starts the long-term postfilter at
+        // the §4.6.1 passthrough: g_l = 1, b = 0, p = KPMIN. Until
+        // the §4.7 block-81..84 pipeline lands the decoder never
+        // touches those, so the accessor should still report the
+        // passthrough values after a non-trivial run.
+        let mut dec = Decoder::new();
+        for i in 0..(consts::NUPDATE as u16 * 4) {
+            let _ = dec.decode_vector_postfiltered(((i + 1) * 17) & 0x03FF);
+        }
+        let lt = dec.long_term_postfilter();
+        assert_eq!(lt.g_l(), 1.0);
+        assert_eq!(lt.b(), 0.0);
+        assert_eq!(lt.p(), consts::KPMIN);
+    }
+
+    #[test]
+    fn long_term_passthrough_preserves_short_term_postfilter_behaviour() {
+        // With the long-term filter in passthrough (current state),
+        // wiring it between sd and the short-term postfilter must not
+        // change the post-filtered output relative to the r207
+        // behaviour. We exercise this by checking that the cold-start
+        // invariant (sf == sd for the first NUPDATE vectors) still
+        // holds after the new long-term stage is inserted.
+        let mut dec_a = Decoder::new();
+        let mut dec_b = Decoder::new();
+        for i in 0..consts::NUPDATE as u16 {
+            let ichan = (i * 23) & 0x03FF;
+            let raw = dec_a.decode_vector(ichan);
+            let pf = dec_b.decode_vector_postfiltered(ichan);
+            for k in 0..FRAME_LEN {
+                assert!(
+                    (raw[k] - pf[k]).abs() < 1e-12,
+                    "cold-start passthrough broken by long-term filter wiring"
+                );
+            }
+        }
     }
 
     #[test]
