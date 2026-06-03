@@ -2,7 +2,7 @@
 
 Pure-Rust ITU-T G.728 Low-Delay CELP (LD-CELP, 16 kbit/s) speech codec.
 
-## Status: clean-room rebuild — autonomous decoder + long-term + short-term postfilter + AGC (round 213)
+## Status: clean-room rebuild — autonomous decoder + long-term + short-term postfilter + AGC + block-81 pitch inverse filter (round 220)
 
 The crate was reset to a register-only scaffold under the workspace
 clean-room policy (round 171, master `14e3bad`): the previous
@@ -49,8 +49,34 @@ without a caller-supplied predictor:
   `set_synthesis_predictor` hooks are preserved for the register-
   only path.
 
-Round 213 adds the **long-term (pitch) postfilter** comb-filter
-machinery (block 71 of Figure 7/G.728):
+Round 220 lands the **first stage of the §4.7 pitch-extraction
+pipeline** — block 81, the 10th-order LPC inverse filter:
+
+- **`PitchInverseFilter` — block 81.** New module transcribes the
+  10th-order LPC inverse filter `Ã(z) = 1 − Σ ã_i · z^{-i}` (eq. 4-6)
+  applied to the decoded-speech stream `sd(k)`. The output residual
+  `d(k) = sd(k) − Σ ã_i · sd(k-i)` is the input that block 82's pitch
+  search will consume. Spec sign convention `ã_i = -a_i` is applied
+  inside `set_from_synthesis_byproduct`; the 10-tap FIR memory carries
+  across vector boundaries.
+- **Coefficient source.** The inverse filter shares the order-10
+  by-product surface that already feeds the short-term postfilter
+  (block 72): per `SynthesisAdapter::order10_predictor()`, refreshed
+  at the first vector of each adaptation cycle (§7.1 — same boundary
+  as §7.2).
+- **`Decoder::decode_vector_postfiltered` advances block 81 each call.**
+  After `sd(n)` is produced by the synthesis filter, the inverse
+  filter runs on it to keep the residual state synced with the
+  decoded-speech stream. The residual is computed but not yet
+  consumed downstream — block 82 (1 kHz lowpass + 4:1 decimate +
+  lag 5..35 coarse search + refinement) is the next chunk. The
+  long-term (block 71) postfilter therefore stays at the §4.6.1
+  passthrough; the cold-start `sf = sd` invariant is preserved
+  bit-for-bit.
+- **`Decoder::pitch_inverse_filter()` accessor** for tests and audit.
+
+Round 213 (preserved) adds the **long-term (pitch) postfilter**
+comb-filter machinery (block 71 of Figure 7/G.728):
 
 - **`LongTermPostfilter` — block 71.** New module transcribes the
   spec's `H_l(z) = g_l · (1 + b · z^{-p})` cascade (eq. 4-1) as a
@@ -138,15 +164,16 @@ order-parameterised Levinson-Durbin recursion, and the
 
 ## What is NOT yet wired up
 
-- §4.7 pitch-extraction / coefficient pipeline driving block 71's
-  `(g_l, b, p)` — blocks 81 (10th-order LPC residual via the inverse
-  filter Ã(z)), 82 (Annex D 1 kHz lowpass + 4:1 decimate, coarse
-  correlation search over lags 5..35, full-resolution refinement
-  4τ−3..4τ+3, fundamental-vs-multiple resolution against the previous
-  frame's pitch), 83 (single-tap predictor weight β) and 84
+- §4.7 blocks 82 / 83 / 84 of the pitch-extraction pipeline driving
+  block 71's `(g_l, b, p)`. Block 81 (10th-order LPC inverse filter
+  producing the residual `d(k)`) is wired up (r220). Remaining are
+  block 82 (Annex D 1 kHz lowpass + 4:1 decimate, coarse correlation
+  search over lags 5..35, full-resolution refinement 4τ−3..4τ+3,
+  fundamental-vs-multiple resolution against the previous frame's
+  pitch), 83 (single-tap predictor weight β) and 84
   (`b = PPFZCF·β` / `g_l = 1/(1+b)` clamped per eq. 4-13/4-14). The
   comb-filter machinery itself (block 71) is wired up; until the
-  §4.7 pipeline starts driving non-trivial coefficients the comb
+  block-82..84 sub-pipeline drives non-trivial coefficients the comb
   follows the §4.6.1 "long-term postfilter off" rule — `b = 0`,
   `g_l = 1`, the filter is the identity. The short-term postfilter
   (block 72) and AGC tail (blocks 73–77) are wired up.
@@ -166,26 +193,29 @@ Every numeric value lives in `src/tables.rs` and is transcribed
 directly from the integer columns of Annexes A, B, C, D in the
 ITU-T G.728 1992-09 PDF that lives under `docs/audio/g728/`. Every
 control-flow line in the `hybrid_window`, `synthesis_adapter`,
-`gain_adapter`, `long_term_postfilter`, `short_term_postfilter`
-and `agc` modules carries a comment pointing at the spec's §5.6 /
-§5.7 / §4.6 pseudocode for blocks 36/43/49 (hybrid window), 50
-(Levinson — already in `levinson.rs`), 51 / 45 (bandwidth expansion),
-67/39/40/42/46/47/48 (the per-vector gain chain), 71 (long-term
-comb filter `g_l · (1 + b·z^{-p})` from eq. 4-1, KPMIN/KPMAX
-clamp), 72 (short-term postfilter pole-zero + tilt cascade with
-`SPFZCF / SPFPCF / TILTF` and the `ã_i = -a_i` sign-convention flip
-spelled out in `short_term_postfilter.rs`), and 73/74/75/76/77 (the
-AGC tail with the lowpass form spelled out in §4.6 immediately
-after eq. 4-5). No external implementation source has been opened
-or consulted during this rebuild — the
-per-test cross-checks (peak Q15 values, AR(1) predictor round-trip,
-`λⁱ` geometric progression, codebook row spot-checks, ICOUNT cycle
-ordering, limiter clamp bounds, first-vector σ(n) = 10^(GOFF/20),
+`gain_adapter`, `long_term_postfilter`, `short_term_postfilter`,
+`pitch_inverse_filter` and `agc` modules carries a comment pointing
+at the spec's §5.6 / §5.7 / §4.6 / §4.7 pseudocode for blocks
+36/43/49 (hybrid window), 50 (Levinson — already in `levinson.rs`),
+51 / 45 (bandwidth expansion), 67/39/40/42/46/47/48 (the per-vector
+gain chain), 71 (long-term comb filter `g_l · (1 + b·z^{-p})` from
+eq. 4-1, KPMIN/KPMAX clamp), 72 (short-term postfilter pole-zero +
+tilt cascade with `SPFZCF / SPFPCF / TILTF` and the `ã_i = -a_i`
+sign-convention flip spelled out in `short_term_postfilter.rs`),
+73/74/75/76/77 (the AGC tail with the lowpass form spelled out in
+§4.6 immediately after eq. 4-5), and 81 (10th-order LPC inverse
+filter `Ã(z) = 1 − Σ ã_i · z^{-i}` from eq. 4-6, same `ã_i = -a_i`
+sign flip spelled out in `pitch_inverse_filter.rs`). No external
+implementation has been opened or consulted during this rebuild —
+the per-test cross-checks (peak Q15 values, AR(1) predictor round-
+trip, `λⁱ` geometric progression, codebook row spot-checks, ICOUNT
+cycle ordering, limiter clamp bounds, first-vector σ(n) = 10^(GOFF/20),
 AGC unity-DC convergence + AGCFAC geometric decay, postfilter
 identity at cold start + non-identity divergence after the first
 adaptation cycle + bandwidth-expansion `ã_i · λ^i` invariants +
-tilt `µ = TILTF · k1` invariant) act as in-repo audit anchors
-against transcription typos.
+tilt `µ = TILTF · k1` invariant + block-81 impulse response matching
+`−ã_i` + AR(1) synthesis/inverse round-trip to zero excitation
+residual) act as in-repo audit anchors against transcription typos.
 
 ## License
 

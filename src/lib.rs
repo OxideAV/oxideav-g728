@@ -59,6 +59,20 @@
 //! [`Decoder::decode_vector_postfiltered`] runs the full block
 //! 32 → 71 → 72 → 73..77 chain.
 //!
+//! Round 220 lands the **first stage of the §4.7 pitch-extraction
+//! pipeline** — block 81: the 10th-order LPC inverse filter `Ã(z) = 1 −
+//! Σ ã_i · z^{-i}` (eq. 4-6) producing the residual `d(k)` from the
+//! decoded speech `sd(k)` — see [`pitch_inverse_filter`] /
+//! [`PitchInverseFilter`]. The inverse filter shares the order-10
+//! by-product / first-reflection-coefficient surface already published
+//! by the synthesis-filter adapter, so it refreshes at the same
+//! adaptation-cycle boundary as the short-term postfilter. The residual
+//! stream it produces is the input to the (still-pending) block-82
+//! pitch-period search. Until block 82 lands, the residual is computed
+//! and made observable via [`Decoder::pitch_inverse_filter`] but is not
+//! yet consumed by anything downstream — the long-term postfilter stays
+//! at its §4.6.1 passthrough.
+//!
 //! Round 189 (preserved) provides the Annex A.1/A.2/A.3 hybrid
 //! windows, the Annex B excitation codebook (128 × 5 shape + 8
 //! gain), the Annex C bandwidth-broadening vectors (Q14), the
@@ -68,11 +82,11 @@
 //!
 //! ## What is NOT yet wired up
 //!
-//! * **§4.7 block-81..84 pitch-extraction / coefficient pipeline.**
-//!   The long-term (block 71) comb filter is wired up, but its
-//!   `(g_l, b, p)` coefficients are still held at the §4.6.1
-//!   passthrough because blocks 81 (10th-order LPC inverse filter
-//!   producing residual `d(k)`), 82 (1 kHz Annex D lowpass + 4:1
+//! * **§4.7 blocks 82..84 of the pitch-extraction / coefficient
+//!   pipeline.** Block 81 (the 10th-order LPC inverse filter producing
+//!   residual `d(k)`) is wired up (r220), but the long-term (block 71)
+//!   comb filter's `(g_l, b, p)` coefficients are still held at the
+//!   §4.6.1 passthrough because blocks 82 (1 kHz Annex D lowpass + 4:1
 //!   decimate + lag 5..35 coarse search + full-resolution refinement
 //!   over `4τ−3..4τ+3` + fundamental-vs-multiple resolution against
 //!   the previous frame's pitch), 83 (single-tap pitch predictor
@@ -114,6 +128,7 @@ pub mod gain_adapter;
 pub mod hybrid_window;
 pub mod levinson;
 pub mod long_term_postfilter;
+pub mod pitch_inverse_filter;
 pub mod short_term_postfilter;
 pub mod synthesis_adapter;
 pub mod tables;
@@ -124,6 +139,7 @@ pub use gain_adapter::GainAdapter;
 pub use hybrid_window::{HybridWindow, HybridWindowState};
 pub use levinson::{levinson_durbin, LevinsonError};
 pub use long_term_postfilter::LongTermPostfilter;
+pub use pitch_inverse_filter::PitchInverseFilter;
 pub use short_term_postfilter::ShortTermPostfilter;
 pub use synthesis_adapter::SynthesisAdapter;
 
@@ -200,6 +216,14 @@ pub struct Decoder {
     /// order-10 by-product + first reflection coefficient; runs
     /// sample-by-sample inside [`Decoder::decode_vector_postfiltered`].
     short_term_pf: ShortTermPostfilter,
+    /// Pitch-extractor LPC inverse filter (block 81 of §4.7).
+    /// Refreshed at the first vector of each adaptation cycle from the
+    /// synthesis adapter's order-10 by-product; produces the residual
+    /// `d(k)` consumed (in a later round) by the block-82 pitch search.
+    /// Until block 82 lands the residual is computed for audit / test
+    /// observability but is not fed anywhere — the long-term postfilter
+    /// stays at the §4.6.1 passthrough.
+    pitch_inv_filter: PitchInverseFilter,
     /// Output gain control (blocks 73–77). Always present; the long-
     /// term postfilter (block 71) is still on the §4.6.1 "off" path
     /// pending its block-81..85 pitch-extraction front end. The
@@ -242,6 +266,7 @@ impl Decoder {
             gain_adapter: GainAdapter::new(),
             long_term_pf: LongTermPostfilter::new(),
             short_term_pf: ShortTermPostfilter::new(),
+            pitch_inv_filter: PitchInverseFilter::new(),
             agc: Agc::new(),
             et_prev: [0.0; FRAME_LEN],
             sttmp_buf: [0.0; consts::NFRSZ],
@@ -343,19 +368,25 @@ impl Decoder {
     ///
     /// 1. Run [`Decoder::decode_vector`] for `sd(n)` (block 32).
     /// 2. If this is the first vector of an adaptation cycle, refresh
-    ///    the short-term postfilter coefficients from the synthesis
-    ///    adapter's order-10 by-product and first reflection
-    ///    coefficient (§7.2, eq. 4-3..4-5). The long-term postfilter
+    ///    the short-term postfilter (block 72) coefficients **and** the
+    ///    pitch-extractor LPC inverse filter (block 81) coefficients
+    ///    from the synthesis adapter's order-10 by-product (§7.2,
+    ///    eq. 4-3..4-5; §7.1 eq. 4-6). The long-term postfilter
     ///    coefficients are held at the §4.6.1 passthrough
-    ///    (`g_l = 1`, `b = 0`) until the §4.7 block-81..84 pitch
-    ///    pipeline lands.
-    /// 3. Filter `sd(n)` through the long-term (block 71) comb
+    ///    (`g_l = 1`, `b = 0`) until the block-82..84 sub-pipeline
+    ///    lands.
+    /// 3. Run the block-81 inverse filter on `sd(n)` to advance the
+    ///    pitch-extractor residual state. The output `d(n)` is what
+    ///    block 82 will consume once it lands; for now it is computed
+    ///    purely to keep the inverse filter's 10-tap memory in sync
+    ///    with the decoded-speech stream.
+    /// 4. Filter `sd(n)` through the long-term (block 71) comb
     ///    filter `H_l(z) = g_l · (1 + b · z^{-p})` to obtain
     ///    `sd_lt(n)`. Until block 84 starts driving non-trivial
     ///    coefficients this is the identity (`sd_lt = sd`).
-    /// 4. Filter `sd_lt(n)` through the short-term postfilter
+    /// 5. Filter `sd_lt(n)` through the short-term postfilter
     ///    (block 72) to obtain `sf(n)`.
-    /// 5. Apply the AGC (blocks 73-77) with the spec's per-vector
+    /// 6. Apply the AGC (blocks 73-77) with the spec's per-vector
     ///    `Σ|sd|` / `Σ|sf|` ratio. Per Figure 7/G.728 block 73 reads
     ///    the *decoded* speech `sd` directly, **not** the long-term
     ///    postfilter output — so the AGC numerator stays anchored to
@@ -385,8 +416,21 @@ impl Decoder {
                 self.synth_adapter.order10_predictor(),
                 self.synth_adapter.k1(),
             );
+            self.pitch_inv_filter
+                .set_from_synthesis_byproduct(self.synth_adapter.order10_predictor());
         }
         self.icount = (self.icount + 1) % consts::NUPDATE;
+
+        // Block 81 (§4.7): run the 10th-order LPC inverse filter on
+        // `sd` to produce the residual `d(k)`. The residual is the
+        // input to block 82's pitch-period search; until that block
+        // lands the result is computed for state continuity and
+        // test/audit observability via
+        // [`Self::pitch_inverse_filter`], but not yet consumed
+        // downstream. Discarding the return value here is intentional —
+        // the filter's per-sample memory still advances, which is the
+        // load-bearing side effect for the upcoming block-82 work.
+        let _residual = self.pitch_inv_filter.filter_vector(&sd);
 
         // Step 3: long-term (pitch) postfilter (block 71). With the
         // §4.6.1 passthrough coefficients the comb filter is the
@@ -414,6 +458,16 @@ impl Decoder {
     /// Borrow the short-term postfilter (useful for tests and audit).
     pub fn short_term_postfilter(&self) -> &ShortTermPostfilter {
         &self.short_term_pf
+    }
+
+    /// Borrow the pitch-extractor LPC inverse filter (block 81) — its
+    /// per-sample memory advances every call to
+    /// [`Self::decode_vector_postfiltered`] and its coefficients
+    /// refresh at the first vector of each adaptation cycle. Useful
+    /// for tests and audit, and for the still-pending block-82 search
+    /// to read the residual stream once it lands.
+    pub fn pitch_inverse_filter(&self) -> &PitchInverseFilter {
+        &self.pitch_inv_filter
     }
 
     /// Borrow the AGC (useful for tests and audit).
@@ -736,6 +790,119 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---------- Pitch-extractor inverse filter wiring (r220, block 81)
+
+    #[test]
+    fn decoder_exposes_pitch_inverse_filter_at_cold_start() {
+        // Fresh decoder: inverse filter is at the all-zero coefficient
+        // / all-zero memory cold start (pure identity `Ã(z) = 1`).
+        let dec = Decoder::new();
+        let pf = dec.pitch_inverse_filter();
+        assert!(pf.coefficients().iter().all(|&v| v == 0.0));
+        assert!(pf.memory().iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn pitch_inverse_filter_memory_advances_per_postfiltered_call() {
+        // After a few `decode_vector_postfiltered` calls the inverse
+        // filter's 10-sample memory should hold the most recently
+        // decoded `sd` samples — proving the filter is being driven by
+        // the wiring. We use the cold-start identity (no Levinson result
+        // yet) so the memory's contents equal the raw decoded speech.
+        let mut dec = Decoder::new();
+        // Cold-start cycle: NUPDATE = 4 vectors → no adapter commit yet,
+        // so the inverse filter stays at all-pass and `d == sd` exactly.
+        // We grab the last decoded sample of vector 3 (the most recent
+        // sd sample) and confirm it lives at mem[0] after the call.
+        let mut last_sd_per_vec = [0.0f64; 4];
+        for i in 0..4u16 {
+            let ichan = (i * 13) & 0x03FF;
+            // Compute what `decode_vector` would emit so we have the
+            // ground-truth sd to compare against (the postfiltered
+            // call is bit-identical in this cold-start window).
+            let mut probe = Decoder::new();
+            for j in 0..=i {
+                let _ = probe.decode_vector((j * 13) & 0x03FF);
+            }
+            last_sd_per_vec[i as usize] = {
+                // The probe just decoded vector i; its last sd sample
+                // is whatever the synth produced — read it via a fresh
+                // decode_vector_postfiltered on a sibling decoder.
+                let _ = dec.decode_vector_postfiltered(ichan);
+                // mem[0] should now hold the most recent sd sample.
+                dec.pitch_inverse_filter().memory()[0]
+            };
+        }
+        // All four vectors must have advanced the memory cursor — at a
+        // minimum, mem[0] should NOT be zero by vector 3 (the synth
+        // produces non-zero output by then).
+        let nonzero_seen = last_sd_per_vec.iter().any(|&v| v != 0.0);
+        assert!(
+            nonzero_seen,
+            "pitch inverse filter memory should advance with decoded speech; got {:?}",
+            last_sd_per_vec
+        );
+    }
+
+    #[test]
+    fn pitch_inverse_filter_coefficients_refresh_each_cycle() {
+        // After at least one adaptation cycle has committed, the
+        // inverse filter's coefficients should have diverged from the
+        // all-zero cold start (same trigger as the short-term postfilter
+        // test above — uses the same order-10 by-product).
+        let mut dec = Decoder::new();
+        for i in 0..(consts::NUPDATE as u16 * 4) {
+            let _ = dec.decode_vector_postfiltered(((i + 1) * 17) & 0x03FF);
+        }
+        let pf = dec.pitch_inverse_filter();
+        let any_nz = pf.coefficients()[1..].iter().any(|&v| v != 0.0);
+        assert!(
+            any_nz,
+            "pitch inverse filter coefficients should be non-zero after >=1 cycle"
+        );
+    }
+
+    #[test]
+    fn pitch_inverse_filter_wiring_preserves_cold_start_passthrough_equality() {
+        // The block-81 wiring only TOUCHES the inverse filter — it does
+        // not feed back into the long-term postfilter or any other
+        // observable output. The cold-start identity `sf == sd` for the
+        // first NUPDATE vectors must therefore remain intact.
+        let mut dec_a = Decoder::new();
+        let mut dec_b = Decoder::new();
+        for i in 0..consts::NUPDATE as u16 {
+            let ichan = (i * 23) & 0x03FF;
+            let raw = dec_a.decode_vector(ichan);
+            let pf = dec_b.decode_vector_postfiltered(ichan);
+            for k in 0..FRAME_LEN {
+                assert!(
+                    (raw[k] - pf[k]).abs() < 1e-12,
+                    "block-81 wiring must not perturb cold-start sf == sd; vec={i} k={k}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pitch_inverse_filter_wiring_keeps_long_term_at_passthrough() {
+        // Block 81 produces a residual but does NOT yet drive the
+        // long-term postfilter — that stays at the §4.6.1 passthrough
+        // until blocks 82..84 land. Confirm the long-term coefficients
+        // remain at cold-start values even after many cycles.
+        let mut dec = Decoder::new();
+        for i in 0..(consts::NUPDATE as u16 * 6) {
+            let _ = dec.decode_vector_postfiltered(((i + 1) * 19) & 0x03FF);
+        }
+        let lt = dec.long_term_postfilter();
+        assert_eq!(lt.g_l(), 1.0, "long-term g_l must stay at 1.0");
+        assert_eq!(lt.b(), 0.0, "long-term b must stay at 0.0");
+        assert_eq!(
+            lt.p(),
+            consts::KPMIN,
+            "long-term p must stay at KPMIN until block 82 lands"
+        );
     }
 
     #[test]

@@ -6,6 +6,40 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Pitch-extractor LPC inverse filter (block 81, Figure 7/G.728, §4.7,
+  r220)** — new `PitchInverseFilter` type transcribes the spec's
+  10th-order LPC inverse filter `Ã(z) = 1 − Σ ã_i · z^{-i}` (eq. 4-6)
+  applied to the decoded-speech stream `sd(k)`. Sign convention
+  `ã_i = -a_i` is applied inside `set_from_synthesis_byproduct`; the
+  10-tap FIR memory carries across vector boundaries. The filter is
+  driven by the same order-10 by-product already published by
+  `SynthesisAdapter::order10_predictor()` and refreshes at the same
+  first-vector-of-cycle boundary as the short-term postfilter. New
+  public API: `PitchInverseFilter::{new, set_from_synthesis_byproduct,
+  coefficients, memory, reset, filter_vector}`.
+- **`Decoder::decode_vector_postfiltered` runs block 81 each call.**
+  After the synthesis filter produces `sd(n)`, the inverse filter
+  advances on it to keep the residual state synced with the decoded-
+  speech stream. The residual `d(k)` is computed but not yet consumed
+  — it is the input that block 82 (pitch search) will read once that
+  module lands. The long-term (block 71) comb filter therefore stays
+  at the §4.6.1 passthrough; the cold-start `sf = sd` invariant is
+  preserved bit-for-bit (regression test
+  `pitch_inverse_filter_wiring_preserves_cold_start_passthrough_equality`).
+- **`Decoder::pitch_inverse_filter()` accessor** for tests and audit
+  and as the read surface for the upcoming block-82 search.
+- 12 new tests (`pitch_inverse_filter` module: fresh-filter pass-
+  through, cold-start zero-coefficient invariants, all-pass predictor
+  drives identity across many vectors, sign-flip `ã_i = −a_i` math,
+  eq. 4-6 impulse response matches `−ã_i`, AR(1) roundtrip recovers
+  unit excitation exactly, 10-tap memory carries across vector
+  boundaries, reset returns to identity, sinusoidal-drive finite-
+  output stability; `Decoder`-level: accessor exposes cold-start
+  state, memory advances per postfiltered call, coefficients refresh
+  each cycle, wiring preserves cold-start `sf = sd`, wiring leaves
+  long-term postfilter at `(g_l, b, p) = (1, 0, KPMIN)`). Total
+  crate tests: 111 → 125.
+
 - **Long-term (pitch) postfilter comb-filter machinery (block 71,
   Figure 7/G.728, r213)** — new `LongTermPostfilter` type transcribes
   the spec's `H_l(z) = g_l · (1 + b · z^{-p})` cascade (eq. 4-1) as
