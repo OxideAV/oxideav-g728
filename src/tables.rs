@@ -322,6 +322,74 @@ pub const GSQ: [f64; NG] = [
 ];
 
 // ---------------------------------------------------------------------
+// Precomputed shape-codevector energy table `E_j = Σ_k y_j(k)²`
+//
+// Spec source: §3.9 of the G.728 (1992-09) Recommendation derives the
+// encoder's analysis-by-synthesis search via equations 3-14..3-23. The
+// distortion form rearranges to `D_{i,j} = b_i · <x̃, ỹ_j> + c_i · E_j`
+// (with `b_i = 2·g_i`, `c_i = g_i²`), where `E_j = Σ_{k=1..IDIM} y_j(k)²`
+// is the shape codevector's own energy — a constant of the codebook and
+// therefore precomputable once at table-load time, NOT recomputed per
+// search.
+//
+// `E_j` is a derived quantity from `Y_Q11`: the spec emits no separate
+// printed integer column for it (the same way `G2 = 2·GQ` and
+// `GSQ = GQ²` above are derived from `GQ`). The values here are
+// computed at compile time as 64-bit float sums of squares of the Q11
+// shape rows; the per-test in `tests::y_energy_matches_dot_product`
+// proves the result equals the direct dot product `Σ y_j² / 2²²` to
+// machine precision.
+//
+// The encoder will consume `Y_ENERGY[j]` directly in the search-cost
+// expression of equation 3-23 once block-12..18 of §3.9 lands. The
+// surface is exposed now so the typed encoder skeleton has a stable
+// table to reference; no encoder pipeline logic is implemented yet.
+// ---------------------------------------------------------------------
+
+/// Internal helper: compute one shape codevector's energy in floating
+/// point. `Y_Q11[j]` is the Q11 integer row; the float row is
+/// `Y_Q11[j] / 2¹¹`, so the energy `Σ_k (Y_Q11[j][k] / 2¹¹)²` equals
+/// `Σ_k Y_Q11[j][k]² / 2²²`.
+const fn shape_energy_q11_row(j: usize) -> f64 {
+    let scale = (1u64 << (Q11 * 2)) as f64;
+    let mut sum = 0.0f64;
+    let mut k = 0;
+    while k < IDIM {
+        let v = Y_Q11[j][k] as f64;
+        sum += v * v;
+        k += 1;
+    }
+    sum / scale
+}
+
+/// Precomputed shape codevector energy `E_j = Σ_k y_j(k)²` for
+/// 0 ≤ j < 128 (§3.9, equation 3-23). Derived from `Y_Q11` at compile
+/// time using the spec-stated Q11 → float division by 2 048; the
+/// per-test guard `y_energy_matches_dot_product` cross-checks each
+/// entry against a direct dot-product computation in `y_f64()` space.
+///
+/// Values are non-negative by construction (sum of squares); the
+/// per-test `y_energy_all_non_negative_and_finite` enforces this
+/// invariant explicitly.
+pub const Y_ENERGY: [f64; NCWD] = {
+    let mut out = [0.0f64; NCWD];
+    let mut j = 0;
+    while j < NCWD {
+        out[j] = shape_energy_q11_row(j);
+        j += 1;
+    }
+    out
+};
+
+/// Run-time accessor matching the float-view convention used elsewhere
+/// in this module (`facv_f64` / `facgpv_f64` / etc.). Returns a fresh
+/// owned copy of [`Y_ENERGY`] for callers that prefer the accessor
+/// shape over a direct constant reference.
+pub fn y_energy_f64() -> [f64; NCWD] {
+    Y_ENERGY
+}
+
+// ---------------------------------------------------------------------
 // Annex C — Bandwidth broadening vectors (Q14)
 // ---------------------------------------------------------------------
 
@@ -671,5 +739,83 @@ mod tests {
     fn lowpass_filter_is_normalised() {
         // Spec form: `a0 = 1.0`. The implicit a0 tap is `AL[0]`.
         assert_eq!(AL[0], 1.0);
+    }
+
+    // ------------- Shape-codevector energy table (E_j, §3.9 eq. 3-23) -
+
+    #[test]
+    fn y_energy_table_dimension_matches_codebook() {
+        // §3.9 prose: one E_j per shape codevector. Codebook has NCWD =
+        // 128 rows, so the energy table must also have 128 entries.
+        assert_eq!(Y_ENERGY.len(), NCWD);
+    }
+
+    #[test]
+    fn y_energy_matches_dot_product() {
+        // Cross-check: E_j must equal the direct Σ_k y_j(k)² computed
+        // on the floating-point shape codevector view. This pins the
+        // const-derived Y_ENERGY against the same data the rest of the
+        // crate reads through `y_f64()` and guards against a future
+        // typo in either branch of the derivation.
+        let y_float = y_f64();
+        for j in 0..NCWD {
+            let mut expected = 0.0f64;
+            for k in 0..IDIM {
+                expected += y_float[j][k] * y_float[j][k];
+            }
+            assert!(
+                (Y_ENERGY[j] - expected).abs() < 1e-12,
+                "Y_ENERGY[{}] = {} vs dot-product {} (diff {})",
+                j,
+                Y_ENERGY[j],
+                expected,
+                (Y_ENERGY[j] - expected).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn y_energy_all_non_negative_and_finite() {
+        // Sum-of-squares ⇒ every entry must be ≥ 0 and finite. A zero
+        // entry would correspond to the all-zero codevector — the
+        // printed Annex B codebook has no such row, so every entry must
+        // be strictly positive.
+        for (j, &e) in Y_ENERGY.iter().enumerate() {
+            assert!(e.is_finite(), "Y_ENERGY[{}] not finite: {}", j, e);
+            assert!(e > 0.0, "Y_ENERGY[{}] not strictly positive: {}", j, e);
+        }
+    }
+
+    #[test]
+    fn y_energy_row_zero_matches_hand_computed() {
+        // Annex B prose lists row 0 of the Q11 shape codebook as
+        // (668, -2950, -1254, -1790, -2553). The floating-point row is
+        // those values divided by 2 048, and the energy is the sum of
+        // squares of that float row. Spot-check the resulting E_0
+        // against a hand-computed value (Q11 sum of squares /
+        // 4 194 304 = 2²²).
+        //
+        //  668² + 2950² + 1254² + 1790² + 2553² =
+        //  446 224 + 8 702 500 + 1 572 516 + 3 204 100 + 6 517 809
+        //  = 20 443 149
+        // / 2²² (= 4 194 304) ≈ 4.874...
+        let expected = 20_443_149.0_f64 / (1u64 << 22) as f64;
+        assert!(
+            (Y_ENERGY[0] - expected).abs() < 1e-12,
+            "Y_ENERGY[0] = {} vs hand-computed {} (diff {})",
+            Y_ENERGY[0],
+            expected,
+            (Y_ENERGY[0] - expected).abs()
+        );
+    }
+
+    #[test]
+    fn y_energy_accessor_returns_same_data_as_const() {
+        // The runtime accessor is a thin owned-copy wrapper around the
+        // const; bit-for-bit equality is the contract.
+        let view = y_energy_f64();
+        for j in 0..NCWD {
+            assert_eq!(view[j], Y_ENERGY[j]);
+        }
     }
 }

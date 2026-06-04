@@ -6,6 +6,48 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Typed encoder scaffold + `E_j` shape-energy table (§3.9, r235)** —
+  new `encoder` module exposes a stable [`Encoder`] type and a
+  [`make_encoder`] factory mirroring the decoder's dual-API
+  convention. The encoder carries the two backward adapters
+  (`SynthesisAdapter` and `GainAdapter`, §3.7 / §3.8) plus the
+  previous gain-scaled excitation `ET(1..IDIM)` slot, all initialised
+  to Table 2/G.728 values. §4.4 / §4.5 of the Recommendation require
+  the two backward adapters to be bit-for-bit identical at both ends
+  of the channel, so the encoder reuses the exact types the decoder
+  already drives.
+- **`tables::Y_ENERGY` — precomputed shape codevector energy
+  `E_j = Σ_k y_j(k)²`** — new `[f64; NCWD]` constant derived at
+  compile time from the already-transcribed Annex B `Y_Q11` shape
+  codebook via `Σ_k Y_Q11[j][k]² / 2²²` (the `Y_Q11 / 2¹¹` Q-shift
+  squared). §3.9 of the Recommendation rearranges the
+  analysis-by-synthesis distortion (eqs. 3-14..3-23) into
+  `D_{i,j} = b_i · <x̃, ỹ_j> + c_i · E_j` (with `b_i = 2·g_i`,
+  `c_i = g_i²`), and `E_j` is a constant of the codebook that the
+  search loop will look up once per shape scan. Exposed via the new
+  `Encoder::shape_energy()` accessor and the runtime `y_energy_f64()`
+  view function (same convention as `facv_f64` / `facgpv_f64`).
+- **`Encoder::encode_vector` typed signature** returning
+  `Result<u16, Error>` — `Error::NotImplemented` in round 235 because
+  the §3.9 analysis-by-synthesis search (blocks 1..28 + 67..70) is
+  not yet implemented. Signature is final for the future pipeline:
+  one `FRAME_LEN`-sample input vector in, one 10-bit channel index
+  out.
+- **Public surface additions**: `Encoder`, `make_encoder`,
+  `CHANNEL_INDEX_BITS = 10` (§2.1), `tables::Y_ENERGY`,
+  `tables::y_energy_f64`.
+- 13 new tests (`tables` module: `Y_ENERGY` dimension matches NCWD,
+  every entry equals the direct `y_f64()` dot product to machine
+  precision, every entry is finite + strictly positive, row 0 hits
+  the hand-computed value 20 443 149 / 2²², runtime accessor mirrors
+  the const; `encoder` module: fresh state matches Table 2 `ET = 0`,
+  `Default` == `new`, shape-energy accessor returns the right
+  table, `encode_vector` returns `NotImplemented` in r235,
+  `CHANNEL_INDEX_BITS == 10`, `make_encoder` produces fresh state,
+  the synthesis adapter exposes `A(1) = 1` at fresh construction,
+  the gain adapter starts at `ICOUNT = 1`). Total crate tests: 170 →
+  183.
+
 - **Long-term postfilter coefficient calculator (blocks 83 + 84,
   Figure 7/G.728, §4.7, r229)** — new `PitchPostfilterCoeff` type
   transcribes the §4.7 single-tap pitch-predictor weight and the

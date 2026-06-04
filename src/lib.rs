@@ -116,6 +116,18 @@
 //! constants, the Levinson-Durbin recursion, and the
 //! [`Decoder::decode_index`] caller-driven entry point.
 //!
+//! Round 235 lands the **typed encoder scaffold** — see [`Encoder`] /
+//! [`make_encoder`] — plus the [`tables::Y_ENERGY`] precomputed shape
+//! codevector energy table (`E_j = Σ_k y_j(k)²`) that §3.9 equation
+//! 3-23 references in the analysis-by-synthesis cost expression. No
+//! encoder pipeline (§3.9 blocks 1..28 + 67..70) is implemented yet —
+//! every [`Encoder::encode_vector`] call returns
+//! [`Error::NotImplemented`]. The encoder type carries the same two
+//! backward adapters as the decoder ([`SynthesisAdapter`] and
+//! [`GainAdapter`]) because §4.4 / §4.5 of the Recommendation require
+//! the two backward adapters to be bit-for-bit identical at both ends
+//! of the channel.
+//!
 //! ## What is NOT yet wired up
 //!
 //! * **PCM format conversion (blocks 1, 28).** A-law / µ-law I/O is
@@ -150,6 +162,7 @@ use oxideav_core::RuntimeContext;
 pub mod agc;
 pub mod consts;
 pub mod decoder;
+pub mod encoder;
 pub mod gain_adapter;
 pub mod hybrid_window;
 pub mod levinson;
@@ -163,6 +176,7 @@ pub mod tables;
 
 pub use agc::Agc;
 pub use decoder::{pack_channel_index, ExcitationVector, Synthesizer, DEFAULT_MAX, FRAME_LEN};
+pub use encoder::{make_encoder, Encoder, CHANNEL_INDEX_BITS};
 pub use gain_adapter::GainAdapter;
 pub use hybrid_window::{HybridWindow, HybridWindowState};
 pub use levinson::{levinson_durbin, LevinsonError};

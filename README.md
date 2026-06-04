@@ -2,7 +2,7 @@
 
 Pure-Rust ITU-T G.728 Low-Delay CELP (LD-CELP, 16 kbit/s) speech codec.
 
-## Status: clean-room rebuild — autonomous decoder + full §4.7 pitch postfilter (blocks 81/82/83/84) + long-term comb + short-term postfilter + AGC (round 229)
+## Status: clean-room rebuild — autonomous decoder + full §4.7 pitch postfilter (blocks 81/82/83/84) + long-term comb + short-term postfilter + AGC + typed encoder scaffold + §3.9 `E_j` shape-energy table (round 235)
 
 The crate was reset to a register-only scaffold under the workspace
 clean-room policy (round 171, master `14e3bad`): the previous
@@ -10,6 +10,39 @@ implementation had numeric tables extracted from an external reference
 C distribution, which the policy forbids regardless of the source's
 licence. The crate is being rebuilt one spec-cited unit at a time from
 the published ITU-T G.728 (1992-09) Recommendation prose alone.
+
+Round 235 lands the **typed encoder scaffold** plus the **§3.9
+precomputed `E_j` shape-codevector energy table** that the
+analysis-by-synthesis search of equation 3-23 will consume:
+
+- **`Encoder` — typed front-end scaffold.** New `encoder` module exposes
+  a stable [`Encoder`] type and a [`make_encoder`] factory mirroring the
+  decoder's dual-API convention (`make_decoder`). The encoder carries
+  the two backward adapters (synthesis-filter adapter §3.7 = block 23,
+  log-gain adapter §3.8 = block 20) plus the `ET(1..IDIM)` 1-vector
+  delay slot, all initialised to Table 2/G.728 values. §4.4 / §4.5 of
+  the Recommendation require the backward adapters to be bit-for-bit
+  identical at both ends of the channel, so the encoder reuses the
+  exact `SynthesisAdapter` / `GainAdapter` types the decoder already
+  drives.
+- **`Y_ENERGY` — `E_j = Σ_k y_j(k)²`.** New `[f64; NCWD]` constant in
+  `tables.rs`, derived at compile time from the already-transcribed
+  Annex B `Y_Q11` shape codebook. §3.9 of the Recommendation rearranges
+  the analysis-by-synthesis distortion (eqs. 3-14..3-23) into
+  `D_{i,j} = b_i · <x̃, ỹ_j> + c_i · E_j` (with `b_i = 2·g_i`,
+  `c_i = g_i²`), where `E_j` is a constant of the codebook and
+  therefore precomputable once at table-load time. Exposed via
+  `Encoder::shape_energy()` for the future analysis-by-synthesis
+  search; the per-test in `tables.rs` cross-checks every entry against
+  a direct dot-product computation in `y_f64()` space to machine
+  precision (and against a hand-computed value for row 0).
+- **`Encoder::encode_vector` returns `Error::NotImplemented`.** The
+  signature is final (one input vector → one 10-bit channel index)
+  but the §3.9 search loop (perceptual-weighting filter + impulse
+  response + zero-state response correlation + shape-codebook scan +
+  gain-quantiser decision tree) is intentionally absent in round 235.
+  Future rounds wire blocks 1..28 + 67..70 against the already-typed
+  adapter surfaces this round establishes.
 
 Round 195 lands the two **backward adapters**, which together let the
 decoder run autonomously off the raw 10-bit channel-index stream
@@ -241,12 +274,14 @@ order-parameterised Levinson-Durbin recursion, and the
 ## What is NOT yet wired up
 
 - A-law / µ-law PCM I/O — `oxideav-g711` handles this per §5.3 / §3.1.
-- The encoder side (blocks 1..28 + 67..70 + the codebook search of
-  §3.9 / blocks 12..18). The decoder-side synthesis-filter adapter
-  (block 23 in the encoder = block 33 in the decoder) and the
-  decoder-side gain adapter (block 20 in the encoder = block 30 in
-  the decoder) are now shareable via the `SynthesisAdapter` /
-  `GainAdapter` types.
+- The encoder pipeline (blocks 1..28 + 67..70 + the codebook search
+  of §3.9 / blocks 12..18). Round 235 lands the typed encoder front
+  end (`Encoder` / `make_encoder` / `Encoder::encode_vector`) so the
+  symbol is available now, but every `encode_*` call returns
+  `Error::NotImplemented`. The shared backward adapters (block 23 in
+  the encoder = block 33 in the decoder; block 20 in the encoder =
+  block 30 in the decoder) are reused unchanged via the existing
+  `SynthesisAdapter` / `GainAdapter` types per §4.4 / §4.5.
 - Annex G fixed-point variant and Annex I frame-loss concealment
   remain deferred behind the floating-point decoder.
 
@@ -254,12 +289,18 @@ order-parameterised Levinson-Durbin recursion, and the
 
 Every numeric value lives in `src/tables.rs` and is transcribed
 directly from the integer columns of Annexes A, B, C, D in the
-ITU-T G.728 1992-09 PDF that lives under `docs/audio/g728/`. Every
-control-flow line in the `hybrid_window`, `synthesis_adapter`,
-`gain_adapter`, `long_term_postfilter`, `short_term_postfilter`,
-`pitch_inverse_filter`, `pitch_search`, `pitch_postfilter_coeff`
-and `agc` modules carries a comment pointing at the spec's §5.6 /
-§5.7 / §4.6 / §4.7 pseudocode
+ITU-T G.728 1992-09 PDF that lives under `docs/audio/g728/`. Round
+235's `Y_ENERGY` table is a **derived** quantity from the Annex B
+shape codebook — not a separately printed column — computed at
+compile time as `Σ_k (Y_Q11[j][k] / 2¹¹)²` per §3.9 equation 3-23,
+with a per-test cross-check against the same `y_f64()` dot product
+the rest of the crate already consumes. Every control-flow line in
+the `hybrid_window`, `synthesis_adapter`, `gain_adapter`,
+`long_term_postfilter`, `short_term_postfilter`,
+`pitch_inverse_filter`, `pitch_search`, `pitch_postfilter_coeff`,
+`agc` and `encoder` modules carries a comment pointing at the
+spec's §3.7 / §3.8 / §3.9 / §4.4 / §4.5 / §5.6 / §5.7 / §4.6 / §4.7
+pseudocode
 for blocks 36/43/49 (hybrid window), 50 (Levinson — already in
 `levinson.rs`), 51 / 45 (bandwidth expansion), 67/39/40/42/46/47/48
 (the per-vector gain chain), 71 (long-term comb filter
