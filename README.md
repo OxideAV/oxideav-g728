@@ -2,7 +2,7 @@
 
 Pure-Rust ITU-T G.728 Low-Delay CELP (LD-CELP, 16 kbit/s) speech codec.
 
-## Status: clean-room rebuild — autonomous decoder + full §4.7 pitch postfilter (blocks 81/82/83/84) + long-term comb + short-term postfilter + AGC + typed encoder scaffold + §3.9 `E_j` shape-energy table (round 235)
+## Status: clean-room rebuild — autonomous decoder + full §4.7 pitch postfilter (blocks 81/82/83/84) + long-term comb + short-term postfilter + AGC + typed encoder scaffold + §3.9 `E_j` shape-energy table + §3.3 perceptual-weighting coefficient calculator (block 38) (round 248)
 
 The crate was reset to a register-only scaffold under the workspace
 clean-room policy (round 171, master `14e3bad`): the previous
@@ -10,6 +10,41 @@ implementation had numeric tables extracted from an external reference
 C distribution, which the policy forbids regardless of the source's
 licence. The crate is being rebuilt one spec-cited unit at a time from
 the published ITU-T G.728 (1992-09) Recommendation prose alone.
+
+Round 248 lands the **perceptual weighting filter coefficient
+calculator** — block 38 of the encoder's perceptual weighting filter
+adapter (Figure 4a/G.728), the third and last sub-block of §3.3 (after
+hybrid window 36 + Levinson 37 transcribed earlier in the shared
+`hybrid_window` / `levinson` modules):
+
+- **`WeightingFilterCoeff` — block 38.** New `weighting_filter_coeff`
+  module transcribes the mechanical substitution `z ← z/γ_k` of
+  eq. 3-4b / 3-4c. Given the order-10 LPC predictor `q_i` from block
+  37 (eq. 3-3a with `q_0 = 1`), block 38 produces the bandwidth-
+  broadened numerator `qγ₁_i = q_i · γ₁ⁱ` and denominator
+  `qγ₂_i = q_i · γ₂ⁱ` for `i = 1..=LPCW`. The `(γ₁, γ₂) = (WZCF,
+  WPCF) = (0.9, 0.6)` paragraph values of Table 1/G.728 are used by
+  default; the same routine plumbed through `from_lpc_with_gammas`
+  realises the §3.4.1 "non-speech, `γ₁ = γ₂ = 0`" disabled path
+  without a branch in the production transform. Both output sequences
+  carry the spec's 1-based layout (`q_gamma_k[0] = 1.0` implicit
+  leading tap), matching the `SynthesisAdapter::coefficients`
+  convention already used elsewhere in the crate so future
+  apply-the-weighting-filter rounds (blocks 4 / 10) can reuse the
+  same "skip element 0, dot product over `1..=LPCW`" idiom.
+- **`Encoder::weighting_filter_coeff()` accessor +
+  `Encoder::set_weighting_filter_coeff_from_lpc()` setter +
+  `Encoder::disable_weighting_filter()` switch.** The encoder now
+  carries a `WeightingFilterCoeff` field initialised to the
+  §3.4 / §3.4.1 all-pass `W(z) = 1`. The setter is the spec-direct
+  block-38 entry point (the future block-37 wiring round feeds its
+  Levinson output straight through); the disable switch flips the
+  §3.4.1 non-speech mode without re-running the transform.
+- **Block 4 / block 10 — applying the filter to input speech /
+  zero-input response — is NOT wired up.** Those carry their own
+  per-vector delay-line state plus the §3.4 special initialisation
+  rule ("filter memory should not be reset to zero at any time
+  except during initialisation") and are queued for a later round.
 
 Round 235 lands the **typed encoder scaffold** plus the **§3.9
 precomputed `E_j` shape-codevector energy table** that the
@@ -277,10 +312,16 @@ order-parameterised Levinson-Durbin recursion, and the
 - The encoder pipeline (blocks 1..28 + 67..70 + the codebook search
   of §3.9 / blocks 12..18). Round 235 lands the typed encoder front
   end (`Encoder` / `make_encoder` / `Encoder::encode_vector`) so the
-  symbol is available now, but every `encode_*` call returns
-  `Error::NotImplemented`. The shared backward adapters (block 23 in
-  the encoder = block 33 in the decoder; block 20 in the encoder =
-  block 30 in the decoder) are reused unchanged via the existing
+  symbol is available now; round 248 adds block 38 (the perceptual-
+  weighting coefficient calculator) as a typed transform consumable
+  via `Encoder::set_weighting_filter_coeff_from_lpc`. The remaining
+  block-37 wiring (Levinson on the §3.3 hybrid-window output), block
+  4 / block 10 (applying the weighting filter to input speech / to
+  the zero-input response of the synthesis filter), and the full
+  §3.9 search loop still surface `Error::NotImplemented` from
+  `encode_vector`. The shared backward adapters (block 23 in the
+  encoder = block 33 in the decoder; block 20 in the encoder = block
+  30 in the decoder) are reused unchanged via the existing
   `SynthesisAdapter` / `GainAdapter` types per §4.4 / §4.5.
 - Annex G fixed-point variant and Annex I frame-loss concealment
   remain deferred behind the floating-point decoder.
@@ -294,13 +335,19 @@ ITU-T G.728 1992-09 PDF that lives under `docs/audio/g728/`. Round
 shape codebook — not a separately printed column — computed at
 compile time as `Σ_k (Y_Q11[j][k] / 2¹¹)²` per §3.9 equation 3-23,
 with a per-test cross-check against the same `y_f64()` dot product
-the rest of the crate already consumes. Every control-flow line in
-the `hybrid_window`, `synthesis_adapter`, `gain_adapter`,
-`long_term_postfilter`, `short_term_postfilter`,
+the rest of the crate already consumes. Round 248's
+`WeightingFilterCoeff` is similarly a derived quantity: the spec-
+paragraph γ₁ = 0.9, γ₂ = 0.6 of Table 1/G.728 power-multiplied
+against the caller-supplied order-10 `q_i` per eq. 3-4b / 3-4c, with
+per-test cross-checks against (i) the unity-q geometric progression
+of `γ_k^i`, (ii) a hand-traced `q_i = (−1/2)^i` term-by-term, and
+(iii) the `γ₂ < γ₁ < 1` ordering of the Table 1 paragraph values.
+Every control-flow line in the `hybrid_window`, `synthesis_adapter`,
+`gain_adapter`, `long_term_postfilter`, `short_term_postfilter`,
 `pitch_inverse_filter`, `pitch_search`, `pitch_postfilter_coeff`,
-`agc` and `encoder` modules carries a comment pointing at the
-spec's §3.7 / §3.8 / §3.9 / §4.4 / §4.5 / §5.6 / §5.7 / §4.6 / §4.7
-pseudocode
+`agc`, `encoder` and `weighting_filter_coeff` modules carries a
+comment pointing at the spec's §3.3 / §3.4 / §3.7 / §3.8 / §3.9 /
+§4.4 / §4.5 / §5.6 / §5.7 / §4.6 / §4.7 pseudocode
 for blocks 36/43/49 (hybrid window), 50 (Levinson — already in
 `levinson.rs`), 51 / 45 (bandwidth expansion), 67/39/40/42/46/47/48
 (the per-vector gain chain), 71 (long-term comb filter

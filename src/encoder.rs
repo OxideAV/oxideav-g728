@@ -48,6 +48,7 @@ use crate::decoder::FRAME_LEN;
 use crate::gain_adapter::GainAdapter;
 use crate::synthesis_adapter::SynthesisAdapter;
 use crate::tables::Y_ENERGY;
+use crate::weighting_filter_coeff::WeightingFilterCoeff;
 use crate::Error;
 
 /// Number of bits in one G.728 channel index (§2.1). Exposed as a
@@ -73,6 +74,15 @@ pub struct Encoder {
     synth_adapter: SynthesisAdapter,
     /// Backward vector gain adapter, shared block-30 logic.
     gain_adapter: GainAdapter,
+    /// Perceptual weighting filter coefficients (block 38 output).
+    /// Driven from the order-10 LPC predictor produced by block 37 of
+    /// the perceptual weighting filter adapter (block 3) per
+    /// equations 3-4b / 3-4c. Initialised to the §3.4 / §3.4.1
+    /// "filter disabled" all-pass `W(z) = 1` per Table 2/G.728 —
+    /// before the first adaptation cycle has run, no `q_i` is yet
+    /// available, and the spec's start-up convention is to leave the
+    /// filter as a pass-through.
+    weighting_filter_coeff: WeightingFilterCoeff,
     /// Previous gain-scaled excitation vector — block-67 1-vector
     /// delay. Initialised to zero per Table 2/G.728.
     et_prev: [f64; FRAME_LEN],
@@ -93,6 +103,10 @@ impl Encoder {
         Self {
             synth_adapter: SynthesisAdapter::new(),
             gain_adapter: GainAdapter::new(),
+            // §3.4 / §3.4.1: before the first adaptation cycle the
+            // weighting filter is the all-pass `W(z) = 1`. The
+            // disabled-mode constructor produces exactly this state.
+            weighting_filter_coeff: WeightingFilterCoeff::disabled(),
             et_prev: [0.0; FRAME_LEN],
         }
     }
@@ -124,6 +138,37 @@ impl Encoder {
     /// 67 (1-vector delay) reads this on every encoded vector.
     pub fn previous_excitation(&self) -> &[f64; FRAME_LEN] {
         &self.et_prev
+    }
+
+    /// Borrow the current perceptual-weighting filter coefficients
+    /// `(Q̃(z/γ₁), Q̃(z/γ₂))` — output of block 38 (§3.3 eqs. 3-4b,
+    /// 3-4c). Before the first adaptation cycle has run (round-248
+    /// scaffold state), this is the all-pass `W(z) = 1`.
+    pub fn weighting_filter_coeff(&self) -> &WeightingFilterCoeff {
+        &self.weighting_filter_coeff
+    }
+
+    /// Set the perceptual-weighting filter coefficients from the
+    /// order-10 LPC predictor `q_i` that block 37 (the Levinson-Durbin
+    /// recursion of the weighting filter adapter, §3.3) produces. This
+    /// is block 38's spec contract: the substitutions `z ← z/γ₁`,
+    /// `z ← z/γ₂` of eq. 3-4b / 3-4c.
+    ///
+    /// `q[0]` must equal `1.0` per the spec's eq. 3-3a leading-tap
+    /// convention; `q[1..=LPCW]` carries the 10 broadened predictor
+    /// coefficients.
+    pub fn set_weighting_filter_coeff_from_lpc(&mut self, q: &[f64; crate::consts::LPCW + 1]) {
+        self.weighting_filter_coeff = WeightingFilterCoeff::from_lpc(q);
+    }
+
+    /// §3.4.1 non-speech-mode entry. Force the perceptual weighting
+    /// filter to the all-pass `W(z) = 1` state regardless of the
+    /// last adaptation cycle's `q_i`. Exposed so encoder callers
+    /// integrating G.728 into a modem path can flip the spec's
+    /// "disable weighting filter" switch without re-running the
+    /// transform.
+    pub fn disable_weighting_filter(&mut self) {
+        self.weighting_filter_coeff = WeightingFilterCoeff::disabled();
     }
 
     /// Encode one `FRAME_LEN`-sample input vector into one 10-bit
@@ -242,5 +287,79 @@ mod tests {
         // returns one.
         let enc = Encoder::new();
         assert_eq!(enc.gain_adapter().icount(), 1);
+    }
+
+    #[test]
+    fn fresh_encoder_weighting_filter_is_all_pass() {
+        // §3.4 / §3.4.1: before the first adaptation cycle the
+        // perceptual weighting filter is the all-pass W(z) = 1, i.e.
+        // both q_gamma1 and q_gamma2 are [1, 0, 0, ..., 0]. The
+        // module-level tests cover the spec invariants in detail;
+        // here we just confirm the encoder's fresh state matches
+        // WeightingFilterCoeff::disabled().
+        let enc = Encoder::new();
+        let coeff = enc.weighting_filter_coeff();
+        assert_eq!(*coeff, WeightingFilterCoeff::disabled());
+    }
+
+    #[test]
+    fn set_weighting_filter_coeff_drives_block_38() {
+        // Round-trip: feeding the encoder a known q_i vector through
+        // set_weighting_filter_coeff_from_lpc must yield the same
+        // (q_gamma1, q_gamma2) as a direct WeightingFilterCoeff::from_lpc
+        // call. This is the spec's block 38 dataflow — the encoder
+        // doesn't transform the q_i further on its way through.
+        let q = [
+            1.0f64,
+            0.5,
+            -0.25,
+            0.125,
+            -0.0625,
+            0.03125,
+            -0.015_625,
+            0.007_812_5,
+            -0.003_906_25,
+            0.001_953_125,
+            -0.000_976_562_5,
+        ];
+
+        let mut enc = Encoder::new();
+        enc.set_weighting_filter_coeff_from_lpc(&q);
+
+        let direct = WeightingFilterCoeff::from_lpc(&q);
+        assert_eq!(*enc.weighting_filter_coeff(), direct);
+    }
+
+    #[test]
+    fn disable_weighting_filter_returns_to_all_pass() {
+        // §3.4.1 manual disable path: after the calculator has been
+        // populated by a non-trivial q_i, the encoder must still be
+        // able to flip back to W(z) = 1 on demand.
+        let q = [
+            1.0f64,
+            0.5,
+            -0.25,
+            0.125,
+            -0.0625,
+            0.03125,
+            -0.015_625,
+            0.007_812_5,
+            -0.003_906_25,
+            0.001_953_125,
+            -0.000_976_562_5,
+        ];
+
+        let mut enc = Encoder::new();
+        enc.set_weighting_filter_coeff_from_lpc(&q);
+        assert_ne!(
+            *enc.weighting_filter_coeff(),
+            WeightingFilterCoeff::disabled()
+        );
+
+        enc.disable_weighting_filter();
+        assert_eq!(
+            *enc.weighting_filter_coeff(),
+            WeightingFilterCoeff::disabled()
+        );
     }
 }

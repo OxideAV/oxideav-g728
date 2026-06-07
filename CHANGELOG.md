@@ -6,6 +6,51 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Perceptual weighting filter coefficient calculator (block 38,
+  Figure 4a/G.728, §3.3 / §3.4, r248)** — new
+  `weighting_filter_coeff` module transcribes block 38 of the encoder's
+  perceptual weighting filter adapter. §3.3 defines the filter as
+  `W(z) = Q̃(z/γ₁) / Q̃(z/γ₂)` (eq. 3-4a) where
+  `Q̃(z) = 1 + Σ q_i · z⁻ⁱ` (eq. 3-3a) is the 10th-order prediction-
+  error filter built from the order-10 LPC predictor `q_i` output of
+  block 37, and `γ₁ = WZCF = 0.9`, `γ₂ = WPCF = 0.6` are the
+  Table 1/G.728 zero-control / pole-control bandwidth factors. Block
+  38's transform is the mechanical substitution `z ← z/γ_k` of
+  eq. 3-4b / 3-4c, producing the bandwidth-broadened sequences
+  `q_i · γ₁ⁱ` (numerator) and `q_i · γ₂ⁱ` (denominator) for
+  `i = 1..=LPCW`. Both sequences carry the spec's 1-based layout
+  (`q_gamma_k[0] = 1.0` implicit leading tap; `q_gamma_k[1..=LPCW]`
+  the broadened taps), matching the `SynthesisAdapter::coefficients`
+  convention already in use elsewhere in the crate.
+- **`WeightingFilterCoeff::disabled` — §3.4.1 non-speech-mode
+  constructor** — produces the `W(z) = 1` all-pass state for modem /
+  other non-speech signals (the spec's "set γ₁ = γ₂ = 0" shortcut,
+  which drops every non-unity tap of both sequences). Also used as
+  the start-up value before the first adaptation cycle has produced
+  `q_i`.
+- **`Encoder::weighting_filter_coeff` accessor +
+  `Encoder::set_weighting_filter_coeff_from_lpc` +
+  `Encoder::disable_weighting_filter`** — block 38 driven through
+  the encoder's typed surface. The fresh encoder starts at the
+  §3.4.1 `W(z) = 1` state; downstream encoder rounds wire block 37's
+  Levinson-Durbin output into the calculator via the typed setter.
+  The disable hook flips the §3.4.1 switch without re-running the
+  transform.
+- **Public surface additions**: `WeightingFilterCoeff`, the
+  `weighting_filter_coeff` module, and the three new `Encoder`
+  methods above.
+- 10 new tests (`weighting_filter_coeff` module: disabled state is
+  `W(z) = 1` shape, `Default` equals `disabled`, unity-q input
+  reproduces the `γ_k^i` geometric progression to within `1e-14`,
+  zero-γ inputs disable the filter, hand-traced `q_i = (−0.5)^i`
+  matches the eq. 3-4b / 3-4c termwise expected values to within
+  `1e-14`, `γ₂ < γ₁ < 1` geometric-consequence invariant at the
+  longest tap, non-unity `q[0]` correctly panics; `encoder` module:
+  fresh encoder matches `WeightingFilterCoeff::disabled`,
+  `set_weighting_filter_coeff_from_lpc` is the spec-direct
+  dataflow, `disable_weighting_filter` returns to the all-pass).
+  Total crate tests: 183 → 193.
+
 - **Typed encoder scaffold + `E_j` shape-energy table (§3.9, r235)** —
   new `encoder` module exposes a stable [`Encoder`] type and a
   [`make_encoder`] factory mirroring the decoder's dual-API

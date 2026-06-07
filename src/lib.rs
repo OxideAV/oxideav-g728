@@ -173,6 +173,7 @@ pub mod pitch_search;
 pub mod short_term_postfilter;
 pub mod synthesis_adapter;
 pub mod tables;
+pub mod weighting_filter_coeff;
 
 pub use agc::Agc;
 pub use decoder::{pack_channel_index, ExcitationVector, Synthesizer, DEFAULT_MAX, FRAME_LEN};
@@ -186,6 +187,7 @@ pub use pitch_postfilter_coeff::PitchPostfilterCoeff;
 pub use pitch_search::PitchSearch;
 pub use short_term_postfilter::ShortTermPostfilter;
 pub use synthesis_adapter::SynthesisAdapter;
+pub use weighting_filter_coeff::WeightingFilterCoeff;
 
 /// Crate-local error type.
 ///
