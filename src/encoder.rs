@@ -48,6 +48,7 @@ use crate::decoder::FRAME_LEN;
 use crate::gain_adapter::GainAdapter;
 use crate::synthesis_adapter::SynthesisAdapter;
 use crate::tables::Y_ENERGY;
+use crate::weighting_filter::PerceptualWeightingFilter;
 use crate::weighting_filter_coeff::WeightingFilterCoeff;
 use crate::Error;
 
@@ -83,6 +84,15 @@ pub struct Encoder {
     /// available, and the spec's start-up convention is to leave the
     /// filter as a pass-through.
     weighting_filter_coeff: WeightingFilterCoeff,
+    /// Block 4 — the perceptual weighting filter `W(z)` applied to the
+    /// current input speech vector `s(n)` to produce the weighted
+    /// speech vector `v(n)` (§3.4). Per §3.4 the per-sample memory
+    /// must not be reset to zero outside initialisation; the filter
+    /// is constructed once here at the all-pass state and thereafter
+    /// only receives new coefficients via
+    /// [`set_weighting_filter_coeff_from_lpc`] (which mirrors them
+    /// into [`weighting_filter`]) — never a state reset.
+    weighting_filter: PerceptualWeightingFilter,
     /// Previous gain-scaled excitation vector — block-67 1-vector
     /// delay. Initialised to zero per Table 2/G.728.
     et_prev: [f64; FRAME_LEN],
@@ -107,6 +117,14 @@ impl Encoder {
             // weighting filter is the all-pass `W(z) = 1`. The
             // disabled-mode constructor produces exactly this state.
             weighting_filter_coeff: WeightingFilterCoeff::disabled(),
+            // §3.4 spec note: filter memory is zeroed only at
+            // initialisation. PerceptualWeightingFilter::new()
+            // produces that state — coefficients = disabled() (so
+            // both q_gamma1 and q_gamma2 collapse to [1, 0, …, 0]),
+            // both delay lines = [0; LPCW]. The encoder then never
+            // calls a reset on this field for the lifetime of the
+            // Encoder struct.
+            weighting_filter: PerceptualWeightingFilter::new(),
             et_prev: [0.0; FRAME_LEN],
         }
     }
@@ -157,8 +175,15 @@ impl Encoder {
     /// `q[0]` must equal `1.0` per the spec's eq. 3-3a leading-tap
     /// convention; `q[1..=LPCW]` carries the 10 broadened predictor
     /// coefficients.
+    ///
+    /// The new coefficient set is also mirrored into the live
+    /// [`PerceptualWeightingFilter`] (block 4) — per §3.3 / §3.4 the
+    /// freeze-and-swap convention only swaps the taps, never the
+    /// per-sample memory.
     pub fn set_weighting_filter_coeff_from_lpc(&mut self, q: &[f64; crate::consts::LPCW + 1]) {
         self.weighting_filter_coeff = WeightingFilterCoeff::from_lpc(q);
+        self.weighting_filter
+            .set_coefficients(self.weighting_filter_coeff);
     }
 
     /// §3.4.1 non-speech-mode entry. Force the perceptual weighting
@@ -167,8 +192,34 @@ impl Encoder {
     /// integrating G.728 into a modem path can flip the spec's
     /// "disable weighting filter" switch without re-running the
     /// transform.
+    ///
+    /// Per §3.4 the filter memory is not touched — only the
+    /// coefficient set is swapped to the all-pass state.
     pub fn disable_weighting_filter(&mut self) {
         self.weighting_filter_coeff = WeightingFilterCoeff::disabled();
+        self.weighting_filter
+            .set_coefficients(self.weighting_filter_coeff);
+    }
+
+    /// Borrow the live block-4 perceptual weighting filter state
+    /// (current coefficients + per-sample delay-line memory).
+    pub fn weighting_filter(&self) -> &PerceptualWeightingFilter {
+        &self.weighting_filter
+    }
+
+    /// Apply the block-4 perceptual weighting filter to one
+    /// `IDIM`-sample input speech vector `s(n)` and return the
+    /// corresponding weighted vector `v(n)` (§3.4). The filter's
+    /// per-sample memory advances as a side effect.
+    ///
+    /// The encoder's analysis-by-synthesis search of §3.9 consumes
+    /// `v(n)` (eventually combined with the zero-input response from
+    /// block 10 to form the VQ target `x(n)`, §3.5 / §3.6). Block 10
+    /// is intentionally still NOT wired up — its cascade with the
+    /// synthesis filter requires the §3.10 pre-/post-save memory
+    /// handling and lands in a future round.
+    pub fn apply_weighting_filter(&mut self, s: &[f64; FRAME_LEN]) -> [f64; FRAME_LEN] {
+        self.weighting_filter.filter_vector(s)
     }
 
     /// Encode one `FRAME_LEN`-sample input vector into one 10-bit
@@ -328,6 +379,85 @@ mod tests {
 
         let direct = WeightingFilterCoeff::from_lpc(&q);
         assert_eq!(*enc.weighting_filter_coeff(), direct);
+    }
+
+    #[test]
+    fn fresh_encoder_weighting_filter_passes_input_through() {
+        // §3.4 / §3.4.1 cold start: at the all-pass W(z) = 1 state
+        // with zeroed memory, block 4 emits v(n) = s(n) bit-for-bit.
+        let mut enc = Encoder::new();
+        let s = [42.0, -17.0, 0.0, 100.5, -250.25];
+        let v = enc.apply_weighting_filter(&s);
+        for k in 0..IDIM {
+            assert_eq!(v[k], s[k], "k={k}");
+        }
+    }
+
+    #[test]
+    fn set_weighting_filter_coeff_propagates_to_block_4_taps() {
+        // The setter must mirror its newly-computed coefficients into
+        // the live block-4 filter so that the next apply_weighting_filter
+        // sees them. Without this propagation the encoder would carry
+        // a "pending" coefficient set that block 4 ignores — a silent
+        // spec violation.
+        let q = [
+            1.0_f64,
+            -0.5,
+            0.25,
+            -0.125,
+            0.0625,
+            -0.03125,
+            0.015_625,
+            -0.007_812_5,
+            0.003_906_25,
+            -0.001_953_125,
+            0.000_976_562_5,
+        ];
+        let mut enc = Encoder::new();
+        enc.set_weighting_filter_coeff_from_lpc(&q);
+
+        let live = enc.weighting_filter().coefficients();
+        let expected = WeightingFilterCoeff::from_lpc(&q);
+        assert_eq!(*live, expected);
+    }
+
+    #[test]
+    fn weighting_filter_memory_survives_coefficient_swap() {
+        // §3.3 / §3.4 invariant: when block 38 commits a new
+        // coefficient set, block 4's per-sample memory must carry
+        // continuously across the swap.
+        let mut enc = Encoder::new();
+        let s = [10.0, 20.0, 30.0, 40.0, 50.0];
+        let _ = enc.apply_weighting_filter(&s);
+        let mem_before = *enc.weighting_filter().input_memory();
+
+        let mut q = [0.0f64; crate::consts::LPCW + 1];
+        q[0] = 1.0;
+        q[1] = -0.4;
+        enc.set_weighting_filter_coeff_from_lpc(&q);
+
+        assert_eq!(*enc.weighting_filter().input_memory(), mem_before);
+    }
+
+    #[test]
+    fn disable_weighting_filter_keeps_per_sample_memory() {
+        // §3.4 spec rule: even when the encoder flips the §3.4.1
+        // "non-speech mode" disable switch, the per-sample memory of
+        // the filter is left alone. The coefficients return to the
+        // all-pass state but block 4's delay lines carry whatever
+        // they carried before the flip.
+        let mut enc = Encoder::new();
+        let s = [10.0, 20.0, 30.0, 40.0, 50.0];
+        let _ = enc.apply_weighting_filter(&s);
+        let mem_before = *enc.weighting_filter().input_memory();
+
+        enc.disable_weighting_filter();
+
+        assert_eq!(*enc.weighting_filter().input_memory(), mem_before);
+        assert_eq!(
+            *enc.weighting_filter().coefficients(),
+            WeightingFilterCoeff::disabled()
+        );
     }
 
     #[test]

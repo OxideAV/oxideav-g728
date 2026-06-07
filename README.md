@@ -2,7 +2,7 @@
 
 Pure-Rust ITU-T G.728 Low-Delay CELP (LD-CELP, 16 kbit/s) speech codec.
 
-## Status: clean-room rebuild — autonomous decoder + full §4.7 pitch postfilter (blocks 81/82/83/84) + long-term comb + short-term postfilter + AGC + typed encoder scaffold + §3.9 `E_j` shape-energy table + §3.3 perceptual-weighting coefficient calculator (block 38) (round 248)
+## Status: clean-room rebuild — autonomous decoder + full §4.7 pitch postfilter (blocks 81/82/83/84) + long-term comb + short-term postfilter + AGC + typed encoder scaffold + §3.9 `E_j` shape-energy table + §3.3 perceptual-weighting coefficient calculator (block 38) + §3.4 weighting filter applied to input speech (block 4) (round 249)
 
 The crate was reset to a register-only scaffold under the workspace
 clean-room policy (round 171, master `14e3bad`): the previous
@@ -11,11 +11,41 @@ C distribution, which the policy forbids regardless of the source's
 licence. The crate is being rebuilt one spec-cited unit at a time from
 the published ITU-T G.728 (1992-09) Recommendation prose alone.
 
-Round 248 lands the **perceptual weighting filter coefficient
-calculator** — block 38 of the encoder's perceptual weighting filter
-adapter (Figure 4a/G.728), the third and last sub-block of §3.3 (after
-hybrid window 36 + Levinson 37 transcribed earlier in the shared
-`hybrid_window` / `levinson` modules):
+Round 249 lands the **block-4 application path** of the perceptual
+weighting filter (§3.4) — given the current input speech vector
+`s(n)`, push it through `W(z) = Q̃(z/γ₁)/Q̃(z/γ₂)` (eq. 3-4a) to
+produce the weighted speech vector `v(n)`:
+
+- **`PerceptualWeightingFilter` — block 4.** New `weighting_filter`
+  module transcribes the spec's one-paragraph §3.4 application. The
+  filter is realised as a direct-form I pole-zero stage,
+  `v(n) = s(n) + Σ_{i=1..10} qγ₁_i · s(n-i) − Σ_{i=1..10} qγ₂_i · v(n-i)`,
+  cross-derived from `V(z) · Q̃(z/γ₂) = S(z) · Q̃(z/γ₁)`. The two
+  implicit `q_0·γ_k^0 = 1` leading taps of `Q̃(z)` (eq. 3-3a) appear
+  explicitly as the standalone `+ s(n)` and `v(n)` terms — only the
+  broadened taps `qγ_k_i` interact with the delay lines. Per §3.4
+  the per-sample memory `(s(n-1..n-10), v(n-1..n-10))` is initialised
+  to zero at construction and never reset thereafter; coefficient
+  swaps, the §3.4.1 non-speech disable switch, and per-frame
+  freeze-and-swap updates all leave the memory untouched.
+- **`Encoder::apply_weighting_filter(s)` +
+  `Encoder::weighting_filter()` accessor.** The encoder now carries a
+  live block-4 filter initialised to the §3.4 / §3.4.1 all-pass
+  state. `set_weighting_filter_coeff_from_lpc` and
+  `disable_weighting_filter` propagate the new coefficient set into
+  the live filter (preserving its per-sample memory across the
+  swap), and `apply_weighting_filter` consumes one
+  `FRAME_LEN`-sample input vector to emit `v(n)`.
+- **Block 10 is still NOT wired up.** Its §3.5 zero-input-response
+  job requires the cascade `F(z)·W(z)` with the synthesis filter's
+  pre-/post-save memory dance from §3.10 and is queued for a later
+  round.
+
+Round 248 (preserved) lands the **perceptual weighting filter
+coefficient calculator** — block 38 of the encoder's perceptual
+weighting filter adapter (Figure 4a/G.728), the third and last
+sub-block of §3.3 (after hybrid window 36 + Levinson 37 transcribed
+earlier in the shared `hybrid_window` / `levinson` modules):
 
 - **`WeightingFilterCoeff` — block 38.** New `weighting_filter_coeff`
   module transcribes the mechanical substitution `z ← z/γ_k` of
@@ -314,11 +344,13 @@ order-parameterised Levinson-Durbin recursion, and the
   end (`Encoder` / `make_encoder` / `Encoder::encode_vector`) so the
   symbol is available now; round 248 adds block 38 (the perceptual-
   weighting coefficient calculator) as a typed transform consumable
-  via `Encoder::set_weighting_filter_coeff_from_lpc`. The remaining
-  block-37 wiring (Levinson on the §3.3 hybrid-window output), block
-  4 / block 10 (applying the weighting filter to input speech / to
-  the zero-input response of the synthesis filter), and the full
-  §3.9 search loop still surface `Error::NotImplemented` from
+  via `Encoder::set_weighting_filter_coeff_from_lpc`; round 249 wires
+  block 4 (the §3.4 application of the filter to input speech) as
+  `Encoder::apply_weighting_filter`. The remaining block-37 wiring
+  (Levinson on the §3.3 hybrid-window output), block 10 (applying
+  the weighting filter to the zero-input response of the synthesis
+  filter, in cascade with block 9 per §3.5), and the full §3.9
+  search loop still surface `Error::NotImplemented` from
   `encode_vector`. The shared backward adapters (block 23 in the
   encoder = block 33 in the decoder; block 20 in the encoder = block
   30 in the decoder) are reused unchanged via the existing
@@ -345,7 +377,8 @@ of `γ_k^i`, (ii) a hand-traced `q_i = (−1/2)^i` term-by-term, and
 Every control-flow line in the `hybrid_window`, `synthesis_adapter`,
 `gain_adapter`, `long_term_postfilter`, `short_term_postfilter`,
 `pitch_inverse_filter`, `pitch_search`, `pitch_postfilter_coeff`,
-`agc`, `encoder` and `weighting_filter_coeff` modules carries a
+`agc`, `encoder`, `weighting_filter_coeff` and `weighting_filter`
+modules carries a
 comment pointing at the spec's §3.3 / §3.4 / §3.7 / §3.8 / §3.9 /
 §4.4 / §4.5 / §5.6 / §5.7 / §4.6 / §4.7 pseudocode
 for blocks 36/43/49 (hybrid window), 50 (Levinson — already in

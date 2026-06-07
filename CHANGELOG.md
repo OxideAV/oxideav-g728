@@ -6,6 +6,53 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Perceptual weighting filter — block 4 application path
+  (§3.4, r249)** — new `weighting_filter` module transcribes the
+  spec's one-paragraph §3.4: the current input speech vector `s(n)`
+  is passed through `W(z) = Q̃(z/γ₁) / Q̃(z/γ₂)` (eq. 3-4a) to produce
+  the weighted speech vector `v(n)`. Realised as a direct-form I
+  pole-zero filter `v(n) = s(n) + Σ_{i=1..10} qγ₁_i · s(n-i)
+  − Σ_{i=1..10} qγ₂_i · v(n-i)`, derived by cross-multiplying
+  `V(z) · Q̃(z/γ₂) = S(z) · Q̃(z/γ₁)`. The two implicit `q_0·γ_k^0 = 1`
+  leading taps of `Q̃(z)` show up as the standalone `+ s(n)` /
+  `v(n)` terms in the difference equation; only the broadened taps
+  `qγ_k_i` for `i = 1..10` interact with the delay lines. Per §3.4
+  spec note ("filter memory should not be reset to zero at any time
+  except during initialization"), the two 10-tap memories
+  (`s(n-1..n-10)`, `v(n-1..n-10)`) are zeroed only by
+  `PerceptualWeightingFilter::new`; coefficient swaps, the §3.4.1
+  disable switch, and per-frame freeze-and-swap updates all leave
+  the memories untouched. Block 10 (the §3.5 zero-input response of
+  `F(z)·W(z)`) is intentionally NOT wired up — it requires the
+  §3.10 pre-/post-save memory dance with the synthesis filter and
+  is queued for a later round.
+- **`Encoder::apply_weighting_filter` + `Encoder::weighting_filter`
+  accessor.** The encoder now carries a live block-4 filter
+  initialised at construction to the §3.4 / §3.4.1 all-pass
+  `W(z) = 1` state. `set_weighting_filter_coeff_from_lpc` and
+  `disable_weighting_filter` now also mirror the new coefficient set
+  into the live filter — the per-sample memory is preserved across
+  the swap. `apply_weighting_filter` consumes one
+  `FRAME_LEN`-sample input vector and emits the corresponding
+  weighted vector `v(n)`.
+- **Public surface additions**: `PerceptualWeightingFilter`, the
+  `weighting_filter` module, `Encoder::apply_weighting_filter`, and
+  `Encoder::weighting_filter`.
+- 14 new tests (`weighting_filter` module: fresh filter is the
+  all-pass `W(z) = 1`, fresh memory is zeroed per §3.4
+  initialisation, `Default` equals `new`, memory advances one
+  sample per emitted output and carries across vector boundaries,
+  coefficient swap leaves memory untouched, first-sample-after-init
+  always equals `s[0]` regardless of `W(z)` shape, δ-input matches
+  the hand-traced first five outputs of the difference equation
+  term-by-term, `γ₁ = γ₂` collapse drives the filter to the identity
+  on 64 vectors of sinusoidal input, 1024-vector finite-output
+  stability; `encoder` module: fresh encoder filter is the
+  pass-through, setter mirrors block-38 output into the live block-4
+  taps, memory survives the coefficient swap, the §3.4.1 disable
+  switch zeroes the coefficients but leaves the memory). Total
+  crate tests: 193 → 207.
+
 - **Perceptual weighting filter coefficient calculator (block 38,
   Figure 4a/G.728, §3.3 / §3.4, r248)** — new
   `weighting_filter_coeff` module transcribes block 38 of the encoder's

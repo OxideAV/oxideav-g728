@@ -128,6 +128,26 @@
 //! the two backward adapters to be bit-for-bit identical at both ends
 //! of the channel.
 //!
+//! Round 248 lands the **perceptual weighting filter coefficient
+//! calculator** (block 38, §3.3, the third sub-block of the weighting
+//! filter adapter after hybrid window 36 and Levinson-Durbin 37) — see
+//! [`weighting_filter_coeff`] / [`WeightingFilterCoeff`]. The
+//! `from_lpc` transform applies the substitutions `z ← z/γ₁` and
+//! `z ← z/γ₂` of eq. 3-4b / 3-4c to the order-10 LPC predictor
+//! `q_i`; the `disabled` constructor realises the §3.4.1 non-speech
+//! `W(z) = 1` shortcut.
+//!
+//! Round 249 lands the **block-4 application path** of the perceptual
+//! weighting filter (§3.4) — see [`weighting_filter`] /
+//! [`PerceptualWeightingFilter`]. The current input speech vector
+//! `s(n)` is passed through `W(z) = Q̃(z/γ₁) / Q̃(z/γ₂)` (eq. 3-4a)
+//! to produce the weighted speech vector `v(n)`, with the spec's
+//! §3.4 "do not reset memory" rule honoured by carrying the per-sample
+//! delay lines continuously across coefficient swaps and the §3.4.1
+//! disable switch. Block 10 (the cascade with the synthesis filter
+//! for the §3.5 zero-input response) requires the §3.10 memory
+//! pre-/post-save dance and is queued for a later round.
+//!
 //! ## What is NOT yet wired up
 //!
 //! * **PCM format conversion (blocks 1, 28).** A-law / µ-law I/O is
@@ -173,6 +193,7 @@ pub mod pitch_search;
 pub mod short_term_postfilter;
 pub mod synthesis_adapter;
 pub mod tables;
+pub mod weighting_filter;
 pub mod weighting_filter_coeff;
 
 pub use agc::Agc;
@@ -187,6 +208,7 @@ pub use pitch_postfilter_coeff::PitchPostfilterCoeff;
 pub use pitch_search::PitchSearch;
 pub use short_term_postfilter::ShortTermPostfilter;
 pub use synthesis_adapter::SynthesisAdapter;
+pub use weighting_filter::PerceptualWeightingFilter;
 pub use weighting_filter_coeff::WeightingFilterCoeff;
 
 /// Crate-local error type.
