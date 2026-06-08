@@ -43,12 +43,14 @@
 //! can wire blocks 1..28 + 67..70 against them without restructuring
 //! this module.
 
-use crate::consts::NCWD;
+use crate::consts::{NCWD, NFRSZ};
 use crate::decoder::FRAME_LEN;
 use crate::gain_adapter::GainAdapter;
+use crate::levinson::LevinsonError;
 use crate::synthesis_adapter::SynthesisAdapter;
 use crate::tables::Y_ENERGY;
 use crate::weighting_filter::PerceptualWeightingFilter;
+use crate::weighting_filter_adapter::WeightingFilterAdapter;
 use crate::weighting_filter_coeff::WeightingFilterCoeff;
 use crate::Error;
 
@@ -93,6 +95,14 @@ pub struct Encoder {
     /// [`set_weighting_filter_coeff_from_lpc`] (which mirrors them
     /// into [`weighting_filter`]) — never a state reset.
     weighting_filter: PerceptualWeightingFilter,
+    /// Upstream weighting-filter adapter (blocks 36 + 37 of §3.3).
+    /// Owns the hybrid-window state (`SBW`, `REXPW` per Table 2) and
+    /// the most recently produced order-10 predictor `q_i`. Driven
+    /// per adaptation cycle by [`Encoder::adapt_weighting_filter`];
+    /// at the third vector of each cycle the encoder reads the
+    /// predictor back out and pushes it through block 38 via
+    /// [`Encoder::commit_weighting_filter_coefficients`].
+    weighting_filter_adapter: WeightingFilterAdapter,
     /// Previous gain-scaled excitation vector — block-67 1-vector
     /// delay. Initialised to zero per Table 2/G.728.
     et_prev: [f64; FRAME_LEN],
@@ -125,6 +135,13 @@ impl Encoder {
             // calls a reset on this field for the lifetime of the
             // Encoder struct.
             weighting_filter: PerceptualWeightingFilter::new(),
+            // §3.3 cold start: the upstream block-36/37 adapter
+            // owns its own Table-2/G.728 initial state (SBW = 0,
+            // REXPW = 0, predictor = all-pass). No coefficient swap
+            // happens until the first cycle completes and the
+            // encoder explicitly calls
+            // commit_weighting_filter_coefficients.
+            weighting_filter_adapter: WeightingFilterAdapter::new(),
             et_prev: [0.0; FRAME_LEN],
         }
     }
@@ -205,6 +222,50 @@ impl Encoder {
     /// (current coefficients + per-sample delay-line memory).
     pub fn weighting_filter(&self) -> &PerceptualWeightingFilter {
         &self.weighting_filter
+    }
+
+    /// Borrow the upstream weighting-filter adapter (blocks 36 + 37
+    /// of §3.3). The adapter is the encoder's source of truth for the
+    /// order-10 predictor `q_i` that drives block 38. Read-only so
+    /// callers see what the next coefficient swap will commit, but
+    /// cannot bypass [`Self::commit_weighting_filter_coefficients`]
+    /// (which is what propagates the new `q_i` to the live block-4
+    /// filter).
+    pub fn weighting_filter_adapter(&self) -> &WeightingFilterAdapter {
+        &self.weighting_filter_adapter
+    }
+
+    /// Run blocks 36 + 37 of the §3.3 weighting-filter adapter on
+    /// one adaptation cycle of input speech (`NFRSZ = 20` samples =
+    /// `NUPDATE = 4` vectors of `IDIM = 5` samples each). The new
+    /// order-10 predictor lands in the adapter's cache; the encoder
+    /// does **not** yet propagate it into the live block-38 /
+    /// block-4 path — that step is gated on the §3.3 "third vector
+    /// of each cycle" timing rule and is exposed separately as
+    /// [`Self::commit_weighting_filter_coefficients`].
+    ///
+    /// On Levinson-Durbin failure the cached predictor is left
+    /// untouched and the error is propagated so the caller can log
+    /// or trace it; the block-33 mirror policy is documented on
+    /// [`WeightingFilterAdapter::adapt`].
+    pub fn adapt_weighting_filter(&mut self, speech: &[f64; NFRSZ]) -> Result<(), LevinsonError> {
+        self.weighting_filter_adapter.adapt(speech)?;
+        Ok(())
+    }
+
+    /// Push the upstream adapter's cached predictor through block 38
+    /// (the §3.3 eq. 3-4b / 3-4c substitutions) and into the live
+    /// block-4 perceptual weighting filter. Per §3.3 the encoder
+    /// only does this at the **third vector of each adaptation
+    /// cycle**; the timing gate is the caller's responsibility, the
+    /// same way the synthesis-filter adapter's commit timing is the
+    /// caller's responsibility for block 33.
+    ///
+    /// Per §3.4 spec rule the per-sample memory of block 4 is
+    /// preserved across the swap — only the coefficients change.
+    pub fn commit_weighting_filter_coefficients(&mut self) {
+        let q = *self.weighting_filter_adapter.predictor();
+        self.set_weighting_filter_coeff_from_lpc(&q);
     }
 
     /// Apply the block-4 perceptual weighting filter to one
@@ -491,5 +552,137 @@ mod tests {
             *enc.weighting_filter_coeff(),
             WeightingFilterCoeff::disabled()
         );
+    }
+
+    #[test]
+    fn fresh_encoder_weighting_filter_adapter_is_allpass() {
+        // §3.3 cold start: the upstream block-36/37 adapter starts
+        // with the all-pass q_i = (1, 0, ..., 0) so block 38 on the
+        // same vector collapses to W(z) = 1. The encoder must expose
+        // exactly that state at construction time so the live block-4
+        // filter and the cached upstream predictor agree on "no
+        // weighting yet".
+        let enc = Encoder::new();
+        let q = enc.weighting_filter_adapter().predictor();
+        assert_eq!(q[0], 1.0);
+        assert!(q[1..].iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn adapt_weighting_filter_returns_levinson_error_on_zero_input() {
+        // The encoder must surface a Levinson failure verbatim — its
+        // job is to relay the upstream adapter's contract, not to
+        // mask failures behind a generic Error::NotImplemented or a
+        // silent success. Zero input forces R(1) ≤ 0; we expect
+        // either ZeroSignal or TrailingZero per the adapter docs.
+        let mut enc = Encoder::new();
+        let zero = [0.0f64; NFRSZ];
+        let result = enc.adapt_weighting_filter(&zero);
+        assert!(
+            matches!(
+                result,
+                Err(LevinsonError::ZeroSignal | LevinsonError::TrailingZero)
+            ),
+            "expected Levinson failure on zero input, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn adapt_weighting_filter_on_nontrivial_input_succeeds() {
+        // A speech-like input must drive the adapter cleanly through
+        // hybrid window + Levinson. Run 6 cycles (the same budget
+        // the synthesis adapter's tests use) and assert at least one
+        // adapt() succeeds — exactly one would be enough but the
+        // multi-cycle smoke gives the hybrid window's recursive part
+        // a chance to populate.
+        let mut enc = Encoder::new();
+        let mut input = [0.0f64; NFRSZ];
+        for k in 0..NFRSZ {
+            let t = k as f64;
+            input[k] = 100.0 * (0.4 * t).sin() + 50.0 * (0.9 * t).cos() + (t * 13.0).fract();
+        }
+        let mut ok_count = 0;
+        for _ in 0..6 {
+            if enc.adapt_weighting_filter(&input).is_ok() {
+                ok_count += 1;
+            }
+        }
+        assert!(
+            ok_count >= 1,
+            "expected at least one successful weighting-filter adaptation"
+        );
+    }
+
+    #[test]
+    fn commit_weighting_filter_coefficients_propagates_to_block_38_and_block_4() {
+        // End-to-end §3.3 wiring: adapt on a speech-like cycle,
+        // commit the resulting q_i, then assert (a) block 38's
+        // (q_gamma1, q_gamma2) reflect the new predictor (not the
+        // disabled all-pass), and (b) the live block-4 filter sees
+        // the same coefficients. This is the spec's full block 36 →
+        // block 37 → block 38 → block 4 chain.
+        let mut enc = Encoder::new();
+        let mut input = [0.0f64; NFRSZ];
+        for k in 0..NFRSZ {
+            let t = k as f64;
+            input[k] = 200.0 * (0.3 * t).sin() + 50.0 * (1.1 * t).cos() + 7.0;
+        }
+
+        // Drive several cycles to land Levinson on a non-degenerate
+        // RTMP, then commit.
+        for _ in 0..6 {
+            let _ = enc.adapt_weighting_filter(&input);
+        }
+        enc.commit_weighting_filter_coefficients();
+
+        let committed = *enc.weighting_filter_coeff();
+        // After a successful adaptation + commit the encoder must
+        // not be at the disabled all-pass shape.
+        assert_ne!(committed, WeightingFilterCoeff::disabled());
+        // And block 4 must have picked up the same coefficients —
+        // the setter's invariant, exercised here through the
+        // commit path.
+        assert_eq!(*enc.weighting_filter().coefficients(), committed);
+    }
+
+    #[test]
+    fn commit_weighting_filter_preserves_block_4_memory() {
+        // §3.4 spec rule: coefficient swap MUST NOT touch block 4's
+        // per-sample delay-line memory. The encoder's commit path
+        // goes through set_weighting_filter_coeff_from_lpc, which
+        // already honours that rule for the manual setter path; this
+        // test pins the same rule for the upstream-driven commit
+        // path so a future refactor cannot regress it.
+        let mut enc = Encoder::new();
+        // Push some samples to populate block 4's memory.
+        let s = [10.0, 20.0, 30.0, 40.0, 50.0];
+        let _ = enc.apply_weighting_filter(&s);
+        let mem_before = *enc.weighting_filter().input_memory();
+
+        // Adapt and commit a non-trivial coefficient set.
+        let mut input = [0.0f64; NFRSZ];
+        for k in 0..NFRSZ {
+            input[k] = 100.0 * (0.5 * k as f64).sin() + 30.0;
+        }
+        for _ in 0..6 {
+            let _ = enc.adapt_weighting_filter(&input);
+        }
+        enc.commit_weighting_filter_coefficients();
+
+        assert_eq!(*enc.weighting_filter().input_memory(), mem_before);
+    }
+
+    #[test]
+    fn weighting_filter_adapter_accessor_is_read_only_view() {
+        // The accessor must return the encoder's own adapter (same
+        // structural state as it was set up at construction). At
+        // fresh-state the predictor is all-pass and exactly equal
+        // to a standalone WeightingFilterAdapter's initial state.
+        let enc = Encoder::new();
+        let q_enc = enc.weighting_filter_adapter().predictor();
+        let standalone = WeightingFilterAdapter::new();
+        let q_solo = standalone.predictor();
+        assert_eq!(q_enc, q_solo);
     }
 }

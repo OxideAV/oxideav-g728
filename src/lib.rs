@@ -148,6 +148,28 @@
 //! for the §3.5 zero-input response) requires the §3.10 memory
 //! pre-/post-save dance and is queued for a later round.
 //!
+//! Round 258 lands the **upstream half of the weighting filter
+//! adapter** (blocks 36 + 37, §3.3) — see
+//! [`weighting_filter_adapter`] / [`WeightingFilterAdapter`]. Block 36
+//! is the hybrid window on past input speech (Annex A.3 `wnrw`,
+//! 60 samples, dimensions `LPCW + NFRSZ + NONRW = 10 + 20 + 30`); it
+//! reuses the shared [`HybridWindow`] / [`HybridWindowState`] machinery
+//! that already powers blocks 43 and 49. Block 37 is the order-10
+//! Levinson-Durbin recursion on the 11 autocorrelation taps it
+//! produces; it reuses [`levinson_durbin`]. The cached predictor
+//! `q_i = a_i^{(10)}` (eq. 3-2f) is exposed via
+//! [`WeightingFilterAdapter::predictor`] in canonical Levinson
+//! layout, ready to be passed into
+//! [`Encoder::set_weighting_filter_coeff_from_lpc`] (block 38, landed
+//! r248). The adapter mirrors [`SynthesisAdapter::adapt`] timing
+//! (one cycle of `NFRSZ = 20` samples per call) and failure policy
+//! (Levinson failure keeps the previously cached predictor and
+//! propagates the error). The encoder is not yet wired to call
+//! the adapter on every cycle — that handshake lands in a follow-up
+//! round once the block-3 / block-2 input-speech buffering for §3.9
+//! is in place; the adapter is correct as a standalone primitive
+//! today and stands ready to feed block 38 directly.
+//!
 //! ## What is NOT yet wired up
 //!
 //! * **PCM format conversion (blocks 1, 28).** A-law / µ-law I/O is
@@ -194,6 +216,7 @@ pub mod short_term_postfilter;
 pub mod synthesis_adapter;
 pub mod tables;
 pub mod weighting_filter;
+pub mod weighting_filter_adapter;
 pub mod weighting_filter_coeff;
 
 pub use agc::Agc;
@@ -209,6 +232,7 @@ pub use pitch_search::PitchSearch;
 pub use short_term_postfilter::ShortTermPostfilter;
 pub use synthesis_adapter::SynthesisAdapter;
 pub use weighting_filter::PerceptualWeightingFilter;
+pub use weighting_filter_adapter::WeightingFilterAdapter;
 pub use weighting_filter_coeff::WeightingFilterCoeff;
 
 /// Crate-local error type.

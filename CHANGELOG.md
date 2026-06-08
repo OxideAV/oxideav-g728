@@ -6,6 +6,49 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Perceptual weighting filter adapter — upstream blocks 36 + 37
+  (§3.3, r258)** — new `weighting_filter_adapter` module wires the
+  hybrid window on input speech (block 36, Annex A.3 `wnrw`, 60-tap
+  window with dimensions `LPCW + NFRSZ + NONRW = 10 + 20 + 30`)
+  into the order-10 Levinson-Durbin recursion (block 37) and
+  produces the predictor `q_i = a_i^{(10)}` (eq. 3-2f) that block 38
+  (landed r248) consumes. The module reuses the existing
+  `HybridWindow` / `HybridWindowState` machinery (already shared
+  with blocks 43 and 49) and the existing `levinson_durbin`
+  routine; on Levinson failure the cached predictor is kept and the
+  error is propagated, mirroring `SynthesisAdapter::adapt`'s policy
+  for block 33 of §3.7. The adapter is owned by the `Encoder` and
+  exposed via three new methods: `adapt_weighting_filter` runs one
+  cycle of `NFRSZ = 20` input-speech samples through blocks 36 +
+  37, `weighting_filter_adapter` borrows the cached predictor for
+  inspection, and `commit_weighting_filter_coefficients` performs
+  the §3.3 "third vector of the cycle" coefficient swap by pushing
+  the predictor through block 38 into the live block-4 filter
+  (`set_weighting_filter_coeff_from_lpc`). Per §3.4 spec rule the
+  per-sample memory of block 4 is preserved across the swap.
+- **Public surface additions**: `WeightingFilterAdapter`, the
+  `weighting_filter_adapter` module, `Encoder::adapt_weighting_filter`,
+  `Encoder::commit_weighting_filter_coefficients`,
+  `Encoder::weighting_filter_adapter`.
+- 15 new tests (`weighting_filter_adapter` module: fresh adapter
+  predictor is all-pass `q_i = (1, 0, ..., 0)`, `Default` matches
+  `new`, zero input drives Levinson to `ZeroSignal` /
+  `TrailingZero` and keeps the all-pass predictor, speech-like
+  input produces `q_0 = 1` and at least one non-zero tap, accessor
+  exposes `LPCW + 1` taps, predictor round-trips through
+  `WeightingFilterCoeff::from_lpc` with both leading unity taps
+  preserved, predictor drives `Encoder::set_weighting_filter_coeff_from_lpc`
+  to a non-disabled state, `q_0 = 1` invariant survives mixed
+  success/failure cycles, hybrid-window dimensions match
+  `LPCW + NFRSZ + NONRW = 60`; `encoder` module: fresh encoder's
+  upstream adapter is all-pass, `adapt_weighting_filter` surfaces
+  Levinson errors verbatim on zero input, `adapt_weighting_filter`
+  on speech-like input succeeds at least once over 6 cycles,
+  `commit_weighting_filter_coefficients` propagates the predictor
+  through block 38 and into block 4, block 4's per-sample memory
+  survives the commit-driven swap, adapter accessor returns the
+  same state as a standalone `WeightingFilterAdapter::new`).
+
 - **Perceptual weighting filter — block 4 application path
   (§3.4, r249)** — new `weighting_filter` module transcribes the
   spec's one-paragraph §3.4: the current input speech vector `s(n)`

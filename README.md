@@ -2,7 +2,7 @@
 
 Pure-Rust ITU-T G.728 Low-Delay CELP (LD-CELP, 16 kbit/s) speech codec.
 
-## Status: clean-room rebuild — autonomous decoder + full §4.7 pitch postfilter (blocks 81/82/83/84) + long-term comb + short-term postfilter + AGC + typed encoder scaffold + §3.9 `E_j` shape-energy table + §3.3 perceptual-weighting coefficient calculator (block 38) + §3.4 weighting filter applied to input speech (block 4) (round 249)
+## Status: clean-room rebuild — autonomous decoder + full §4.7 pitch postfilter (blocks 81/82/83/84) + long-term comb + short-term postfilter + AGC + typed encoder scaffold + §3.9 `E_j` shape-energy table + §3.3 full perceptual-weighting adapter (blocks 36 + 37 + 38) + §3.4 weighting filter applied to input speech (block 4) (round 258)
 
 The crate was reset to a register-only scaffold under the workspace
 clean-room policy (round 171, master `14e3bad`): the previous
@@ -11,10 +11,46 @@ C distribution, which the policy forbids regardless of the source's
 licence. The crate is being rebuilt one spec-cited unit at a time from
 the published ITU-T G.728 (1992-09) Recommendation prose alone.
 
-Round 249 lands the **block-4 application path** of the perceptual
-weighting filter (§3.4) — given the current input speech vector
-`s(n)`, push it through `W(z) = Q̃(z/γ₁)/Q̃(z/γ₂)` (eq. 3-4a) to
-produce the weighted speech vector `v(n)`:
+Round 258 lands the **upstream half of the perceptual weighting
+filter adapter** (blocks 36 + 37 of §3.3) — the missing link
+between the input-speech buffer and the block-38 coefficient
+calculator already in place:
+
+- **`WeightingFilterAdapter` — blocks 36 + 37.** New
+  `weighting_filter_adapter` module wires the §3.3 hybrid window
+  on past input speech (Annex A.3 `wnrw`, 60-tap window with
+  dimensions `LPCW + NFRSZ + NONRW = 10 + 20 + 30`) into the
+  order-10 Levinson-Durbin recursion. The result is the predictor
+  `q_i = a_i^{(10)}` (eq. 3-2f) in canonical Levinson layout
+  `[1.0, a_1, …, a_10]`. The module reuses the shared
+  `HybridWindow` / `HybridWindowState` machinery already powering
+  blocks 43 and 49 and the existing `levinson_durbin` routine. On
+  Levinson failure the cached predictor is kept and the error is
+  propagated — same "keep previous cycle" policy
+  `SynthesisAdapter::adapt` honours for block 33.
+- **`Encoder::adapt_weighting_filter(speech)` +
+  `Encoder::commit_weighting_filter_coefficients()` +
+  `Encoder::weighting_filter_adapter()` accessor.** The encoder
+  now owns the upstream adapter. `adapt_weighting_filter` runs one
+  cycle of `NFRSZ = 20` input-speech samples through blocks 36 +
+  37; `commit_weighting_filter_coefficients` performs the §3.3
+  "third vector of the cycle" coefficient swap by pushing the
+  predictor through block 38 into the live block-4 filter. Per
+  §3.4 spec rule the per-sample memory of block 4 is preserved
+  across the swap. The cycle-timing gate (commit only at
+  `ICOUNT = 3`) is still the caller's responsibility — the same
+  way the synthesis-filter adapter's commit timing is the
+  caller's responsibility for block 33.
+- **The encoder's analysis-by-synthesis search loop is still NOT
+  wired up.** Blocks 1..28 + 67..70 of §3.9 (the per-vector VQ
+  cost expression, impulse-response convolution, gain-quantiser
+  decision tree) remain to be lifted off the precomputed `E_j` /
+  `G2` / `GSQ` / `GB` table set already in `tables.rs`.
+
+Round 249 (preserved) lands the **block-4 application path** of
+the perceptual weighting filter (§3.4) — given the current input
+speech vector `s(n)`, push it through `W(z) = Q̃(z/γ₁)/Q̃(z/γ₂)`
+(eq. 3-4a) to produce the weighted speech vector `v(n)`:
 
 - **`PerceptualWeightingFilter` — block 4.** New `weighting_filter`
   module transcribes the spec's one-paragraph §3.4 application. The
