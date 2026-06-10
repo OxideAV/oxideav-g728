@@ -218,6 +218,7 @@ pub mod tables;
 pub mod weighting_filter;
 pub mod weighting_filter_adapter;
 pub mod weighting_filter_coeff;
+pub mod zero_input_response;
 
 pub use agc::Agc;
 pub use decoder::{pack_channel_index, ExcitationVector, Synthesizer, DEFAULT_MAX, FRAME_LEN};
@@ -234,6 +235,7 @@ pub use synthesis_adapter::SynthesisAdapter;
 pub use weighting_filter::PerceptualWeightingFilter;
 pub use weighting_filter_adapter::WeightingFilterAdapter;
 pub use weighting_filter_coeff::WeightingFilterCoeff;
+pub use zero_input_response::ZeroInputResponse;
 
 /// Crate-local error type.
 ///

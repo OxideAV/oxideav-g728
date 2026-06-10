@@ -2,7 +2,7 @@
 
 Pure-Rust ITU-T G.728 Low-Delay CELP (LD-CELP, 16 kbit/s) speech codec.
 
-## Status: clean-room rebuild — autonomous decoder + full §4.7 pitch postfilter (blocks 81/82/83/84) + long-term comb + short-term postfilter + AGC + typed encoder scaffold + §3.9 `E_j` shape-energy table + §3.3 full perceptual-weighting adapter (blocks 36 + 37 + 38) + §3.4 weighting filter applied to input speech (block 4) (round 258)
+## Status: clean-room rebuild — autonomous decoder + full §4.7 pitch postfilter (blocks 81/82/83/84) + long-term comb + short-term postfilter + AGC + typed encoder scaffold + §3.9 `E_j` shape-energy table + §3.3 full perceptual-weighting adapter (blocks 36 + 37 + 38) + §3.4 weighting filter applied to input speech (block 4) + §3.5/§3.6 zero-input response + VQ target (blocks 9 + 10 + 11) (round 267)
 
 The crate was reset to a register-only scaffold under the workspace
 clean-room policy (round 171, master `14e3bad`): the previous
@@ -10,6 +10,46 @@ implementation had numeric tables extracted from an external reference
 C distribution, which the policy forbids regardless of the source's
 licence. The crate is being rebuilt one spec-cited unit at a time from
 the published ITU-T G.728 (1992-09) Recommendation prose alone.
+
+Round 267 lands the **zero-input response + VQ target vector** —
+blocks 9, 10 and 11 of Figure 2/G.728 (§3.5 / §3.6; pseudo-code
+§5.9 / §5.10) — the analysis-by-synthesis **search target** `x(n)`
+that the §3.9 codebook search of equations 3-14..3-23 minimises
+against:
+
+- **`ZeroInputResponse` — blocks 9 + 10 + 11.** New
+  `zero_input_response` module transcribes the §5.9 "ring for five
+  samples" recurrence: with switch 5 open (zero input at node 7),
+  the synthesis filter (block 9, `STATELPC(1..LPC)` memory) and the
+  perceptual weighting filter (block 10, `ZIRWFIR(1..LPCW)` /
+  `ZIRWIIR(1..LPCW)` memories) are let "ring" for one `IDIM = 5`-
+  sample vector, producing the zero-input response `r(n)` from their
+  carried-over memory of past gain-scaled excitation. Block 11 then
+  subtracts: `x(n) = v(n) − r(n)` (§5.10, `TARGET(K) = SW(K) −
+  ZIR(K)`). Block 9 reuses the exact synthesis-filter memory-shift
+  idiom the decoder's `Synthesizer` already runs (the §5.9 block-9
+  recurrence is the same zero-input recurrence the decoder computes
+  on a zero excitation); a per-test cross-checks the two paths to
+  machine precision. The §3.5 initialisation state (all three memory
+  arrays zero) makes the first vector's `r(n) = 0` and `x(n) =
+  v(n)` exactly, matching the spec note "except for the vector right
+  after initialization, the memory of the filters 9 and 10 is in
+  general non-zero".
+- **`Encoder::compute_vq_target(v)` + `Encoder::zero_input_response_unit()`
+  accessor.** The encoder now owns the ring unit. `compute_vq_target`
+  drives blocks 9 + 10 + 11 with the encoder's own order-50 synthesis
+  predictor (block 23, shared with the decoder per §4.5) and the live
+  block-38 weighting coefficients (`AWZ = q_gamma1`, `AWP =
+  q_gamma2`), consuming the weighted speech vector `v(n)` from
+  `apply_weighting_filter` (block 4) and emitting the target `x(n)`.
+- **The §3.10 memory-update phase is deliberately NOT in this round.**
+  Saving the post-ring memory, zeroing it, refiltering the chosen
+  excitation `e(n)` to add the zero-state response on top, and reading
+  `sq(n)` back out of the top five `STATELPC` taps all depend on the
+  §3.9 codebook-search output `e(n)` that is not yet wired up. This
+  module is the half of §3.5 that runs **before** the search and only
+  reads the current filter memory; the complementary memory-update
+  half runs **after** the search and lands in a later round.
 
 Round 258 lands the **upstream half of the perceptual weighting
 filter adapter** (blocks 36 + 37 of §3.3) — the missing link
@@ -382,12 +422,21 @@ order-parameterised Levinson-Durbin recursion, and the
   weighting coefficient calculator) as a typed transform consumable
   via `Encoder::set_weighting_filter_coeff_from_lpc`; round 249 wires
   block 4 (the §3.4 application of the filter to input speech) as
-  `Encoder::apply_weighting_filter`. The remaining block-37 wiring
-  (Levinson on the §3.3 hybrid-window output), block 10 (applying
-  the weighting filter to the zero-input response of the synthesis
-  filter, in cascade with block 9 per §3.5), and the full §3.9
-  search loop still surface `Error::NotImplemented` from
-  `encode_vector`. The shared backward adapters (block 23 in the
+  `Encoder::apply_weighting_filter`; round 258 wires blocks 36 + 37
+  (the §3.3 hybrid window + Levinson on the input-speech buffer) as
+  `Encoder::adapt_weighting_filter` /
+  `commit_weighting_filter_coefficients`; round 267 wires blocks 9 +
+  10 + 11 (the §3.5 / §3.6 zero-input response + VQ target) as
+  `Encoder::compute_vq_target`. The remaining work — the §3.10
+  memory-update phase (adding the zero-state response of the chosen
+  excitation `e(n)` back onto the saved ring memory and reading
+  `sq(n)` out of the top `STATELPC` taps) and the full §3.9 codebook
+  search loop (impulse-response convolution, time-reversed
+  correlation, shape-codebook scan, gain-quantiser decision tree) —
+  still surface `Error::NotImplemented` from `encode_vector`. The
+  search and the memory update both depend on the chosen excitation
+  `e(n)` that §3.9 selects, so they land together in a later round.
+  The shared backward adapters (block 23 in the
   encoder = block 33 in the decoder; block 20 in the encoder = block
   30 in the decoder) are reused unchanged via the existing
   `SynthesisAdapter` / `GainAdapter` types per §4.4 / §4.5.
@@ -413,10 +462,12 @@ of `γ_k^i`, (ii) a hand-traced `q_i = (−1/2)^i` term-by-term, and
 Every control-flow line in the `hybrid_window`, `synthesis_adapter`,
 `gain_adapter`, `long_term_postfilter`, `short_term_postfilter`,
 `pitch_inverse_filter`, `pitch_search`, `pitch_postfilter_coeff`,
-`agc`, `encoder`, `weighting_filter_coeff` and `weighting_filter`
+`agc`, `encoder`, `weighting_filter_coeff`, `weighting_filter` and
+`zero_input_response`
 modules carries a
-comment pointing at the spec's §3.3 / §3.4 / §3.7 / §3.8 / §3.9 /
-§4.4 / §4.5 / §5.6 / §5.7 / §4.6 / §4.7 pseudocode
+comment pointing at the spec's §3.3 / §3.4 / §3.5 / §3.6 / §3.7 /
+§3.8 / §3.9 / §4.4 / §4.5 / §5.6 / §5.7 / §5.9 / §5.10 / §4.6 / §4.7
+pseudocode
 for blocks 36/43/49 (hybrid window), 50 (Levinson — already in
 `levinson.rs`), 51 / 45 (bandwidth expansion), 67/39/40/42/46/47/48
 (the per-vector gain chain), 71 (long-term comb filter
