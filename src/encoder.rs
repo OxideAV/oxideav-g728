@@ -1,50 +1,56 @@
-//! ITU-T G.728 LD-CELP encoder — typed front-end scaffold.
+//! ITU-T G.728 LD-CELP encoder.
 //!
-//! Round 235 lands the **typed encoder surface** ahead of the
-//! analysis-by-synthesis pipeline that §3.9 of the Recommendation
-//! describes. No encoder logic is implemented yet; this module exposes
-//! a stable [`Encoder`] type and a [`make_encoder`] factory consistent
-//! with the workspace's dual-API convention so consumers can wire the
-//! encoder symbol now and the pipeline can fill in behind it.
+//! Round 235 landed the **typed encoder surface**; rounds 248 / 249 /
+//! 258 / 267 grew the front end (blocks 38, 4, 36 + 37, 9 + 10 + 11);
+//! round 276 lands the **§3.9 codebook search** (blocks 12–18, in
+//! [`crate::codebook_search`]) and the **§3.10 memory update**
+//! ([`ZeroInputResponse::update_memory`], pseudo-code §5.13), closing
+//! the analysis-by-synthesis loop: [`Encoder::encode_vector`] now
+//! emits one real 10-bit channel index per `IDIM = 5`-sample input
+//! vector.
 //!
-//! ## Scope
+//! ## Per-vector dataflow (Figure 2/G.728)
 //!
-//! The G.728 encoder reads 16-bit linear PCM (or A/µ-law per §3.1), runs
-//! the per-vector analysis-by-synthesis loop of §3.9, and emits one
-//! 10-bit channel index per `IDIM = 5`-sample vector. The shared
-//! backward adapters (synthesis-filter adapter §3.7, gain adapter §3.8,
-//! both already transcribed in the decoder modules) are reused
-//! unchanged — see §4.4 / §4.5 of the Recommendation.
+//! 1. **Block 20** — predict the excitation gain `σ(n)` from the
+//!    previous gain-scaled excitation (backward vector gain adapter,
+//!    §3.8; shared type with the decoder's block 30 per §4.5).
+//! 2. **Block 4** — perceptual weighting filter on the input speech,
+//!    `v(n)` (§3.4).
+//! 3. **Blocks 9 + 10 + 11** — zero-input response ring + VQ target
+//!    `x(n) = v(n) − r(n)` (§3.5 / §3.6).
+//! 4. **Blocks 12–18** — codebook search: impulse response, energy
+//!    table, target normalisation, time-reversed convolution, gain
+//!    decision tree, best-index selection (§3.9).
+//! 5. **Blocks 19 + 21** — excitation lookup + gain scaling,
+//!    `e(n) = σ(n)·g_i·y_j` (§5.12).
+//! 6. **§5.13 memory update** — zero-state responses of `e(n)` added
+//!    onto the post-ring filter memory; the quantized speech `sq(n)`
+//!    falls out of the top `STATELPC` taps (block 22 omitted per
+//!    §3.10).
+//! 7. **Blocks 23 + 3 cycle bookkeeping** — `sq(n)` accumulates into
+//!    the synthesis adapter's NFRSZ buffer and `s(n)` into the
+//!    weighting adapter's; when a full adaptation cycle (NUPDATE = 4
+//!    vectors) is collected both adapters re-run, the new weighting
+//!    coefficients commit through block 38, and blocks 12 + 14 + 15
+//!    refresh the impulse response + energy table. This is the same
+//!    end-of-cycle simplification of the spec's ICOUNT = 2/3 stagger
+//!    that [`crate::Decoder::decode_vector`] documents for block 33 —
+//!    the encoder and decoder MUST share the cadence so their
+//!    synthesis predictors evolve in lockstep (§4.5).
 //!
-//! What §3.9 splits into precomputable constants:
+//! Because blocks 19–23 form the **simulated decoder** (block 8,
+//! §3.10), an [`Encoder`] driven by any input and a
+//! [`crate::Decoder`] fed the resulting channel indices produce the
+//! same quantized speech bit for bit — the
+//! `encoder_decoder_lockstep_*` tests pin that property.
 //!
-//! - `Y_ENERGY[j] = Σ_k y_j(k)²` (the per-shape codevector energy) —
-//!   landed this round in `tables.rs` as a const-derived
-//!   `[f64; NCWD]` array (eq. 3-23). The per-test in `tables.rs`
-//!   asserts it equals the direct dot product on `y_f64()` to machine
-//!   precision.
-//! - `G2[i] = 2·gq[i]` and `GSQ[i] = gq[i]²` — already in `tables.rs`
-//!   from r189, used by the `b_i = 2·g_i`, `c_i = g_i²` substitution
-//!   in eq. 3-21 / 3-22 of the gain-quantiser decision tree.
-//! - `GB[i]` — the mid-point boundaries already in `tables.rs`, used
-//!   by the division-free gain decision in §3.9.2.
-//!
-//! All four tables are constants of the codebook; the encoder will
-//! consume them by reference without recomputation.
-//!
-//! ## What is NOT implemented
-//!
-//! The full §3.9 search loop (perceptual weighting filter + impulse
-//! response + zero-state response correlation + shape-codebook scan +
-//! gain-quantiser decision tree) is intentionally absent. Every
-//! `encode_*` call returns [`Error::NotImplemented`]. The shared
-//! backward adapters ([`crate::SynthesisAdapter`], [`crate::GainAdapter`])
-//! are accessible through the encoder's typed surface so future rounds
-//! can wire blocks 1..28 + 67..70 against them without restructuring
-//! this module.
+//! The precomputed codebook constants the search consumes
+//! (`Y_ENERGY`, `G2`, `GSQ`, `GB`) live in `tables.rs`; the per-cycle
+//! `E_j = ‖H·y_j‖²` table lives in [`CodebookSearch`].
 
+use crate::codebook_search::CodebookSearch;
 use crate::consts::{NCWD, NFRSZ};
-use crate::decoder::FRAME_LEN;
+use crate::decoder::{ExcitationVector, FRAME_LEN};
 use crate::gain_adapter::GainAdapter;
 use crate::levinson::LevinsonError;
 use crate::synthesis_adapter::SynthesisAdapter;
@@ -60,7 +66,8 @@ use crate::Error;
 /// without re-deriving the rate-bit-count relationship.
 pub const CHANNEL_INDEX_BITS: u32 = 10;
 
-/// LD-CELP encoder — typed scaffold only as of round 235.
+/// LD-CELP encoder — full per-vector analysis-by-synthesis loop as
+/// of round 276 ([`Encoder::encode_vector`]).
 ///
 /// Carries the two backward adapters (synthesis-filter adapter §3.7,
 /// log-gain adapter §3.8) plus the previously gain-scaled excitation
@@ -68,10 +75,6 @@ pub const CHANNEL_INDEX_BITS: u32 = 10;
 /// because §4.4 / §4.5 of the Recommendation require the encoder and
 /// decoder backward adapters to be bit-for-bit identical so that the
 /// quantised speech at both ends evolves in lockstep.
-///
-/// The [`Encoder::shape_energy`] accessor exposes the precomputed
-/// `E_j` table the analysis-by-synthesis search will consume per §3.9
-/// equation 3-23.
 #[derive(Debug)]
 pub struct Encoder {
     /// Backward synthesis-filter adapter, shared block-33 logic.
@@ -105,15 +108,37 @@ pub struct Encoder {
     /// [`Encoder::commit_weighting_filter_coefficients`].
     weighting_filter_adapter: WeightingFilterAdapter,
     /// Zero-input-response + VQ-target unit (blocks 9 + 10 + 11 of
-    /// §3.5 / §3.6). Carries the synthesis-filter ring memory
-    /// `STATELPC` and the weighting-filter ring memories
-    /// `ZIRWFIR` / `ZIRWIIR`, all at the spec's all-zero
-    /// initialisation state per Table 2/G.728. Driven by
-    /// [`Encoder::compute_vq_target`].
+    /// §3.5 / §3.6) — and, since r276, the §5.13 memory-update phase
+    /// (§3.10). Carries the synthesis-filter ring memory `STATELPC`
+    /// and the weighting-filter ring memories `ZIRWFIR` / `ZIRWIIR`,
+    /// all at the spec's all-zero initialisation state per
+    /// Table 2/G.728. Driven by [`Encoder::compute_vq_target`] /
+    /// [`Encoder::encode_vector`].
     zir: ZeroInputResponse,
+    /// Codebook search module (blocks 12–18 of §3.9). Carries the
+    /// per-cycle impulse response `H` and filtered-shape energy
+    /// table `Y2` at their Table 2/G.728 initial states.
+    codebook_search: CodebookSearch,
     /// Previous gain-scaled excitation vector — block-67 1-vector
     /// delay. Initialised to zero per Table 2/G.728.
     et_prev: [f64; FRAME_LEN],
+    /// Rolling NFRSZ-sample quantized-speech buffer feeding the
+    /// synthesis adapter (block 23) — the encoder-side mirror of the
+    /// decoder's `STTMP(1..NFRSZ)` accumulation.
+    sttmp_buf: [f64; NFRSZ],
+    /// Rolling NFRSZ-sample input-speech buffer feeding the
+    /// weighting-filter adapter (blocks 36 + 37) — the spec's
+    /// `STMP(1..4*IDIM)` cycle buffer.
+    stmp_buf: [f64; NFRSZ],
+    /// Shared write cursor into the two cycle buffers; both fill in
+    /// lockstep (one vector of each per encoded vector) and the
+    /// adapters re-run when a full NFRSZ cycle is collected.
+    cycle_idx: usize,
+    /// Most recent quantized speech vector `sq(n)` (the §3.10
+    /// by-product of the memory update) — exposed for the
+    /// encoder/decoder lockstep tests and for callers that want the
+    /// locally decoded signal without running a separate decoder.
+    last_sq: [f64; FRAME_LEN],
 }
 
 impl Default for Encoder {
@@ -155,7 +180,15 @@ impl Encoder {
             // first vector's zero-input response is zero and the VQ
             // target equals the weighted speech exactly.
             zir: ZeroInputResponse::new(),
+            // Table 2/G.728: H starts at the identity impulse
+            // (1,0,0,0,0) and Y2 at the bare shape energies — the
+            // CodebookSearch constructor encodes both.
+            codebook_search: CodebookSearch::new(),
             et_prev: [0.0; FRAME_LEN],
+            sttmp_buf: [0.0; NFRSZ],
+            stmp_buf: [0.0; NFRSZ],
+            cycle_idx: 0,
+            last_sq: [0.0; FRAME_LEN],
         }
     }
 
@@ -331,27 +364,109 @@ impl Encoder {
         self.zir.compute_target(&a, &w, v)
     }
 
+    /// Borrow the codebook-search module (blocks 12–18 of §3.9) —
+    /// read-only view of the current impulse response `H` and
+    /// filtered-shape energy table `Y2`.
+    pub fn codebook_search(&self) -> &CodebookSearch {
+        &self.codebook_search
+    }
+
+    /// Borrow the most recent quantized speech vector `sq(n)` — the
+    /// §3.10 by-product of the last [`Self::encode_vector`] call.
+    /// Because blocks 19–23 form the simulated decoder (block 8),
+    /// this equals what [`crate::Decoder::decode_vector`] produces
+    /// for the same channel index, bit for bit.
+    pub fn quantized_speech(&self) -> &[f64; FRAME_LEN] {
+        &self.last_sq
+    }
+
     /// Encode one `FRAME_LEN`-sample input vector into one 10-bit
-    /// channel index.
+    /// channel index — the full per-vector analysis-by-synthesis loop
+    /// of Figure 2/G.728 (§3.4–§3.10). Mirrors the symmetry of
+    /// [`crate::Decoder::decode_vector`]: one input vector in, one
+    /// channel index out.
     ///
-    /// The full §3.9 analysis-by-synthesis search (blocks 1..28 +
-    /// 67..70) is not yet implemented — the call returns
-    /// [`Error::NotImplemented`] in round 235. The signature is final
-    /// and matches the symmetry of [`crate::Decoder::decode_vector`]:
-    /// one input vector in, one channel index out.
-    pub fn encode_vector(&mut self, _input: &[f64; FRAME_LEN]) -> Result<u16, Error> {
-        Err(Error::NotImplemented)
+    /// See the module docs for the block-by-block dataflow. The
+    /// adapters re-run at the end of every NUPDATE = 4 vectors —
+    /// the same end-of-cycle simplification of the spec's
+    /// ICOUNT = 2/3 stagger that the decoder uses, so encoder and
+    /// decoder synthesis predictors evolve in lockstep (§4.5).
+    ///
+    /// The `Result` shape is kept (per-vector encoding itself cannot
+    /// fail) so byte-stream framing entry points can share the
+    /// signature.
+    pub fn encode_vector(&mut self, input: &[f64; FRAME_LEN]) -> Result<u16, Error> {
+        // ----- Block 20: predict σ(n) from the previous ET -----------
+        // Same call order as the decoder's block 30 (§4.5 lockstep).
+        let gain = self.gain_adapter.predict_next(&self.et_prev);
+
+        // ----- Block 4: perceptual weighting (§3.4) ------------------
+        let v = self.weighting_filter.filter_vector(input);
+
+        // ----- Blocks 9 + 10 + 11: ZIR ring + VQ target (§3.5/§3.6) --
+        let a = *self.synth_adapter.coefficients();
+        let w = self.weighting_filter_coeff;
+        let target = self.zir.compute_target(&a, &w, &v);
+
+        // ----- Blocks 12–18: codebook search (§3.9) ------------------
+        // Blocks 16 + 13 + 17 + 18 run per vector; the per-cycle
+        // blocks 12 + 14 + 15 are refreshed in the end-of-cycle
+        // bookkeeping below.
+        let res = self.codebook_search.search(&target, gain);
+
+        // ----- Blocks 19 + 21: excitation lookup + gain scaling ------
+        // §5.12: YN = GQ(IG)·Y(IS row), ET = GAIN·YN. The decoder-side
+        // ExcitationVector lookup implements exactly the block-19
+        // table read, so the two ends share the code path.
+        let yn = ExcitationVector::from_channel_index(res.channel_index);
+        let mut et = [0.0f64; FRAME_LEN];
+        for k in 0..FRAME_LEN {
+            et[k] = gain * yn.0[k];
+        }
+
+        // ----- §5.13: filter memory update (§3.10) -------------------
+        // Adds the zero-state responses of e(n) onto the post-ring
+        // memory and yields sq(n) from the top STATELPC taps.
+        let sq = self.zir.update_memory(&et, &a, &w);
+        self.last_sq = sq;
+
+        // ----- Cycle bookkeeping: blocks 23 + 36/37/38 + 12/14/15 ----
+        // Accumulate one vector of quantized speech (block 23 input)
+        // and one vector of input speech (block 36 input); on a full
+        // NFRSZ cycle re-run both adapters, commit the weighting
+        // coefficients through block 38, and refresh the impulse
+        // response + energy table (blocks 12 + 14 + 15). On Levinson
+        // failure each adapter keeps its previous cycle's output —
+        // the same §3.7 "keep the old coefficients" policy the
+        // decoder applies to block 33.
+        for k in 0..FRAME_LEN {
+            self.sttmp_buf[self.cycle_idx + k] = sq[k];
+            self.stmp_buf[self.cycle_idx + k] = input[k];
+        }
+        self.cycle_idx += FRAME_LEN;
+        if self.cycle_idx >= NFRSZ {
+            self.cycle_idx = 0;
+            let _ = self.synth_adapter.adapt(&self.sttmp_buf);
+            if self.weighting_filter_adapter.adapt(&self.stmp_buf).is_ok() {
+                self.commit_weighting_filter_coefficients();
+            }
+            self.codebook_search.update_impulse_response(
+                self.synth_adapter.coefficients(),
+                &self.weighting_filter_coeff,
+            );
+        }
+
+        // ----- Block 67 wrap-around: save ET for the next vector -----
+        self.et_prev = et;
+
+        Ok(res.channel_index)
     }
 }
 
-/// Direct factory entry for the typed encoder scaffold, mirroring
-/// [`crate::make_decoder`]. Returns a fresh [`Encoder`] with all
-/// internal state at Table 2/G.728 initial values.
-///
-/// The decoder/encoder symmetry of this dual-API convention lets
-/// downstream consumers wire the encoder type now; round-235's
-/// `encode_*` calls still surface [`Error::NotImplemented`] because
-/// the §3.9 analysis-by-synthesis pipeline is not yet implemented.
+/// Direct factory entry for the encoder, mirroring
+/// [`crate::make_decoder`] per the workspace dual-API convention.
+/// Returns a fresh [`Encoder`] with all internal state at
+/// Table 2/G.728 initial values.
 pub fn make_encoder() -> Encoder {
     Encoder::new()
 }
@@ -398,15 +513,26 @@ mod tests {
     }
 
     #[test]
-    fn encode_vector_is_not_implemented_in_r235() {
-        // Round 235 lands only the typed surface. The full §3.9
-        // analysis-by-synthesis search is not yet implemented; every
-        // encode_vector call must surface Error::NotImplemented so
-        // downstream callers can detect the pre-encoder-pipeline state.
+    fn encode_vector_emits_ten_bit_channel_indices() {
+        // r276: the §3.9 + §3.10 loop is closed — every call returns
+        // a real channel index in [0, 1024) (CHANNEL_INDEX_BITS = 10),
+        // including on all-zero input (the COR = 0 path of the §5.11
+        // decision tree is well-defined).
         let mut enc = Encoder::new();
         let zero_in = [0.0f64; IDIM];
-        let err = enc.encode_vector(&zero_in);
-        assert_eq!(err, Err(Error::NotImplemented));
+        let ichan = enc.encode_vector(&zero_in).expect("encode must succeed");
+        assert!(ichan < 1024);
+        for i in 0..64usize {
+            let mut s = [0.0f64; IDIM];
+            for k in 0..IDIM {
+                s[k] = 500.0 * ((i * IDIM + k) as f64 * 0.37).sin();
+            }
+            let ichan = enc.encode_vector(&s).expect("encode must succeed");
+            assert!(ichan < 1024, "vector {i}");
+            for &q in enc.quantized_speech() {
+                assert!(q.is_finite(), "vector {i}");
+            }
+        }
     }
 
     #[test]
@@ -784,5 +910,127 @@ mod tests {
         let standalone = WeightingFilterAdapter::new();
         let q_solo = standalone.predictor();
         assert_eq!(q_enc, q_solo);
+    }
+
+    /// Speech-like test signal: two tones + a slow envelope, scaled
+    /// to the §3.1.1 nominal input range.
+    fn speech_like_sample(n: usize) -> f64 {
+        let t = n as f64;
+        let envelope = 0.6 + 0.4 * (t * 0.004).sin();
+        envelope * (900.0 * (t * 0.23).sin() + 350.0 * (t * 0.71).cos())
+    }
+
+    #[test]
+    fn encoder_decoder_lockstep_quantized_speech_is_bit_exact() {
+        // Blocks 19–23 of the encoder form the simulated decoder
+        // (block 8, §3.10): "the quantized speech vector sq(n) is
+        // actually the simulated decoded speech vector when there are
+        // no channel errors". So a fresh Decoder fed the encoder's
+        // channel indices must reproduce the encoder's sq(n) BIT FOR
+        // BIT, vector after vector — both ends share the backward
+        // adapters (§4.4 / §4.5), the same end-of-cycle adaptation
+        // cadence, and the same ±4 095 memory saturation. 200 vectors
+        // = 50 adaptation cycles, deep into the adapted regime.
+        let mut enc = Encoder::new();
+        let mut dec = crate::Decoder::new();
+        for vec_idx in 0..200usize {
+            let mut s = [0.0f64; IDIM];
+            for k in 0..IDIM {
+                s[k] = speech_like_sample(vec_idx * IDIM + k);
+            }
+            let ichan = enc.encode_vector(&s).expect("encode");
+            let out = dec.decode_vector(ichan);
+            for k in 0..IDIM {
+                assert_eq!(
+                    enc.quantized_speech()[k],
+                    out[k],
+                    "vec {vec_idx} sample {k}: encoder sq {} vs decoder {}",
+                    enc.quantized_speech()[k],
+                    out[k]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn encoder_tracks_input_after_adaptation() {
+        // End-to-end quality smoke: after the backward adapters have
+        // had time to converge, the quantized speech must track the
+        // input — the coding error energy over a window must drop
+        // well below the signal energy. (G.728 delivers toll quality;
+        // even this floating-point build at cold start beats 3 dB
+        // SNR comfortably on a stationary two-tone signal. The exact
+        // SNR is not pinned — only the "error ≪ signal" property.)
+        let mut enc = Encoder::new();
+        let warmup = 100usize;
+        let measure = 100usize;
+        let mut sig_energy = 0.0f64;
+        let mut err_energy = 0.0f64;
+        for vec_idx in 0..(warmup + measure) {
+            let mut s = [0.0f64; IDIM];
+            for k in 0..IDIM {
+                s[k] = speech_like_sample(vec_idx * IDIM + k);
+            }
+            enc.encode_vector(&s).expect("encode");
+            if vec_idx >= warmup {
+                let sq = enc.quantized_speech();
+                for k in 0..IDIM {
+                    sig_energy += s[k] * s[k];
+                    err_energy += (s[k] - sq[k]) * (s[k] - sq[k]);
+                }
+            }
+        }
+        assert!(
+            err_energy < 0.5 * sig_energy,
+            "coding error energy {err_energy} should be well below signal energy {sig_energy}"
+        );
+    }
+
+    #[test]
+    fn encode_vector_advances_cycle_state() {
+        // After several adaptation cycles of real signal the
+        // end-of-cycle bookkeeping must have run: the synthesis
+        // predictor leaves the all-pass state (block 23 adapted on
+        // sq) and the impulse response leaves the identity (blocks
+        // 12 + 14 + 15 refreshed from the new coefficient sets).
+        // Levinson may legitimately fail on the earliest cold-start
+        // cycles (the §3.7 "keep the old coefficients" path), so
+        // give the hybrid window the same multi-cycle budget the
+        // adapter's own tests use: 10 cycles = 40 vectors.
+        let mut enc = Encoder::new();
+        for vec_idx in 0..40usize {
+            let mut s = [0.0f64; IDIM];
+            for k in 0..IDIM {
+                s[k] = speech_like_sample(vec_idx * IDIM + k);
+            }
+            enc.encode_vector(&s).expect("encode");
+        }
+        let a = enc.synthesis_adapter().coefficients();
+        assert!(
+            a[1..].iter().any(|&v| v != 0.0),
+            "synthesis predictor should have adapted off the all-pass state"
+        );
+        let h = enc.codebook_search().impulse_response();
+        assert!(
+            h[1..].iter().any(|&v| v != 0.0),
+            "impulse response should have left the identity after a cycle refresh"
+        );
+    }
+
+    #[test]
+    fn encoder_excitation_matches_decoder_reconstruction() {
+        // The block-67 ET delay slot must carry σ(n)·g_i·y_j — the
+        // same gain-scaled excitation the decoder rebuilds. Cross-
+        // check one step explicitly: encode a vector, then rebuild
+        // ET from the emitted index with a parallel gain adapter.
+        let mut enc = Encoder::new();
+        let mut reference_gain = crate::GainAdapter::new();
+        let s = [800.0, -300.0, 450.0, -120.0, 615.0];
+        let sigma = reference_gain.predict_next(&[0.0; IDIM]);
+        let ichan = enc.encode_vector(&s).expect("encode");
+        let yn = ExcitationVector::from_channel_index(ichan);
+        for k in 0..IDIM {
+            assert_eq!(enc.previous_excitation()[k], sigma * yn.0[k], "sample {k}");
+        }
     }
 }

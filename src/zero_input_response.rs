@@ -29,7 +29,7 @@
 //! i.e. `x(n) = v(n) − r(n)` (the spec calls `v(n)` `SW` and `r(n)`
 //! `ZIR` in the §5.10 pseudo-code).
 //!
-//! ## What this module computes — and what it deliberately does not
+//! ## What this module computes
 //!
 //! `ZeroInputResponse` carries the three filter-memory arrays the
 //! §5.9 block-9 / block-10 pseudo-code names — `STATELPC` (synthesis
@@ -38,25 +38,25 @@
 //! each) — and runs one `IDIM = 5`-sample "ring" through them to
 //! produce `r(n)`, then subtracts it from `v(n)` to yield `x(n)`.
 //!
-//! The §3.10 **memory-update phase** — saving the post-ring memory,
-//! zeroing it, refiltering the chosen `e(n)` to add the zero-state
-//! response on top of the saved zero-input memory, and reading
-//! `sq(n)` back out of the top five `STATELPC` taps — is a separate,
-//! later round. It depends on the codebook-search output `e(n)` that
-//! §3.9 (not yet wired up) selects, so it cannot run before the
-//! search. This module is the half of §3.5 that runs **before** the
-//! search and only reads the current filter memory; the
-//! complementary memory-update half runs **after** the search.
+//! Since round 276 it also carries the complementary §3.10
+//! **memory-update phase** (pseudo-code §5.13): after the §3.9
+//! codebook search has selected the gain-scaled excitation `e(n)`,
+//! [`ZeroInputResponse::update_memory`] computes the **zero-state
+//! responses** of the cascaded filters to `e(n)` and adds them onto
+//! the post-ring memory — "this in effect adds the zero-input
+//! responses to the zero-state responses of the filters 9 and 10"
+//! (§3.10). The quantized speech vector `sq(n)` then falls out of
+//! the top five `STATELPC` taps for free, which is why the §5.12
+//! block-22 synthesis filter "can be omitted".
 //!
-//! Until then the caller supplies the filter memory explicitly (the
-//! §3.10 update would otherwise be its source); `ZeroInputResponse`
-//! constructs to the spec's all-zero initialisation state, so the
-//! very first vector after construction yields `r(n) = 0` and
-//! `x(n) = v(n)` exactly — matching the §3.5 note that "except for
-//! the vector right after initialization, the memory of the filters
-//! 9 and 10 is in general non-zero".
+//! `ZeroInputResponse` constructs to the spec's all-zero
+//! initialisation state, so the very first vector after construction
+//! yields `r(n) = 0` and `x(n) = v(n)` exactly — matching the §3.5
+//! note that "except for the vector right after initialization, the
+//! memory of the filters 9 and 10 is in general non-zero".
 
 use crate::consts::{IDIM, LPC, LPCW};
+use crate::decoder::DEFAULT_MAX;
 use crate::weighting_filter_coeff::WeightingFilterCoeff;
 
 /// Block 9 + block 10 + block 11 — zero-input-response computation
@@ -65,9 +65,10 @@ use crate::weighting_filter_coeff::WeightingFilterCoeff;
 /// Carries the three filter-memory arrays the §5.9 pseudo-code
 /// names. All three are initialised to zero per the spec's
 /// initialisation state (Table 2/G.728); after that they evolve
-/// only through [`ZeroInputResponse::compute_target`] (the "ring"
-/// shift of §5.9) until the §3.10 memory-update phase lands in a
-/// later round.
+/// through [`ZeroInputResponse::compute_target`] (the "ring" shift
+/// of §5.9, before the codebook search) and
+/// [`ZeroInputResponse::update_memory`] (the §5.13 zero-state-
+/// response addition, after the search).
 #[derive(Debug, Clone)]
 pub struct ZeroInputResponse {
     /// `STATELPC(1..LPC)` — synthesis filter memory (block 9). Index
@@ -141,9 +142,9 @@ impl ZeroInputResponse {
     /// The three filter-memory arrays advance one slot per output
     /// sample as the spec's "ring for five samples" prescribes, so a
     /// subsequent call sees the rung-down memory (the spec's general
-    /// non-zero state). This is the **zero-input phase** only; the
-    /// §3.10 memory-update phase that adds the zero-state response of
-    /// `e(n)` is a later round.
+    /// non-zero state). This is the **zero-input phase**; once the
+    /// §3.9 search has picked `e(n)`, the caller completes the cycle
+    /// with [`Self::update_memory`].
     pub fn compute_target(
         &mut self,
         a: &[f64; LPC + 1],
@@ -235,6 +236,126 @@ impl ZeroInputResponse {
         }
 
         zir
+    }
+
+    /// §3.10 memory-update phase — filter memory update for blocks 9
+    /// and 10 (pseudo-code §5.13). Runs **after** the §3.9 codebook
+    /// search has selected the gain-scaled excitation vector `e(n)`
+    /// (= `ET = σ(n)·g_i·y_j`, blocks 19 + 21 of §5.12).
+    ///
+    /// Per §3.10: the memory left over after the §5.9 zero-input ring
+    /// is kept, the zero-memory cascade is excited with `e(n)`, and
+    /// the resulting **zero-state responses** are added on top —
+    /// "this in effect adds the zero-input responses to the
+    /// zero-state responses of the filters 9 and 10". The quantized
+    /// speech vector `sq(n)` is then read out of the top five
+    /// `STATELPC` taps (the §5.12 block-22 synthesis filter "can be
+    /// omitted"), and is returned.
+    ///
+    /// `et` is the gain-scaled excitation `ET(1..IDIM)`; `a` and `w`
+    /// are the same predictor / weighting coefficient sets the
+    /// preceding [`Self::compute_target`] call used. Per §5.13 the
+    /// synthesis-filter memory is clipped at the `MAX`/`MIN`
+    /// saturation levels — "the positive and negative saturation
+    /// levels of A-law or µ-law PCM"; we use the same default
+    /// `±4 095` envelope as [`crate::Synthesizer::new`] (§3.1.1
+    /// assumed-input range) so the encoder-side memory stays in
+    /// lockstep with the decoder-side block-32 filter.
+    ///
+    /// Must be called exactly once per encoded vector, after the
+    /// per-vector [`Self::compute_target`] — the §5.13 procedure
+    /// assumes the ring has already shifted the memory.
+    pub fn update_memory(
+        &mut self,
+        et: &[f64; IDIM],
+        a: &[f64; LPC + 1],
+        w: &WeightingFilterCoeff,
+    ) -> [f64; IDIM] {
+        let awz = &w.q_gamma1; // numerator taps, spec AWZ
+        let awp = &w.q_gamma2; // denominator taps, spec AWP
+
+        // ===== §5.13: zero-state responses of the cascade ===========
+        // The pseudo-code reuses ZIRWFIR as a scratch history for the
+        // synthesis-filter zero-state output and TEMP for the
+        // weighting-filter zero-state output (both only need IDIM
+        // slots — the filters start from zero memory and e(n) is five
+        // samples long). We use two local arrays; the struct's
+        // ZIRWFIR is rewritten from STATELPC at the end exactly as
+        // the spec's "now set ZIRWFIR to the right value" loop does.
+        //
+        // | ZIRWFIR(1) = ET(1)              | ZIRWFIR now a scratch array
+        // | TEMP(1) = ET(1)
+        // | For K = 2,3,..,IDIM:
+        // |   A0 = ET(K)
+        // |   A1 = 0
+        // |   A2 = 0
+        // |   For I = K,K−1,..,2, do the next five lines
+        // |     ZIRWFIR(I) = ZIRWFIR(I − 1) | shift histories
+        // |     TEMP(I) = TEMP(I − 1)
+        // |     A0 = A0 − A(I)·ZIRWFIR(I)   | synthesis feedback
+        // |     A1 = A1 + AWZ(I)·ZIRWFIR(I) | weighting numerator
+        // |     A2 = A2 − AWP(I)·TEMP(I)    | weighting denominator
+        // |   ZIRWFIR(1) = A0
+        // |   TEMP(1) = A0 + A1 + A2
+        //
+        // Same five-line shift-then-MAC idiom as the block-12 impulse
+        // response calculator (§5.11) — the cascade is the same, the
+        // input is e(n) instead of the unit impulse. Most recent
+        // sample sits at index 1.
+        let mut zsr_syn = [0.0f64; IDIM]; // spec's scratch ZIRWFIR(1..IDIM)
+        let mut zsr_w = [0.0f64; IDIM]; // spec's TEMP(1..IDIM)
+        zsr_syn[0] = et[0];
+        zsr_w[0] = et[0];
+        for k in 2..=IDIM {
+            let mut a0 = et[k - 1];
+            let mut a1 = 0.0f64;
+            let mut a2 = 0.0f64;
+            for i in (2..=k).rev() {
+                zsr_syn[i - 1] = zsr_syn[i - 2];
+                zsr_w[i - 1] = zsr_w[i - 2];
+                a0 -= a[i - 1] * zsr_syn[i - 1];
+                a1 += awz[i - 1] * zsr_syn[i - 1];
+                a2 -= awp[i - 1] * zsr_w[i - 1];
+            }
+            zsr_syn[0] = a0;
+            zsr_w[0] = a0 + a1 + a2;
+        }
+
+        // ===== §5.13: add zero-state to zero-input responses =========
+        // | For K = 1,2,..,IDIM, do the next four lines
+        // |   STATELPC(K) = STATELPC(K) + ZIRWFIR(K)
+        // |   If STATELPC(K) > MAX, set STATELPC(K) = MAX  | limit
+        // |   If STATELPC(K) < MIN, set STATELPC(K) = MIN  |
+        // |   ZIRWIIR(K) = ZIRWIIR(K) + TEMP(K)
+        //
+        // Only the top IDIM taps receive the zero-state response —
+        // the older taps (6..LPC of STATELPC, 6..LPCW of ZIRWIIR)
+        // keep their rung-down values from the §5.9 ring; the
+        // zero-state response is only five samples deep.
+        for k in 0..IDIM {
+            self.state_lpc[k] = (self.state_lpc[k] + zsr_syn[k]).clamp(-DEFAULT_MAX, DEFAULT_MAX);
+            self.zirw_iir[k] += zsr_w[k];
+        }
+
+        // | For I = 1,2,..,LPCW:            | now set ZIRWFIR to the
+        // |   ZIRWFIR(I) = STATELPC(I)      | right value
+        //
+        // The weighting filter's all-zero memory holds the past
+        // *inputs* to filter 10 — which, with the switch closed, are
+        // the synthesis-filter outputs, i.e. the quantized speech now
+        // sitting in the top LPCW taps of STATELPC.
+        for i in 0..LPCW {
+            self.zirw_fir[i] = self.state_lpc[i];
+        }
+
+        // | I = IDIM + 1
+        // | For K = 1,2,..,IDIM:            | obtain quantized speech
+        // |   ST(K) = STATELPC(I − K)       | by reversing order
+        let mut st = [0.0f64; IDIM];
+        for k in 0..IDIM {
+            st[k] = self.state_lpc[IDIM - 1 - k];
+        }
+        st
     }
 }
 
@@ -446,6 +567,103 @@ mod tests {
             for &xv in &x {
                 assert!(xv.is_finite(), "non-finite target at vec {vec_idx}");
             }
+        }
+    }
+
+    #[test]
+    fn update_memory_identity_cascade_passes_excitation_through() {
+        // Cold start + all-pass synthesis + disabled weighting: the
+        // zero-state response of the identity cascade IS e(n), the
+        // zero-input memory is zero, so sq(n) = e(n) and the top five
+        // STATELPC taps hold e(n) reversed (most recent first).
+        let mut z = ZeroInputResponse::new();
+        let a = allpass_a();
+        let w = WeightingFilterCoeff::disabled();
+        let _ = z.compute_target(&a, &w, &[0.0; IDIM]);
+        let et = [3.0, -1.5, 0.75, -0.375, 0.1875];
+        let st = z.update_memory(&et, &a, &w);
+        for k in 0..IDIM {
+            assert_eq!(st[k], et[k], "k={k}");
+            assert_eq!(z.state_lpc()[k], et[IDIM - 1 - k], "STATELPC[{k}]");
+        }
+        // ZIRWFIR mirrors STATELPC's top LPCW taps after the update.
+        for i in 0..LPCW {
+            assert_eq!(z.zirw_fir()[i], z.state_lpc()[i], "ZIRWFIR[{i}]");
+        }
+    }
+
+    #[test]
+    fn ring_plus_update_matches_decoder_synthesizer_exactly() {
+        // §3.10 note: "after the filter memory update, the top five
+        // elements of the memory of the synthesis filter 9 are
+        // exactly the same as the components of the desired quantized
+        // speech vector sq(n)". The decoder's block-32 Synthesizer
+        // computes the same ZIR + ZSR + clamp sequence in one call —
+        // so for any predictor and any excitation stream, ring +
+        // update_memory here must reproduce Synthesizer::filter_vector
+        // bit for bit, vector after vector.
+        use crate::decoder::{ExcitationVector, Synthesizer};
+
+        let mut adapter = SynthesisAdapter::new();
+        let mut input = [0.0f64; crate::consts::NFRSZ];
+        for k in 0..crate::consts::NFRSZ {
+            let t = k as f64;
+            input[k] = 150.0 * (0.35 * t).sin() + 60.0 * (1.3 * t).cos();
+        }
+        for _ in 0..6 {
+            let _ = adapter.adapt(&input);
+        }
+        let a = *adapter.coefficients();
+
+        // Non-trivial weighting coefficients exercise the block-10
+        // halves too (they must not perturb the STATELPC lockstep).
+        let mut q = [0.0f64; LPCW + 1];
+        q[0] = 1.0;
+        q[1] = -0.45;
+        q[2] = 0.15;
+        let w = WeightingFilterCoeff::from_lpc(&q);
+
+        let mut z = ZeroInputResponse::new();
+        let mut synth = Synthesizer::new();
+        synth.set_predictor(a);
+
+        for vec_idx in 0..32 {
+            let mut et = [0.0f64; IDIM];
+            for k in 0..IDIM {
+                et[k] = 40.0 * ((vec_idx * IDIM + k) as f64 * 0.43).sin();
+            }
+            // Encoder side: §5.9 ring (discard target), then §5.13.
+            let _ = z.compute_target(&a, &w, &[0.0; IDIM]);
+            let st = z.update_memory(&et, &a, &w);
+            // Decoder side: block 32 in one call.
+            let dec = synth.filter_vector(&ExcitationVector(et));
+            for k in 0..IDIM {
+                assert_eq!(
+                    st[k], dec[k],
+                    "vec {vec_idx} sample {k}: encoder {} decoder {}",
+                    st[k], dec[k]
+                );
+            }
+            // The full 50-tap memories must agree too.
+            for j in 0..LPC {
+                assert_eq!(z.state_lpc()[j], synth.state()[j], "vec {vec_idx} tap {j}");
+            }
+        }
+    }
+
+    #[test]
+    fn update_memory_clamps_statelpc_at_saturation() {
+        // §5.13 limiter: STATELPC clips at ±MAX (the §3.1.1 ±4 095
+        // envelope). Drive a huge excitation through the identity
+        // cascade and confirm the memory saturates.
+        let mut z = ZeroInputResponse::new();
+        let a = allpass_a();
+        let w = WeightingFilterCoeff::disabled();
+        let _ = z.compute_target(&a, &w, &[0.0; IDIM]);
+        let et = [1.0e6, -1.0e6, 1.0e6, -1.0e6, 1.0e6];
+        let st = z.update_memory(&et, &a, &w);
+        for k in 0..IDIM {
+            assert_eq!(st[k].abs(), crate::decoder::DEFAULT_MAX, "k={k}");
         }
     }
 }

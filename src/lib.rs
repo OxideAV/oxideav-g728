@@ -119,14 +119,18 @@
 //! Round 235 lands the **typed encoder scaffold** — see [`Encoder`] /
 //! [`make_encoder`] — plus the [`tables::Y_ENERGY`] precomputed shape
 //! codevector energy table (`E_j = Σ_k y_j(k)²`) that §3.9 equation
-//! 3-23 references in the analysis-by-synthesis cost expression. No
-//! encoder pipeline (§3.9 blocks 1..28 + 67..70) is implemented yet —
-//! every [`Encoder::encode_vector`] call returns
-//! [`Error::NotImplemented`]. The encoder type carries the same two
-//! backward adapters as the decoder ([`SynthesisAdapter`] and
-//! [`GainAdapter`]) because §4.4 / §4.5 of the Recommendation require
-//! the two backward adapters to be bit-for-bit identical at both ends
-//! of the channel.
+//! 3-23 references in the analysis-by-synthesis cost expression. The
+//! encoder type carries the same two backward adapters as the decoder
+//! ([`SynthesisAdapter`] and [`GainAdapter`]) because §4.4 / §4.5 of
+//! the Recommendation require the two backward adapters to be
+//! bit-for-bit identical at both ends of the channel. Rounds 248 /
+//! 249 / 258 / 267 grow the encoder front end (blocks 36 + 37 + 38 +
+//! 4 + 9 + 10 + 11); round 276 lands the **§3.9 codebook search**
+//! (blocks 12–18, see [`codebook_search`] / [`CodebookSearch`]) and
+//! the **§3.10 memory update** ([`ZeroInputResponse::update_memory`],
+//! pseudo-code §5.13), closing the analysis-by-synthesis loop —
+//! [`Encoder::encode_vector`] now emits real 10-bit channel indices
+//! and runs in exact lockstep with [`Decoder::decode_vector`].
 //!
 //! Round 248 lands the **perceptual weighting filter coefficient
 //! calculator** (block 38, §3.3, the third sub-block of the weighting
@@ -202,6 +206,7 @@
 use oxideav_core::RuntimeContext;
 
 pub mod agc;
+pub mod codebook_search;
 pub mod consts;
 pub mod decoder;
 pub mod encoder;
@@ -221,6 +226,7 @@ pub mod weighting_filter_coeff;
 pub mod zero_input_response;
 
 pub use agc::Agc;
+pub use codebook_search::{CodebookSearch, SearchResult};
 pub use decoder::{pack_channel_index, ExcitationVector, Synthesizer, DEFAULT_MAX, FRAME_LEN};
 pub use encoder::{make_encoder, Encoder, CHANNEL_INDEX_BITS};
 pub use gain_adapter::GainAdapter;
@@ -239,9 +245,11 @@ pub use zero_input_response::ZeroInputResponse;
 
 /// Crate-local error type.
 ///
-/// Round 189 exposes a decoder front end behind [`Decoder`] but does
-/// not yet implement encoder operations or the backward-adapter
-/// pipeline; those entry points still return [`Error::NotImplemented`].
+/// As of round 276 both the decoder and the per-vector encoder loop
+/// are wired end to end; [`Error::NotImplemented`] remains for the
+/// planned surfaces that are still scaffolds (e.g. the Annex G
+/// fixed-point arithmetic variant and the byte-stream framing
+/// helpers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     /// Functionality is part of the planned scope but not yet wired
@@ -427,19 +435,17 @@ impl Decoder {
         // ----- Block 30: predict σ(n) from previous ET ---------------
         let sigma = self.gain_adapter.predict_next(&self.et_prev);
 
-        // ----- Block 29: shape codevector lookup ---------------------
-        // ExcitationVector::from_channel_index pre-applies the gain-
-        // codebook scaling; we want the raw shape codevector only,
-        // because block 30 supplies σ(n) and block 31 multiplies it
-        // explicitly. So redo the lookup unscaled here.
-        let ichan_masked = (ichan & 0x03FF) as usize;
-        let is_index = ichan_masked / consts::NG;
-        let y_row = &tables::Y_Q11[is_index];
+        // ----- Block 29: excitation VQ codebook lookup ---------------
+        // §5.14 block 29: YN(K) = GQ(IG) · Y(NN + K) — the gain-
+        // codebook level g_i is part of the codebook lookup, separate
+        // from the backward-adapted σ(n) that block 31 multiplies on
+        // top (ET = GAIN · YN). ExcitationVector::from_channel_index
+        // already implements exactly this YN lookup.
+        let yn = ExcitationVector::from_channel_index(ichan);
         let mut et = [0.0f64; FRAME_LEN];
         for k in 0..FRAME_LEN {
-            // Annex B: divide by 2^11 to obtain float; then multiply
-            // by σ(n) per block 31.
-            et[k] = sigma * (y_row[k] as f64 / 2_048.0);
+            // Block 31: ET(K) = GAIN · YN(K).
+            et[k] = sigma * yn.0[k];
         }
 
         // ----- Block 32: synthesis filter ---------------------------
@@ -799,6 +805,41 @@ mod tests {
             "GSTATE should have diverged from initial -32 dB after 20 vectors; got {:?}",
             gstate
         );
+    }
+
+    #[test]
+    fn decode_vector_applies_gain_codebook_level() {
+        // §5.14 block 29: YN(K) = GQ(IG)·Y(NN + K) — the gain-codebook
+        // level is part of the lookup, on top of which block 31
+        // multiplies the backward-adapted σ(n). On the very first
+        // vector (cold start: zero filter memory, all-pass predictor,
+        // σ(n) identical on both sides because it is predicted from
+        // the all-zero ET history), two channel indices sharing the
+        // same shape row but different gain levels must decode to
+        // outputs in exactly the GQ ratio.
+        let shape = 10u8;
+        let mut dec_a = Decoder::new();
+        let mut dec_b = Decoder::new();
+        let out_a = dec_a.decode_vector(decoder::pack_channel_index(shape, 0));
+        let out_b = dec_b.decode_vector(decoder::pack_channel_index(shape, 2));
+        let ratio = tables::GQ[2] / tables::GQ[0];
+        for k in 0..FRAME_LEN {
+            assert!(
+                (out_b[k] - ratio * out_a[k]).abs() <= 1e-9 * out_a[k].abs().max(1.0),
+                "sample {k}: {} vs {} (ratio {ratio})",
+                out_b[k],
+                out_a[k]
+            );
+        }
+        // And the negative half of the codebook flips the sign.
+        let mut dec_c = Decoder::new();
+        let out_c = dec_c.decode_vector(decoder::pack_channel_index(shape, 4));
+        for k in 0..FRAME_LEN {
+            assert!(
+                (out_c[k] + out_a[k]).abs() <= 1e-9 * out_a[k].abs().max(1.0),
+                "sign mirror sample {k}"
+            );
+        }
     }
 
     // ---------- AGC tail (r201, blocks 73-77) -----------------------

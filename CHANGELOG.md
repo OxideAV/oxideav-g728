@@ -6,6 +6,44 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Codebook search + memory update — encoder loop CLOSED (§3.9
+  blocks 12–18 + §3.10 / §5.13, r276)** — new `codebook_search`
+  module transcribes the §5.11 pseudo-code: block 12 (five-sample
+  impulse response of the cascade `F(z)·W(z)` from the zero-memory
+  `{1,0,0,0,0}` excitation), blocks 14 + 15 (per-cycle convolution
+  of all 128 shape codevectors with `h` and the filtered energy
+  table `E_j = ‖H·y_j‖²`, eq. 3-20; Table 2 initials `H = 1,0,0,0,0`
+  and `Y2 =` energy of `y_j`), block 16 (target normalisation
+  `x̂ = x/σ(n)`), block 13 (time-reversed convolution
+  `p(n) = Hᵀ·x̂(n)`, eq. 3-19), and blocks 17 + 18 (the §3.9.2
+  division-free gain decision tree over the `GB` cell boundaries
+  plus the eq. 3-23 distortion `D̂ = −b_i·P_j + c_i·E_j` minimum and
+  the `ICHAN = (IS−1)·NG + (IG−1)` concatenation).
+  `ZeroInputResponse::update_memory` adds the §5.13 filter-memory
+  update: zero-state responses of the chosen `e(n)` added onto the
+  post-ring memory, `STATELPC` clipped at the ±4095 MAX/MIN
+  envelope, `ZIRWFIR` re-anchored to the top `STATELPC` taps, and
+  `sq(n)` read out of the top five taps (block 22 omitted per
+  §3.10). `Encoder::encode_vector` now runs the full Figure 2
+  per-vector loop — block 20 → 4 → 9/10/11 → 12–18 → 19/21 → §5.13
+  → end-of-cycle adapter bookkeeping (same cadence as
+  `Decoder::decode_vector`) — and emits real 10-bit channel
+  indices.
+- **Public surface additions (r276)**: `CodebookSearch`,
+  `SearchResult`, the `codebook_search` module,
+  `ZeroInputResponse::update_memory`, `Encoder::codebook_search`,
+  `Encoder::quantized_speech`.
+- 21 new tests (r276), including: a brute-force cross-check of the
+  §3.9.2 decision tree against the raw eq. 3-16 MSE over all 1024
+  (gain, shape) pairs; exact-codevector recovery across both gain
+  halves; block-16 σ(n) invariance; the COR = 0 tie route of the
+  §5.11 pseudo-code; bit-for-bit equality of ring + `update_memory`
+  against the decoder's block-32 `Synthesizer` (output and all 50
+  memory taps, 32 vectors); a 200-vector encoder ↔ decoder
+  lockstep test (decoder output == encoder `sq(n)` bit for bit);
+  and a coding-error-energy ≪ signal-energy tracking property
+  after adapter convergence.
+
 - **Perceptual weighting filter adapter — upstream blocks 36 + 37
   (§3.3, r258)** — new `weighting_filter_adapter` module wires the
   hybrid window on input speech (block 36, Annex A.3 `wnrw`, 60-tap
@@ -404,6 +442,17 @@ All notable changes to this project will be documented in this file.
   update each cycle, finite-output stability over 64 vectors). Total
   crate tests: 81 → 96.
 
+### Fixed
+
+- **`Decoder::decode_vector` dropped the gain-codebook level (r276)**
+  — the block-29 lookup scaled the shape codevector by the backward-
+  adapted σ(n) only, omitting the `GQ(IG)` factor that §5.14
+  prescribes (`YN(K) = GQ(IG)·Y(NN + K)`); all eight gain levels in
+  the same shape row decoded identically. The lookup now routes
+  through `ExcitationVector::from_channel_index` (which implements
+  the spec's block 29 exactly) and a new test pins the `GQ` ratio
+  and the sign-mirrored negative half on cold-start vectors.
+
 ### Changed
 
 - `Decoder::decode_vector_postfiltered` semantics: previously a strict
@@ -459,7 +508,7 @@ All notable changes to this project will be documented in this file.
   synthesis adapter producing A() internally. The earlier
   `Decoder::decode_index` / `set_synthesis_predictor` hooks are
   preserved for the register-only path.
-- New tests: 12 added (hybrid-window dimensions / WNCF / zero
+- New tests (r195): 12 added (hybrid-window dimensions / WNCF / zero
   input, synthesis-adapter A(1)=1 invariant / zero-input
   ill-conditioning / nonzero-input convergence / decoder
   integration, gain-adapter Table 2 initial state / ICOUNT cycle /

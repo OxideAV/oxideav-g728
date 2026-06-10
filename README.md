@@ -2,7 +2,7 @@
 
 Pure-Rust ITU-T G.728 Low-Delay CELP (LD-CELP, 16 kbit/s) speech codec.
 
-## Status: clean-room rebuild — autonomous decoder + full §4.7 pitch postfilter (blocks 81/82/83/84) + long-term comb + short-term postfilter + AGC + typed encoder scaffold + §3.9 `E_j` shape-energy table + §3.3 full perceptual-weighting adapter (blocks 36 + 37 + 38) + §3.4 weighting filter applied to input speech (block 4) + §3.5/§3.6 zero-input response + VQ target (blocks 9 + 10 + 11) (round 267)
+## Status: clean-room rebuild — autonomous decoder + full §4.7 postfilter chain + **complete encoder loop**: §3.9 codebook search (blocks 12–18) + §3.10 memory update, `encode_vector` in bit-exact lockstep with `decode_vector` (round 276)
 
 The crate was reset to a register-only scaffold under the workspace
 clean-room policy (round 171, master `14e3bad`): the previous
@@ -11,7 +11,72 @@ C distribution, which the policy forbids regardless of the source's
 licence. The crate is being rebuilt one spec-cited unit at a time from
 the published ITU-T G.728 (1992-09) Recommendation prose alone.
 
-Round 267 lands the **zero-input response + VQ target vector** —
+Round 276 **closes the analysis-by-synthesis loop**: the §3.9
+codebook search (blocks 12 through 18 of Figure 2/G.728; pseudo-code
+§5.11) and the §3.10 filter-memory-update phase (pseudo-code §5.13)
+both land, so `Encoder::encode_vector` now runs the full per-vector
+encoder of Figure 2 and emits real 10-bit channel indices:
+
+- **`CodebookSearch` — blocks 12–18 (§3.9).** New `codebook_search`
+  module. Block 12 computes the five-sample impulse response `h(n)`
+  of the cascade `F(z)·W(z)` by exciting the zero-memory filters
+  with `{1,0,0,0,0}` (§3.9.2); blocks 14 + 15 convolve all 128 shape
+  codevectors with `h` and store the filtered energies
+  `E_j = ‖H·y_j‖²` (eq. 3-20); all three refresh once per adaptation
+  cycle. Per vector, block 16 normalises the VQ target
+  (`x̂ = x/σ(n)`, single reciprocal per the §5.11 pseudo-code),
+  block 13 runs the time-reversed convolution `p(n) = Hᵀ·x̂(n)`
+  (eq. 3-19), and blocks 17 + 18 walk the §3.9.2 division-free
+  decision tree — `P_j = pᵀ(n)·y_j` against the `d_i·E_j` quantizer
+  cell boundaries (approach c) of §3.9.1), distortion
+  `D̂ = −b_i·P_j + c_i·E_j` (eq. 3-23) — to emit
+  `ICHAN = (IS−1)·NG + (IG−1)`. Initial state per Table 2/G.728:
+  `H = 1,0,0,0,0`, `Y2 =` energy of `y_j` (the r235 `Y_ENERGY`
+  table). A per-test brute-forces all 1024 `(i, j)` pairs through
+  the raw eq. 3-16 MSE and confirms the decision tree picks the
+  same argmin; others pin exact-codevector recovery (positive and
+  negative gain halves), block-16 gain invariance, and the COR = 0
+  tie-routing of the pseudo-code.
+- **`ZeroInputResponse::update_memory` — §3.10 / §5.13.** The
+  complementary memory-update half that r267 deferred: the
+  zero-state responses of the chosen `e(n)` through the zero-memory
+  cascade are added onto the post-ring memory ("this in effect adds
+  the zero-input responses to the zero-state responses of the
+  filters 9 and 10"), `STATELPC` clips at the ±4095 §5.13 MAX/MIN
+  envelope, `ZIRWFIR` is re-anchored to the top `STATELPC` taps,
+  and the quantized speech `sq(n)` is read out of the top five taps
+  — the §5.12 block-22 synthesis filter is omitted exactly as §3.10
+  allows. A per-test proves ring + update reproduces the decoder's
+  block-32 `Synthesizer` **bit for bit**, memory tap for memory
+  tap, over a 32-vector stream.
+- **`Encoder::encode_vector` — the full Figure 2 loop.** Block 20
+  (σ(n) prediction) → block 4 (weighting) → blocks 9 + 10 + 11
+  (ZIR + target) → blocks 12–18 (search) → blocks 19 + 21
+  (excitation lookup + gain scaling, sharing the decoder's block-29
+  `ExcitationVector` path) → §5.13 memory update → end-of-cycle
+  adapter bookkeeping (blocks 23 + 36/37/38 + 12/14/15, on the same
+  end-of-cycle cadence `Decoder::decode_vector` uses for block 33
+  so the two synthesis predictors evolve in lockstep per §4.5).
+  New accessors: `Encoder::codebook_search()`,
+  `Encoder::quantized_speech()`.
+- **Encoder ↔ decoder lockstep, proven.** Blocks 19–23 form the
+  simulated decoder (block 8): "the quantized speech vector sq(n)
+  is actually the simulated decoded speech vector when there are no
+  channel errors" (§3.10). A per-test drives 200 speech-like
+  vectors (50 adaptation cycles) through `encode_vector` and a
+  fresh `Decoder::decode_vector` and asserts the decoder's output
+  equals the encoder's `sq(n)` **bit for bit**; a second per-test
+  pins the "coding-error energy ≪ signal energy" tracking property
+  after adapter convergence.
+- **Decoder block-29 fix.** `Decoder::decode_vector` was scaling
+  the shape codevector by σ(n) only, dropping the gain-codebook
+  level `GQ(IG)` that §5.14 block 29 includes in the lookup
+  (`YN(K) = GQ(IG)·Y(NN+K)`). Fixed to route through
+  `ExcitationVector::from_channel_index` (which implements exactly
+  that lookup); a new per-test pins the `GQ` ratio and the
+  sign-mirrored negative half on cold-start vectors.
+
+Round 267 landed the **zero-input response + VQ target vector** —
 blocks 9, 10 and 11 of Figure 2/G.728 (§3.5 / §3.6; pseudo-code
 §5.9 / §5.10) — the analysis-by-synthesis **search target** `x(n)`
 that the §3.9 codebook search of equations 3-14..3-23 minimises
@@ -42,14 +107,9 @@ against:
   block-38 weighting coefficients (`AWZ = q_gamma1`, `AWP =
   q_gamma2`), consuming the weighted speech vector `v(n)` from
   `apply_weighting_filter` (block 4) and emitting the target `x(n)`.
-- **The §3.10 memory-update phase is deliberately NOT in this round.**
-  Saving the post-ring memory, zeroing it, refiltering the chosen
-  excitation `e(n)` to add the zero-state response on top, and reading
-  `sq(n)` back out of the top five `STATELPC` taps all depend on the
-  §3.9 codebook-search output `e(n)` that is not yet wired up. This
-  module is the half of §3.5 that runs **before** the search and only
-  reads the current filter memory; the complementary memory-update
-  half runs **after** the search and lands in a later round.
+- **The §3.10 memory-update phase was deliberately NOT in r267** —
+  it depends on the §3.9 codebook-search output `e(n)`. Both landed
+  together in round 276 (see above).
 
 Round 258 lands the **upstream half of the perceptual weighting
 filter adapter** (blocks 36 + 37 of §3.3) — the missing link
@@ -81,11 +141,9 @@ calculator already in place:
   `ICOUNT = 3`) is still the caller's responsibility — the same
   way the synthesis-filter adapter's commit timing is the
   caller's responsibility for block 33.
-- **The encoder's analysis-by-synthesis search loop is still NOT
-  wired up.** Blocks 1..28 + 67..70 of §3.9 (the per-vector VQ
-  cost expression, impulse-response convolution, gain-quantiser
-  decision tree) remain to be lifted off the precomputed `E_j` /
-  `G2` / `GSQ` / `GB` table set already in `tables.rs`.
+- **The encoder's analysis-by-synthesis search loop** (deferred at
+  r258) landed in round 276 off the precomputed `E_j` / `G2` /
+  `GSQ` / `GB` table set already in `tables.rs`.
 
 Round 249 (preserved) lands the **block-4 application path** of
 the perceptual weighting filter (§3.4) — given the current input
@@ -415,33 +473,20 @@ order-parameterised Levinson-Durbin recursion, and the
 ## What is NOT yet wired up
 
 - A-law / µ-law PCM I/O — `oxideav-g711` handles this per §5.3 / §3.1.
-- The encoder pipeline (blocks 1..28 + 67..70 + the codebook search
-  of §3.9 / blocks 12..18). Round 235 lands the typed encoder front
-  end (`Encoder` / `make_encoder` / `Encoder::encode_vector`) so the
-  symbol is available now; round 248 adds block 38 (the perceptual-
-  weighting coefficient calculator) as a typed transform consumable
-  via `Encoder::set_weighting_filter_coeff_from_lpc`; round 249 wires
-  block 4 (the §3.4 application of the filter to input speech) as
-  `Encoder::apply_weighting_filter`; round 258 wires blocks 36 + 37
-  (the §3.3 hybrid window + Levinson on the input-speech buffer) as
-  `Encoder::adapt_weighting_filter` /
-  `commit_weighting_filter_coefficients`; round 267 wires blocks 9 +
-  10 + 11 (the §3.5 / §3.6 zero-input response + VQ target) as
-  `Encoder::compute_vq_target`. The remaining work — the §3.10
-  memory-update phase (adding the zero-state response of the chosen
-  excitation `e(n)` back onto the saved ring memory and reading
-  `sq(n)` out of the top `STATELPC` taps) and the full §3.9 codebook
-  search loop (impulse-response convolution, time-reversed
-  correlation, shape-codebook scan, gain-quantiser decision tree) —
-  still surface `Error::NotImplemented` from `encode_vector`. The
-  search and the memory update both depend on the chosen excitation
-  `e(n)` that §3.9 selects, so they land together in a later round.
-  The shared backward adapters (block 23 in the
-  encoder = block 33 in the decoder; block 20 in the encoder = block
-  30 in the decoder) are reused unchanged via the existing
-  `SynthesisAdapter` / `GainAdapter` types per §4.4 / §4.5.
+- The spec's exact ICOUNT = 2/3 intra-cycle adaptation stagger.
+  Both `encode_vector` and `decode_vector` currently re-run their
+  adapters at the **end** of each NUPDATE = 4-vector cycle (a
+  one-vector phase shift of the coefficient swap relative to the
+  spec's "third vector of the cycle" rule). The two ends share the
+  cadence, so encoder ↔ decoder lockstep is exact within this
+  crate; interop with a third-party G.728 endpoint needs the
+  ICOUNT-faithful stagger on both paths. Tracked as the next
+  encoder/decoder refinement.
+- §3.11 synchronization / in-band signalling (the every-N-vectors
+  6-bit half-codebook search) and byte-stream framing helpers
+  (`Error::InvalidInputLength` is reserved for them).
 - Annex G fixed-point variant and Annex I frame-loss concealment
-  remain deferred behind the floating-point decoder.
+  remain deferred behind the floating-point build.
 
 ## Clean-room provenance
 
@@ -462,11 +507,12 @@ of `γ_k^i`, (ii) a hand-traced `q_i = (−1/2)^i` term-by-term, and
 Every control-flow line in the `hybrid_window`, `synthesis_adapter`,
 `gain_adapter`, `long_term_postfilter`, `short_term_postfilter`,
 `pitch_inverse_filter`, `pitch_search`, `pitch_postfilter_coeff`,
-`agc`, `encoder`, `weighting_filter_coeff`, `weighting_filter` and
-`zero_input_response`
+`agc`, `encoder`, `weighting_filter_coeff`, `weighting_filter`,
+`zero_input_response` and `codebook_search`
 modules carries a
 comment pointing at the spec's §3.3 / §3.4 / §3.5 / §3.6 / §3.7 /
-§3.8 / §3.9 / §4.4 / §4.5 / §5.6 / §5.7 / §5.9 / §5.10 / §4.6 / §4.7
+§3.8 / §3.9 / §3.10 / §4.4 / §4.5 / §5.6 / §5.7 / §5.9 / §5.10 /
+§5.11 / §5.13 / §4.6 / §4.7
 pseudocode
 for blocks 36/43/49 (hybrid window), 50 (Levinson — already in
 `levinson.rs`), 51 / 45 (bandwidth expansion), 67/39/40/42/46/47/48
