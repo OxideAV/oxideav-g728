@@ -137,10 +137,12 @@ calculator already in place:
   "third vector of the cycle" coefficient swap by pushing the
   predictor through block 38 into the live block-4 filter. Per
   §3.4 spec rule the per-sample memory of block 4 is preserved
-  across the swap. The cycle-timing gate (commit only at
-  `ICOUNT = 3`) is still the caller's responsibility — the same
-  way the synthesis-filter adapter's commit timing is the
-  caller's responsibility for block 33.
+  across the swap. `commit_weighting_filter_coefficients` remains a
+  manual entry point for standalone callers; the autonomous
+  `encode_vector` loop now applies the §3.3 "third vector of the
+  cycle" gate itself (deferring the block-38 commit to `ICOUNT = 3`,
+  alongside the block-33 synthesis-filter swap — see the round-287
+  ICOUNT stagger section below).
 - **The encoder's analysis-by-synthesis search loop** (deferred at
   r258) landed in round 276 off the precomputed `E_j` / `G2` /
   `GSQ` / `GB` table set already in `tables.rs`.
@@ -470,18 +472,40 @@ lowpass coefficients, Table 1/G.728 parameter constants, the
 order-parameterised Levinson-Durbin recursion, and the
 `Decoder::decode_index` caller-driven entry point.
 
+## ICOUNT-faithful synthesis-filter stagger (round 287)
+
+Both `encode_vector` and `decode_vector` now apply the spec's exact
+**ICOUNT = 3 update stagger** for the backward synthesis filter
+(Table E-1/G.728 + block 51's `Wait until ICOUNT = 3, then A = ATMP`).
+Each carries a 1-based `sf_icount` walking `1 → 2 → 3 → 4 → 1` per
+vector and a `pending` / `active` predictor pair: the block-49/50/51
+adapter still runs at the cycle boundary (input speech through vector
+4), but its bandwidth-expanded predictor is **stashed** and only
+swapped into the live synthesis filter when `ICOUNT` reaches 3 — so
+during vectors 1 and 2 of each cycle the filter keeps the previous
+cycle's coefficients exactly as the block-50 note prescribes ("the
+old set … is still being used" until the third vector). The encoder
+applies the same deferred swap to its block-38 weighting coefficients
+and refreshes blocks 12 + 14 + 15 (impulse response + filtered-shape
+energy table) at `ICOUNT = 3` once `A`, `AWZ`, `AWP` are all ready.
+The backward vector gain adapter already updated its log-gain
+predictor at `ICOUNT = 2` internally (per Table E-1's "first use at
+vector 2"), so its cadence was already spec-faithful.
+
+New accessors `Decoder::active_predictor` / `sf_icount` and
+`Encoder::active_predictor` / `sf_icount` expose the staggered state.
+The 200-vector `encoder_decoder_lockstep_quantized_speech_is_bit_exact`
+test confirms the two ends still reconstruct identical `sq(n)` bit for
+bit, and the new
+`encoder_active_predictor_tracks_decoder_in_lockstep` test pins the
+active predictors equal vector-for-vector. The
+`*_swap_only_happens_at_third_vector` tests assert the active
+predictor changes **only** at `ICOUNT = 3` over an 80-vector
+non-stationary drive, with at least one genuine swap observed.
+
 ## What is NOT yet wired up
 
 - A-law / µ-law PCM I/O — `oxideav-g711` handles this per §5.3 / §3.1.
-- The spec's exact ICOUNT = 2/3 intra-cycle adaptation stagger.
-  Both `encode_vector` and `decode_vector` currently re-run their
-  adapters at the **end** of each NUPDATE = 4-vector cycle (a
-  one-vector phase shift of the coefficient swap relative to the
-  spec's "third vector of the cycle" rule). The two ends share the
-  cadence, so encoder ↔ decoder lockstep is exact within this
-  crate; interop with a third-party G.728 endpoint needs the
-  ICOUNT-faithful stagger on both paths. Tracked as the next
-  encoder/decoder refinement.
 - §3.11 synchronization / in-band signalling (the every-N-vectors
   6-bit half-codebook search) and byte-stream framing helpers
   (`Error::InvalidInputLength` is reserved for them).

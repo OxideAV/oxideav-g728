@@ -6,6 +6,35 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **ICOUNT = 3 synthesis-filter update stagger — spec-faithful on
+  both encode and decode paths (Table E-1/G.728 + block 51, r287)** —
+  `Decoder::decode_vector` and `Encoder::encode_vector` now carry a
+  1-based `sf_icount` cycle counter (`1 → 2 → 3 → 4 → 1` per vector)
+  and a `pending` / `active` synthesis-predictor pair. The backward
+  synthesis-filter adapter (blocks 49/50/51) still runs at the cycle
+  boundary on the previous cycle's quantised speech, but the
+  bandwidth-expanded predictor is stashed and only swapped into the
+  live filter when `ICOUNT` reaches 3 — the block-51 `Wait until
+  ICOUNT = 3, then A = ATMP` instruction, and the "first use at
+  decoding/encoding vector 3" row of Table E-1/G.728. Previously both
+  ends applied the freshly-adapted predictor on the very next vector
+  (vector 1), a two-vector phase error relative to the spec; that
+  error is now removed, so the crate interoperates with a third-party
+  G.728 endpoint that follows the normative cadence. The encoder
+  additionally defers its block-38 weighting-filter coefficient commit
+  and the block-12/14/15 impulse-response + filtered-shape-energy
+  refresh to the same `ICOUNT = 3` boundary (the spec runs blocks
+  12/14/15 at ICOUNT = 3 once `A`, `AWZ`, `AWP` are ready). The
+  backward vector gain adapter already updated its log-gain predictor
+  at `ICOUNT = 2` internally, matching Table E-1's "first use at
+  vector 2", so no change was needed there. New accessors
+  `Decoder::active_predictor` / `Decoder::sf_icount` and
+  `Encoder::active_predictor` / `Encoder::sf_icount` expose the
+  staggered state; five new tests pin the cadence (ICOUNT walk,
+  swap-only-at-ICOUNT-3 on both paths, and encoder↔decoder active-
+  predictor lockstep), while the pre-existing 200-vector bit-exact
+  `sq(n)` lockstep test confirms the two ends still reconstruct
+  identical quantised speech.
 - **Codebook search + memory update — encoder loop CLOSED (§3.9
   blocks 12–18 + §3.10 / §5.13, r276)** — new `codebook_search`
   module transcribes the §5.11 pseudo-code: block 12 (five-sample

@@ -27,16 +27,22 @@
 //!    onto the post-ring filter memory; the quantized speech `sq(n)`
 //!    falls out of the top `STATELPC` taps (block 22 omitted per
 //!    §3.10).
-//! 7. **Blocks 23 + 3 cycle bookkeeping** — `sq(n)` accumulates into
-//!    the synthesis adapter's NFRSZ buffer and `s(n)` into the
-//!    weighting adapter's; when a full adaptation cycle (NUPDATE = 4
-//!    vectors) is collected both adapters re-run, the new weighting
-//!    coefficients commit through block 38, and blocks 12 + 14 + 15
-//!    refresh the impulse response + energy table. This is the same
-//!    end-of-cycle simplification of the spec's ICOUNT = 2/3 stagger
-//!    that [`crate::Decoder::decode_vector`] documents for block 33 —
-//!    the encoder and decoder MUST share the cadence so their
-//!    synthesis predictors evolve in lockstep (§4.5).
+//! 7. **Blocks 23 + 3 cycle bookkeeping + ICOUNT = 3 stagger** —
+//!    `sq(n)` accumulates into the synthesis adapter's NFRSZ buffer
+//!    and `s(n)` into the weighting adapter's; when a full adaptation
+//!    cycle (NUPDATE = 4 vectors) is collected both adapters re-run
+//!    and their results are **stashed** (synthesis predictor +
+//!    block-38 weighting coefficients) rather than applied. Per
+//!    Table E-1/G.728 (and the block-51 `Wait until ICOUNT = 3, then
+//!    A = ATMP` instruction) the new synthesis predictor, weighting
+//!    coefficients, and impulse response + energy table (blocks
+//!    12 + 14 + 15) are **first used at encoding vector 3** of the
+//!    following cycle — so the swap is deferred to `ICOUNT = 3`. This
+//!    is the spec-faithful update stagger; [`crate::Decoder::
+//!    decode_vector`] applies the identical deferred swap for block
+//!    33, so the encoder and decoder synthesis predictors evolve in
+//!    exact lockstep (§4.5) — the precondition for interoperating with
+//!    a third-party G.728 endpoint.
 //!
 //! Because blocks 19–23 form the **simulated decoder** (block 8,
 //! §3.10), an [`Encoder`] driven by any input and a
@@ -49,7 +55,7 @@
 //! `E_j = ‖H·y_j‖²` table lives in [`CodebookSearch`].
 
 use crate::codebook_search::CodebookSearch;
-use crate::consts::{NCWD, NFRSZ};
+use crate::consts::{LPC, NCWD, NFRSZ, NUPDATE};
 use crate::decoder::{ExcitationVector, FRAME_LEN};
 use crate::gain_adapter::GainAdapter;
 use crate::levinson::LevinsonError;
@@ -139,6 +145,35 @@ pub struct Encoder {
     /// encoder/decoder lockstep tests and for callers that want the
     /// locally decoded signal without running a separate decoder.
     last_sq: [f64; FRAME_LEN],
+    /// **Spec ICOUNT for the per-cycle coefficient swap.** 1-based,
+    /// walks `1 → 2 → 3 → 4 → 1` once per [`Encoder::encode_vector`]
+    /// call. Per Table E-1/G.728 the backward synthesis filter (blocks
+    /// 23/49/50/51) AND the perceptual weighting filter / fast
+    /// codebook-search adapter (blocks 3/36/37/38 + 12/14/15) both
+    /// take their input through vector 2–4 of a cycle but are **first
+    /// used at encoding vector 3** of the following cycle. This counter
+    /// drives that deferred swap so the encoder's synthesis predictor
+    /// evolves in exact lockstep with the decoder's.
+    sf_icount: usize,
+    /// **Pending synthesis predictor** (bandwidth-expanded `ATMP`,
+    /// block 51) computed at a cycle boundary, awaiting the
+    /// `ICOUNT = 3` swap into [`Self::active_predictor`]. `None` until
+    /// the first full adaptation cycle has accumulated.
+    pending_synth: Option<[f64; LPC + 1]>,
+    /// **Active synthesis predictor** currently driving blocks 9/10/11
+    /// (ZIR target) and block 13 (§3.10 memory update). Only refreshed
+    /// from [`Self::pending_synth`] at `ICOUNT = 3`; during vectors 1
+    /// and 2 of each cycle the encoder keeps the previous cycle's
+    /// committed predictor (block-50 note: "the old set … is still
+    /// being used" until the third vector).
+    active_predictor: [f64; LPC + 1],
+    /// **Pending perceptual weighting coefficients** (block 38 output)
+    /// computed at a cycle boundary, awaiting the `ICOUNT = 3` commit.
+    /// `None` when the cycle's Levinson-Durbin (block 37) failed or no
+    /// cycle has completed — in which case the previous cycle's
+    /// weighting coefficients are kept (the §3.3 ill-conditioning
+    /// rule) and no commit happens.
+    pending_weighting: Option<WeightingFilterCoeff>,
 }
 
 impl Default for Encoder {
@@ -189,6 +224,19 @@ impl Encoder {
             stmp_buf: [0.0; NFRSZ],
             cycle_idx: 0,
             last_sq: [0.0; FRAME_LEN],
+            // Spec ICOUNT runs 1..4; start at NUPDATE so the first
+            // `encode_vector` call advances it to 1.
+            sf_icount: NUPDATE,
+            // No adaptation cycle has completed yet. The active
+            // synthesis predictor starts at the all-pass identity
+            // (`A(1) = 1`, rest 0) per Table 2/G.728.
+            pending_synth: None,
+            active_predictor: {
+                let mut a = [0.0f64; LPC + 1];
+                a[0] = 1.0;
+                a
+            },
+            pending_weighting: None,
         }
     }
 
@@ -213,6 +261,27 @@ impl Encoder {
     /// as [`Self::synthesis_adapter`].
     pub fn gain_adapter(&self) -> &GainAdapter {
         &self.gain_adapter
+    }
+
+    /// The **active synthesis predictor** currently driving blocks
+    /// 9/10/11 + 13 (the §3.7 / block-51 output, committed at the
+    /// third vector of each adaptation cycle per Table E-1/G.728). This
+    /// is the value the encoder's analysis-by-synthesis loop actually
+    /// uses; it lags [`Self::synthesis_adapter`]`().coefficients()` (the
+    /// most-recently computed predictor) by the ICOUNT = 3 swap delay.
+    /// The decoder's [`crate::Decoder::active_predictor`] follows the
+    /// identical stagger, so the two values coincide vector-for-vector
+    /// when both ends process the same quantised-speech stream.
+    pub fn active_predictor(&self) -> &[f64; LPC + 1] {
+        &self.active_predictor
+    }
+
+    /// The current 1-based synthesis-filter `ICOUNT` (walks
+    /// `1 → 2 → 3 → 4 → 1` once per [`Self::encode_vector`] call). The
+    /// block-51 / block-38 coefficient swap commits when this reaches
+    /// 3. Useful for tests and audit.
+    pub fn sf_icount(&self) -> usize {
+        self.sf_icount
     }
 
     /// Borrow the previous gain-scaled excitation `ET(1..IDIM)`. Block
@@ -386,16 +455,48 @@ impl Encoder {
     /// [`crate::Decoder::decode_vector`]: one input vector in, one
     /// channel index out.
     ///
-    /// See the module docs for the block-by-block dataflow. The
-    /// adapters re-run at the end of every NUPDATE = 4 vectors —
-    /// the same end-of-cycle simplification of the spec's
-    /// ICOUNT = 2/3 stagger that the decoder uses, so encoder and
-    /// decoder synthesis predictors evolve in lockstep (§4.5).
+    /// See the module docs for the block-by-block dataflow.
+    ///
+    /// **ICOUNT = 3 coefficient stagger (Table E-1/G.728).** The
+    /// backward synthesis filter (blocks 23/49/50/51) and the
+    /// perceptual-weighting / fast-codebook-search adapter (blocks
+    /// 3/36/37/38 + 12/14/15) both compute their new coefficients from
+    /// signal accumulated over a 4-vector cycle, but the spec defers
+    /// **first use of the updated coefficients to vector 3** of the
+    /// following cycle. The encoder therefore stashes the freshly-
+    /// computed predictor / weighting coefficients at the cycle
+    /// boundary and only swaps them into the live blocks when
+    /// `ICOUNT` reaches 3 — matching the decoder's identical
+    /// `decode_vector` stagger so the two ends stay in exact lockstep
+    /// (§4.5) and interoperate with a third-party G.728 endpoint.
     ///
     /// The `Result` shape is kept (per-vector encoding itself cannot
     /// fail) so byte-stream framing entry points can share the
     /// signature.
     pub fn encode_vector(&mut self, input: &[f64; FRAME_LEN]) -> Result<u16, Error> {
+        // ----- Spec ICOUNT advance + ICOUNT = 3 deferred swap --------
+        // Advance the cycle counter (1 → 2 → 3 → 4 → 1). At the third
+        // vector, commit the previous cycle's pending synthesis
+        // predictor (block 51 `Wait until ICOUNT = 3, then A = ATMP`),
+        // the pending weighting coefficients (block 38), and refresh
+        // the impulse response + filtered-shape energy table (blocks
+        // 12/14/15, which the spec also runs at ICOUNT = 3 once the new
+        // A, AWZ, AWP are ready).
+        self.sf_icount = (self.sf_icount % NUPDATE) + 1;
+        if self.sf_icount == 3 {
+            if let Some(pending) = self.pending_synth.take() {
+                self.active_predictor = pending;
+            }
+            if let Some(w_new) = self.pending_weighting.take() {
+                self.weighting_filter_coeff = w_new;
+                self.weighting_filter.set_coefficients(w_new);
+            }
+            // Blocks 12/14/15: refresh now that A (block 51) and AWZ /
+            // AWP (block 38) for this cycle are both committed.
+            self.codebook_search
+                .update_impulse_response(&self.active_predictor, &self.weighting_filter_coeff);
+        }
+
         // ----- Block 20: predict σ(n) from the previous ET -----------
         // Same call order as the decoder's block 30 (§4.5 lockstep).
         let gain = self.gain_adapter.predict_next(&self.et_prev);
@@ -404,14 +505,16 @@ impl Encoder {
         let v = self.weighting_filter.filter_vector(input);
 
         // ----- Blocks 9 + 10 + 11: ZIR ring + VQ target (§3.5/§3.6) --
-        let a = *self.synth_adapter.coefficients();
+        // Use the ICOUNT-staggered active synthesis predictor (block 51
+        // output committed at the third vector), NOT the adapter's
+        // most-recent result directly.
+        let a = self.active_predictor;
         let w = self.weighting_filter_coeff;
         let target = self.zir.compute_target(&a, &w, &v);
 
         // ----- Blocks 12–18: codebook search (§3.9) ------------------
         // Blocks 16 + 13 + 17 + 18 run per vector; the per-cycle
-        // blocks 12 + 14 + 15 are refreshed in the end-of-cycle
-        // bookkeeping below.
+        // blocks 12 + 14 + 15 are refreshed at ICOUNT = 3 above.
         let res = self.codebook_search.search(&target, gain);
 
         // ----- Blocks 19 + 21: excitation lookup + gain scaling ------
@@ -430,15 +533,17 @@ impl Encoder {
         let sq = self.zir.update_memory(&et, &a, &w);
         self.last_sq = sq;
 
-        // ----- Cycle bookkeeping: blocks 23 + 36/37/38 + 12/14/15 ----
+        // ----- Cycle bookkeeping: blocks 23 + 36/37/38 --------------
         // Accumulate one vector of quantized speech (block 23 input)
         // and one vector of input speech (block 36 input); on a full
-        // NFRSZ cycle re-run both adapters, commit the weighting
-        // coefficients through block 38, and refresh the impulse
-        // response + energy table (blocks 12 + 14 + 15). On Levinson
-        // failure each adapter keeps its previous cycle's output —
-        // the same §3.7 "keep the old coefficients" policy the
-        // decoder applies to block 33.
+        // NFRSZ cycle re-run both adapters and stash their outputs as
+        // `pending_*` for the deferred ICOUNT = 3 swap above. On
+        // Levinson failure each adapter keeps its previous cycle's
+        // output (the §3.7 "keep the old coefficients" policy): for the
+        // weighting filter that means leaving `pending_weighting` empty
+        // so the previous coefficients survive; for the synthesis
+        // adapter the cached `coefficients()` are unchanged so the same
+        // value is re-stashed harmlessly.
         for k in 0..FRAME_LEN {
             self.sttmp_buf[self.cycle_idx + k] = sq[k];
             self.stmp_buf[self.cycle_idx + k] = input[k];
@@ -447,13 +552,11 @@ impl Encoder {
         if self.cycle_idx >= NFRSZ {
             self.cycle_idx = 0;
             let _ = self.synth_adapter.adapt(&self.sttmp_buf);
+            self.pending_synth = Some(*self.synth_adapter.coefficients());
             if self.weighting_filter_adapter.adapt(&self.stmp_buf).is_ok() {
-                self.commit_weighting_filter_coefficients();
+                let q = *self.weighting_filter_adapter.predictor();
+                self.pending_weighting = Some(WeightingFilterCoeff::from_lpc(&q));
             }
-            self.codebook_search.update_impulse_response(
-                self.synth_adapter.coefficients(),
-                &self.weighting_filter_coeff,
-            );
         }
 
         // ----- Block 67 wrap-around: save ET for the next vector -----
@@ -1014,6 +1117,98 @@ mod tests {
         assert!(
             h[1..].iter().any(|&v| v != 0.0),
             "impulse response should have left the identity after a cycle refresh"
+        );
+    }
+
+    #[test]
+    fn encode_vector_sf_icount_walks_one_to_four() {
+        // Table E-1/G.728: the encoder's synthesis-filter ICOUNT walks
+        // 1 → 2 → 3 → 4 → 1 once per encoded vector, landing on 1 for
+        // the first call.
+        let mut enc = Encoder::new();
+        let want = [1usize, 2, 3, 4, 1, 2, 3, 4];
+        let s = [0.0f64; IDIM];
+        for &w in &want {
+            enc.encode_vector(&s).expect("encode");
+            assert_eq!(
+                enc.sf_icount(),
+                w,
+                "encoder ICOUNT must walk 1..4 cyclically"
+            );
+        }
+    }
+
+    #[test]
+    fn encoder_active_predictor_tracks_decoder_in_lockstep() {
+        // The ICOUNT = 3 swap stagger (Table E-1/G.728) must keep the
+        // encoder's *active* synthesis predictor — the one its
+        // analysis-by-synthesis loop actually uses — bit-for-bit equal
+        // to the decoder's active predictor at every vector, since both
+        // ends run the identical block-49/50/51 adapter on the identical
+        // quantised-speech stream and apply the identical deferred swap.
+        // This is the property that makes the synthesis filters evolve
+        // in lockstep; if the two staggers disagreed, the encoder's
+        // codebook search would target a different filter than the
+        // decoder reconstructs with.
+        let mut enc = Encoder::new();
+        let mut dec = crate::Decoder::new();
+        for vec_idx in 0..120usize {
+            let mut s = [0.0f64; IDIM];
+            for k in 0..IDIM {
+                s[k] = speech_like_sample(vec_idx * IDIM + k);
+            }
+            let ichan = enc.encode_vector(&s).expect("encode");
+            dec.decode_vector(ichan);
+            assert_eq!(
+                enc.sf_icount(),
+                dec.sf_icount(),
+                "vec {vec_idx}: encoder/decoder ICOUNT must agree"
+            );
+            assert_eq!(
+                enc.active_predictor(),
+                dec.active_predictor(),
+                "vec {vec_idx}: encoder/decoder active synthesis predictor must agree"
+            );
+        }
+    }
+
+    #[test]
+    fn encoder_synthesis_predictor_swap_only_happens_at_third_vector() {
+        // Mirror of the decoder's stagger test: the encoder's active
+        // synthesis predictor may change ONLY at ICOUNT = 3 (block 51 /
+        // Table E-1/G.728). Drive a non-stationary speech-like signal
+        // for many cycles and assert the active predictor is constant
+        // across every non-ICOUNT-3 vector boundary, with at least one
+        // genuine swap observed at an ICOUNT = 3 boundary.
+        let mut enc = Encoder::new();
+        let mut prev = *enc.active_predictor();
+        assert_eq!(prev[0], 1.0);
+        let mut observed_a_swap = false;
+        for vec_idx in 0..80usize {
+            let mut s = [0.0f64; IDIM];
+            for k in 0..IDIM {
+                s[k] = speech_like_sample(vec_idx * IDIM + k);
+            }
+            enc.encode_vector(&s).expect("encode");
+            let now = *enc.active_predictor();
+            if enc.sf_icount() == 3 {
+                if now != prev {
+                    observed_a_swap = true;
+                }
+            } else {
+                assert_eq!(
+                    now,
+                    prev,
+                    "vec {vec_idx} (ICOUNT {}): active predictor changed outside ICOUNT = 3",
+                    enc.sf_icount()
+                );
+            }
+            assert_eq!(now[0], 1.0, "A(1) = 1 invariant must hold every vector");
+            prev = now;
+        }
+        assert!(
+            observed_a_swap,
+            "expected at least one genuine ICOUNT = 3 predictor swap over 80 vectors"
         );
     }
 

@@ -361,6 +361,28 @@ pub struct Decoder {
     /// refresh at the first vector of each cycle (icount == 0 here,
     /// mapping to spec ICOUNT = 1).
     icount: usize,
+    /// **Spec ICOUNT for the synthesis-filter swap.** 1-based, walks
+    /// `1 → 2 → 3 → 4 → 1` once per [`Decoder::decode_vector`] call.
+    /// Per Table E-1/G.728 the backward synthesis-filter adapter takes
+    /// its input speech through vector 4 of a cycle but its updated
+    /// coefficients are **first used at decoding vector 3** of the
+    /// following cycle (blocks 49/50/51 → the block-51 `Wait until
+    /// ICOUNT = 3, then A = ATMP` swap). This counter drives that
+    /// deferred swap.
+    sf_icount: usize,
+    /// **Pending synthesis predictor** computed by the block-49/50/51
+    /// adapter at a cycle boundary, awaiting the block-51 `ICOUNT = 3`
+    /// swap into [`Self::active_predictor`]. `None` until the first
+    /// full adaptation cycle has been accumulated. Holds the
+    /// bandwidth-expanded `ATMP` array (spec `A` layout).
+    pending_synth: Option<[f64; consts::LPC + 1]>,
+    /// **Active synthesis predictor** currently driving block 32. Only
+    /// refreshed from [`Self::pending_synth`] at `ICOUNT = 3`, so during
+    /// vectors 1 and 2 of each cycle the filter keeps using the
+    /// previous cycle's committed coefficients exactly as the spec's
+    /// block-50 note prescribes ("the old set of synthesis filter
+    /// coefficients … is still being used" until the third vector).
+    active_predictor: [f64; consts::LPC + 1],
 }
 
 impl Default for Decoder {
@@ -389,6 +411,20 @@ impl Decoder {
             sttmp_buf: [0.0; consts::NFRSZ],
             sttmp_idx: 0,
             icount: 0,
+            // Spec ICOUNT runs 1..4; start at 4 so the first
+            // `decode_vector` call advances it to 1 (the first vector
+            // of the first adaptation cycle).
+            sf_icount: consts::NUPDATE,
+            // No adaptation cycle has completed yet, so there is no
+            // pending predictor to swap. The active predictor starts
+            // at the all-pass identity (`A(1) = 1`, rest 0) per
+            // Table 2/G.728.
+            pending_synth: None,
+            active_predictor: {
+                let mut a = [0.0f64; consts::LPC + 1];
+                a[0] = 1.0;
+                a
+            },
         }
     }
 
@@ -432,6 +468,23 @@ impl Decoder {
     ///    NFRSZ = 20 samples is accumulated, run the synthesis
     ///    adapter to produce the next cycle's predictor.
     pub fn decode_vector(&mut self, ichan: u16) -> [f64; FRAME_LEN] {
+        // ----- Spec ICOUNT advance + block-51 deferred swap ----------
+        // Advance the synthesis-filter ICOUNT (1 → 2 → 3 → 4 → 1).
+        // The backward synthesis-filter adapter (blocks 49/50/51)
+        // takes the quantised speech through vector 4 of a cycle, but
+        // per Table E-1/G.728 (and the block-51 `Wait until ICOUNT = 3,
+        // then A = ATMP` instruction) its coefficients are not first
+        // used until **decoding vector 3** of the following cycle. We
+        // therefore hold the freshly-computed predictor in
+        // `pending_synth` and swap it into the active predictor only
+        // when ICOUNT reaches 3.
+        self.sf_icount = (self.sf_icount % consts::NUPDATE) + 1;
+        if self.sf_icount == 3 {
+            if let Some(pending) = self.pending_synth.take() {
+                self.active_predictor = pending;
+            }
+        }
+
         // ----- Block 30: predict σ(n) from previous ET ---------------
         let sigma = self.gain_adapter.predict_next(&self.et_prev);
 
@@ -449,22 +502,26 @@ impl Decoder {
         }
 
         // ----- Block 32: synthesis filter ---------------------------
-        // Use the most recently produced predictor from block 33.
-        self.synth.set_predictor(*self.synth_adapter.coefficients());
+        // Use the ICOUNT-staggered active predictor (block 51 output
+        // committed at the third vector of each cycle), NOT the
+        // adapter's most-recent result directly.
+        self.synth.set_predictor(self.active_predictor);
         let exc = ExcitationVector(et);
         let out = self.synth.filter_vector(&exc);
 
         // ----- Block 33 preparation: accumulate quantised speech ----
         // STTMP for the next call is the rolling buffer of decoded
         // speech vectors. We push the current output and, once a full
-        // NFRSZ-sample cycle is accumulated, run the synthesis
-        // adapter to produce a refreshed predictor for the next cycle.
+        // NFRSZ-sample cycle is accumulated, run the synthesis adapter
+        // (blocks 49/50/51) to produce the next cycle's predictor and
+        // stash it as `pending_synth` for the deferred ICOUNT = 3 swap.
         for k in 0..FRAME_LEN {
             self.sttmp_buf[self.sttmp_idx] = out[k];
             self.sttmp_idx += 1;
         }
         if self.sttmp_idx >= consts::NFRSZ {
             let _ = self.synth_adapter.adapt(&self.sttmp_buf);
+            self.pending_synth = Some(*self.synth_adapter.coefficients());
             self.sttmp_idx = 0;
         }
 
@@ -669,6 +726,27 @@ impl Decoder {
     /// Borrow the gain adapter (useful for tests and audit).
     pub fn gain_adapter(&self) -> &GainAdapter {
         &self.gain_adapter
+    }
+
+    /// The **active synthesis predictor** currently driving block 32
+    /// (the §3.7 / block-51 output, committed at the third vector of
+    /// each adaptation cycle). During vectors 1 and 2 of a cycle this
+    /// is the previous cycle's committed predictor; it advances to the
+    /// most recently adapted predictor only at `ICOUNT = 3`. Useful for
+    /// tests and audit of the Table E-1/G.728 update stagger. Compare
+    /// with [`Self::synthesis_adapter`]`().coefficients()`, which is
+    /// the *most recently computed* predictor regardless of swap
+    /// timing.
+    pub fn active_predictor(&self) -> &[f64; consts::LPC + 1] {
+        &self.active_predictor
+    }
+
+    /// The current 1-based synthesis-filter `ICOUNT` (walks
+    /// `1 → 2 → 3 → 4 → 1` once per [`Self::decode_vector`] call). The
+    /// block-51 coefficient swap commits when this reaches 3. Useful
+    /// for tests and audit.
+    pub fn sf_icount(&self) -> usize {
+        self.sf_icount
     }
 }
 
@@ -1391,5 +1469,66 @@ mod tests {
         }
         let a = dec.synthesis_adapter().coefficients();
         assert_eq!(a[0], 1.0, "block-33 must preserve A(1) = 1");
+    }
+
+    #[test]
+    fn decode_vector_sf_icount_walks_one_to_four() {
+        // Table E-1/G.728: the synthesis-filter ICOUNT indexes the
+        // vector within the adaptation cycle and walks 1 → 2 → 3 → 4 →
+        // 1. The first `decode_vector` call must land on 1.
+        let mut dec = Decoder::new();
+        let want = [1usize, 2, 3, 4, 1, 2, 3, 4];
+        for &w in &want {
+            dec.decode_vector(0);
+            assert_eq!(dec.sf_icount(), w, "ICOUNT must walk 1..4 cyclically");
+        }
+    }
+
+    #[test]
+    fn synthesis_predictor_swap_only_happens_at_third_vector() {
+        // Per Table E-1/G.728 + block 51 (`Wait until ICOUNT = 3, then
+        // A = ATMP`): the active synthesis predictor may change ONLY at
+        // ICOUNT = 3 of an adaptation cycle, never at ICOUNT 1, 2 or 4.
+        // This is the defining stagger property; it holds regardless of
+        // whether any individual cycle's Levinson converged. We drive a
+        // non-stationary excitation for many cycles (well past cold-
+        // start warm-up so genuine coefficient swaps do occur) and
+        // assert the active predictor is constant across every
+        // non-ICOUNT-3 vector boundary.
+        let mut dec = Decoder::new();
+        let stim = |i: u16| ((i.wrapping_mul(53)).wrapping_add(11)) & 0x03FF;
+
+        let mut prev = *dec.active_predictor();
+        let mut observed_a_swap = false;
+        for i in 0..80u16 {
+            dec.decode_vector(stim(i));
+            let now = *dec.active_predictor();
+            if dec.sf_icount() == 3 {
+                if now != prev {
+                    observed_a_swap = true;
+                }
+                // At ICOUNT = 3 the active predictor must equal the
+                // adapter's currently-cached block-51 output (the
+                // pending value committed at this boundary).
+                assert_eq!(
+                    now,
+                    *dec.synthesis_adapter().coefficients(),
+                    "vec {i}: ICOUNT = 3 must commit the adapter's latest predictor"
+                );
+            } else {
+                assert_eq!(
+                    now,
+                    prev,
+                    "vec {i} (ICOUNT {}): active predictor changed outside ICOUNT = 3",
+                    dec.sf_icount()
+                );
+            }
+            assert_eq!(now[0], 1.0, "A(1) = 1 invariant must hold every vector");
+            prev = now;
+        }
+        assert!(
+            observed_a_swap,
+            "expected at least one genuine ICOUNT = 3 predictor swap over 80 vectors"
+        );
     }
 }
