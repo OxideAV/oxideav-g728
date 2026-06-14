@@ -227,7 +227,9 @@ pub mod zero_input_response;
 
 pub use agc::Agc;
 pub use codebook_search::{CodebookSearch, SearchResult};
-pub use decoder::{pack_channel_index, ExcitationVector, Synthesizer, DEFAULT_MAX, FRAME_LEN};
+pub use decoder::{
+    extract_sync_bit, pack_channel_index, ExcitationVector, Synthesizer, DEFAULT_MAX, FRAME_LEN,
+};
 pub use encoder::{make_encoder, Encoder, CHANNEL_INDEX_BITS};
 pub use gain_adapter::GainAdapter;
 pub use hybrid_window::{HybridWindow, HybridWindowState};

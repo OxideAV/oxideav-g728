@@ -6,6 +6,31 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **§3.11 synchronization / in-band-signalling bit robbing (r297)** —
+  the encoder can now rob the leftmost codeword bit of a chosen vector
+  to carry a synchronization or in-band-signalling bit, the in-stream
+  side-channel of §3.11. `CodebookSearch::search_with_sync_bit(target,
+  gain, bit)` restricts the §3.9 shape scan to one half of the codebook
+  — shape indices `0..=63` for a `0`, `64..=127` for a `1` — so the
+  emitted index's most-significant shape bit (which, because the seven
+  shape bits precede the three sign-and-gain bits, is the leftmost bit
+  of the whole codeword) equals the desired bit. `Encoder::
+  encode_vector_with_sync_bit(input, sync_bit)` runs the full
+  per-vector analysis-by-synthesis loop with that half-codebook search;
+  the new crate-root `extract_sync_bit(ichan)` helper recovers the bit
+  on the decoder side (bit 9 of the channel index). Because the robbed
+  vector runs the identical backward-adaptation dataflow (only the
+  shape range narrows) and the half-codebook codevector is a perfectly
+  valid 10-bit index, the encoder and decoder stay in bit-exact
+  lockstep on a robbed stream — both ends must agree out of band on the
+  every-`N`-th robbing schedule (§3.11 recommends `N` a multiple of 4,
+  e.g. `N = 16` ≈ 100 bit/s, robbed from the last vector of a cycle).
+  Four new per-tests: the half-codebook search confines the shape index
+  to the requested half + sets the top codeword bit; it still finds the
+  half-restricted brute-force eq. 3-16 minimum; the sync bit round-trips
+  through encode + `extract_sync_bit` on an `N = 16` schedule; and the
+  encoder ↔ decoder `sq(n)` lockstep is preserved bit for bit across a
+  robbed stream.
 - **ICOUNT = 3 synthesis-filter update stagger — spec-faithful on
   both encode and decode paths (Table E-1/G.728 + block 51, r287)** —
   `Decoder::decode_vector` and `Encoder::encode_vector` now carry a

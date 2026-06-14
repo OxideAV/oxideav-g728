@@ -474,6 +474,41 @@ impl Encoder {
     /// fail) so byte-stream framing entry points can share the
     /// signature.
     pub fn encode_vector(&mut self, input: &[f64; FRAME_LEN]) -> Result<u16, Error> {
+        self.encode_vector_inner(input, None)
+    }
+
+    /// §3.11 in-band-signalling encode: encode one vector while robbing
+    /// the leftmost codeword bit to carry the synchronization /
+    /// signalling bit `sync_bit`.
+    ///
+    /// Identical to [`Self::encode_vector`] except that the §3.9
+    /// codebook search is restricted to **one half** of the shape
+    /// codebook (blocks 17 + 18 over shape `0..=63` for a `0`,
+    /// `64..=127` for a `1`) so the emitted index's top shape bit equals
+    /// `sync_bit` (§3.11). The full per-vector backward-adaptation
+    /// dataflow — predictor σ(n), weighting, ZIR target, gain search,
+    /// excitation lookup, §3.10 memory update, adapter bookkeeping — is
+    /// unchanged, so the encoder and decoder stay in lockstep on the
+    /// robbed vector exactly as for an un-robbed one. The decoder
+    /// recovers the bit with [`crate::extract_sync_bit`].
+    ///
+    /// §3.11 recommends robbing once every `N` vectors with `N` a
+    /// multiple of 4 (e.g. `N = 16`, ≈ 100 bit/s) and robbing from the
+    /// **last** vector of an adaptation cycle; scheduling which vectors
+    /// are robbed is the caller's responsibility (both ends must agree).
+    pub fn encode_vector_with_sync_bit(
+        &mut self,
+        input: &[f64; FRAME_LEN],
+        sync_bit: bool,
+    ) -> Result<u16, Error> {
+        self.encode_vector_inner(input, Some(sync_bit))
+    }
+
+    fn encode_vector_inner(
+        &mut self,
+        input: &[f64; FRAME_LEN],
+        sync_bit: Option<bool>,
+    ) -> Result<u16, Error> {
         // ----- Spec ICOUNT advance + ICOUNT = 3 deferred swap --------
         // Advance the cycle counter (1 → 2 → 3 → 4 → 1). At the third
         // vector, commit the previous cycle's pending synthesis
@@ -514,8 +549,16 @@ impl Encoder {
 
         // ----- Blocks 12–18: codebook search (§3.9) ------------------
         // Blocks 16 + 13 + 17 + 18 run per vector; the per-cycle
-        // blocks 12 + 14 + 15 are refreshed at ICOUNT = 3 above.
-        let res = self.codebook_search.search(&target, gain);
+        // blocks 12 + 14 + 15 are refreshed at ICOUNT = 3 above. On a
+        // §3.11-robbed vector the shape scan is restricted to one half
+        // of the codebook so the leftmost codeword bit carries the
+        // signalling bit.
+        let res = match sync_bit {
+            Some(bit) => self
+                .codebook_search
+                .search_with_sync_bit(&target, gain, bit),
+            None => self.codebook_search.search(&target, gain),
+        };
 
         // ----- Blocks 19 + 21: excitation lookup + gain scaling ------
         // §5.12: YN = GQ(IG)·Y(IS row), ET = GAIN·YN. The decoder-side
@@ -1050,6 +1093,73 @@ mod tests {
                     "vec {vec_idx} sample {k}: encoder sq {} vs decoder {}",
                     enc.quantized_speech()[k],
                     out[k]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sync_bit_round_trips_through_encode_and_extract() {
+        // §3.11: encode every 16th vector (last of a cycle) with an
+        // alternating sync bit; the decoder-side extractor must recover
+        // exactly the bit that was robbed. Unrobbed vectors decode
+        // normally; robbed vectors carry the bit in the leftmost
+        // codeword bit (shape MSB).
+        let mut enc = Encoder::new();
+        let mut bit = false;
+        for vec_idx in 0..160usize {
+            let mut s = [0.0f64; IDIM];
+            for k in 0..IDIM {
+                s[k] = speech_like_sample(vec_idx * IDIM + k);
+            }
+            // Rob the last vector of every 4th adaptation cycle (N = 16).
+            let robbed = (vec_idx + 1) % 16 == 0;
+            let ichan = if robbed {
+                enc.encode_vector_with_sync_bit(&s, bit).expect("encode")
+            } else {
+                enc.encode_vector(&s).expect("encode")
+            };
+            if robbed {
+                assert_eq!(
+                    crate::extract_sync_bit(ichan),
+                    bit,
+                    "vec {vec_idx}: robbed sync bit not recovered"
+                );
+                bit = !bit;
+            }
+        }
+    }
+
+    #[test]
+    fn sync_bit_robbing_preserves_encoder_decoder_lockstep() {
+        // §3.11: because both ends know which vectors are robbed and the
+        // robbed vector runs the identical backward-adaptation dataflow
+        // (only the shape scan narrows), a Decoder fed the robbed
+        // indices must STILL reproduce the encoder's sq(n) bit for bit —
+        // the half-codebook codevector is a perfectly valid 10-bit index
+        // that decodes the same way at both ends.
+        let mut enc = Encoder::new();
+        let mut dec = crate::Decoder::new();
+        let mut bit = true;
+        for vec_idx in 0..160usize {
+            let mut s = [0.0f64; IDIM];
+            for k in 0..IDIM {
+                s[k] = speech_like_sample(vec_idx * IDIM + k);
+            }
+            let robbed = (vec_idx + 1) % 16 == 0;
+            let ichan = if robbed {
+                let c = enc.encode_vector_with_sync_bit(&s, bit).expect("encode");
+                bit = !bit;
+                c
+            } else {
+                enc.encode_vector(&s).expect("encode")
+            };
+            let out = dec.decode_vector(ichan);
+            for k in 0..IDIM {
+                assert_eq!(
+                    enc.quantized_speech()[k],
+                    out[k],
+                    "vec {vec_idx} sample {k}: lockstep broke on robbed stream"
                 );
             }
         }

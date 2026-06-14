@@ -112,6 +112,29 @@ pub fn pack_channel_index(shape: u8, gain: u8) -> u16 {
     shape * NG as u16 + gain
 }
 
+/// Recover the §3.11 in-band-signalling / synchronization bit carried
+/// by a "robbed" 10-bit channel index.
+///
+/// Per §3.11 the synchronization bit is robbed from the **leftmost bit
+/// of the codeword**, which — because the seven shape bits precede the
+/// three sign-and-gain bits — is bit 9 of `ICHAN`, i.e. the
+/// most-significant bit of the 7-bit shape index. The encoder produces
+/// it by searching only one half of the shape codebook: the first half
+/// (shape `0..=63`) for a `0`, the second half (shape `64..=127`) for a
+/// `1`. So the recovered bit is simply whether the shape index is
+/// `≥ 64` (equivalently, bit 9 of `ICHAN`).
+///
+/// The decoder must know *which* vectors were robbed (the every-`N`-th
+/// schedule agreed out of band); this helper only extracts the bit once
+/// the caller has identified a robbed vector. The remaining 9 bits
+/// still decode to a valid excitation codevector exactly as for an
+/// un-robbed vector — no separate decode path is needed (§3.11).
+pub fn extract_sync_bit(ichan: u16) -> bool {
+    // Bit 9 of the 10-bit channel index == MSB of the 7-bit shape
+    // index (shape occupies bits 9..3, gain bits 2..0).
+    (ichan & 0x0200) != 0
+}
+
 /// 50th-order all-pole synthesis filter, decoder side.
 ///
 /// State carried across vectors:

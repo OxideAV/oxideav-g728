@@ -2,7 +2,7 @@
 
 Pure-Rust ITU-T G.728 Low-Delay CELP (LD-CELP, 16 kbit/s) speech codec.
 
-## Status: clean-room rebuild — autonomous decoder + full §4.7 postfilter chain + **complete encoder loop**: §3.9 codebook search (blocks 12–18) + §3.10 memory update, `encode_vector` in bit-exact lockstep with `decode_vector` (round 276)
+## Status: clean-room rebuild — autonomous decoder + full §4.7 postfilter chain + **complete encoder loop**: §3.9 codebook search (blocks 12–18) + §3.10 memory update, `encode_vector` in bit-exact lockstep with `decode_vector` (round 276) + §3.11 in-band-signalling bit robbing (round 297)
 
 The crate was reset to a register-only scaffold under the workspace
 clean-room policy (round 171, master `14e3bad`): the previous
@@ -472,6 +472,49 @@ lowpass coefficients, Table 1/G.728 parameter constants, the
 order-parameterised Levinson-Durbin recursion, and the
 `Decoder::decode_index` caller-driven entry point.
 
+## §3.11 in-band signalling / synchronization bit robbing (round 297)
+
+The encoder can now rob the **leftmost codeword bit** of a chosen
+vector to carry a synchronization or in-band-signalling bit, the
+in-stream side-channel described in §3.11 of the Recommendation. The
+spec robs one bit out of every `N`-th transmitted codebook index by
+searching only **half** the shape codebook for those vectors:
+
+- **`CodebookSearch::search_with_sync_bit(target, gain, bit)`.** Runs
+  the identical blocks 16 + 13 + 17 + 18 decision tree but restricts
+  the shape scan to one half of the codebook — shape indices `0..=63`
+  for a `0`, `64..=127` for a `1` (§3.11's recommended convention). The
+  factored-out `search_range` core is shared with the full
+  [`CodebookSearch::search`]; only the shape scan range narrows, so the
+  gain decision tree and all the precomputed `E_j` / `G2` / `GSQ` / `GB`
+  machinery are reused unchanged. Because the seven shape bits precede
+  the three sign-and-gain bits, the most-significant shape bit is the
+  leftmost bit of the whole codeword — exactly the property in-band
+  signalling needs.
+- **`Encoder::encode_vector_with_sync_bit(input, sync_bit)`.** Runs the
+  full per-vector analysis-by-synthesis loop (the same dataflow as
+  [`Encoder::encode_vector`]) with the half-codebook search on the
+  robbed vector. The backward-adaptation dataflow — σ(n) prediction,
+  weighting, ZIR target, gain search, excitation lookup, §3.10 memory
+  update, end-of-cycle adapter bookkeeping — is unchanged, so the robbed
+  vector stays in lockstep at both ends.
+- **`extract_sync_bit(ichan)` (crate root).** Recovers the robbed bit on
+  the decoder side — bit 9 of the channel index, i.e. whether the shape
+  index is ≥ 64. The remaining nine bits still decode to a valid
+  excitation codevector with no separate decode path (§3.11).
+
+Both ends must agree out of band on which vectors are robbed (§3.11:
+"the encoder has to know which speech vectors will be robbed … Otherwise
+the decoder will not have the same decoded excitation codevectors"); the
+recommendation suggests `N` a multiple of 4 (e.g. `N = 16` ≈ 100 bit/s),
+robbed from the last vector of an adaptation cycle. Four per-tests pin
+the behaviour: the half-codebook search confines the shape index to the
+requested half and sets the top codeword bit; it still finds the
+half-restricted brute-force eq. 3-16 minimum; the sync bit round-trips
+through encode + `extract_sync_bit` on an `N = 16` schedule; and the
+encoder ↔ decoder `sq(n)` lockstep is preserved **bit for bit** across a
+robbed stream.
+
 ## ICOUNT-faithful synthesis-filter stagger (round 287)
 
 Both `encode_vector` and `decode_vector` now apply the spec's exact
@@ -506,9 +549,10 @@ non-stationary drive, with at least one genuine swap observed.
 ## What is NOT yet wired up
 
 - A-law / µ-law PCM I/O — `oxideav-g711` handles this per §5.3 / §3.1.
-- §3.11 synchronization / in-band signalling (the every-N-vectors
-  6-bit half-codebook search) and byte-stream framing helpers
-  (`Error::InvalidInputLength` is reserved for them).
+- Byte-stream framing helpers (`Error::InvalidInputLength` is reserved
+  for them). The §3.11 in-band-signalling **bit-robbing** itself landed
+  in round 297 (see above); what remains is the optional bit-level
+  packing/unpacking of a contiguous 10-bit-per-vector byte stream.
 - Annex G fixed-point variant and Annex I frame-loss concealment
   remain deferred behind the floating-point build.
 

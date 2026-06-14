@@ -240,6 +240,57 @@ impl CodebookSearch {
     /// block-47 clamp to `[0, 60]` dB), so the block-16 reciprocal is
     /// always well-defined.
     pub fn search(&self, target: &[f64; IDIM], gain: f64) -> SearchResult {
+        // Full codebook: shape indices 1..=NCWD (spec 1-based).
+        self.search_range(target, gain, 1, NCWD)
+    }
+
+    /// §3.11 in-band-signalling half-codebook search (bit robbing).
+    ///
+    /// For an every-`N`-th "robbed" vector the encoder must search
+    /// through **only half** of the shape codebook so that the leftmost
+    /// (most-significant) bit of the 7-bit shape index is free to carry
+    /// a synchronization / in-band-signalling bit (§3.11). Per the
+    /// recommendation's convention:
+    ///
+    /// * desired bit `0` ⇒ search the **first** half (shape indices
+    ///   `0..=63`), so the emitted index lies in `0..=63`;
+    /// * desired bit `1` ⇒ search the **second** half (shape indices
+    ///   `64..=127`), so the emitted index lies in `64..=127`.
+    ///
+    /// Because the seven shape bits precede the three sign-and-gain
+    /// bits, that leftmost shape bit is the leftmost bit of the whole
+    /// codeword (§3.11), which is the property in-band signalling needs.
+    /// Both the encoder (here) and the decoder
+    /// ([`crate::extract_sync_bit`]) must know which vectors are robbed,
+    /// otherwise the two ends decode different excitation codevectors
+    /// for those vectors (§3.11 "the encoder has to know which speech
+    /// vectors will be robbed … Otherwise, the decoder will not have the
+    /// same decoded excitation codevectors").
+    ///
+    /// The gain search is unaffected — the same blocks 17 + 18 decision
+    /// tree runs; only the shape scan range narrows. The returned
+    /// `channel_index` is therefore directly transmittable: its top
+    /// shape bit equals `bit`.
+    pub fn search_with_sync_bit(&self, target: &[f64; IDIM], gain: f64, bit: bool) -> SearchResult {
+        // Spec 1-based shape range: first half = IS 1..=64 (0-based
+        // 0..=63), second half = IS 65..=128 (0-based 64..=127). NCWD =
+        // 128, so the split is at NCWD / 2 = 64.
+        let half = NCWD / 2;
+        let (start, end) = if bit { (half + 1, NCWD) } else { (1, half) };
+        self.search_range(target, gain, start, end)
+    }
+
+    /// Core blocks 16 + 13 + 17 + 18 search over a 1-based shape index
+    /// range `[start, end]` (inclusive). The full-codebook
+    /// [`Self::search`] passes `1..=NCWD`; the §3.11 half-codebook
+    /// [`Self::search_with_sync_bit`] passes one half.
+    fn search_range(
+        &self,
+        target: &[f64; IDIM],
+        gain: f64,
+        start: usize,
+        end: usize,
+    ) -> SearchResult {
         // ===== Block 16 (§5.11): target normalization ================
         // | TMP = 1 / GAIN
         // | For K = 1,2,..,IDIM: TARGET(K) = TARGET(K) * TMP
@@ -295,8 +346,8 @@ impl CodebookSearch {
         let n1 = NG / 2;
         let mut distm = f64::INFINITY;
         let mut ig = 1usize; // spec 1-based IG
-        let mut is = 1usize; // spec 1-based IS
-        for j in 1..=NCWD {
+        let mut is = start; // spec 1-based IS (range start)
+        for j in start..=end {
             let row = &Y_Q11[j - 1];
             let mut cor = 0.0f64;
             for k in 0..IDIM {
@@ -650,5 +701,101 @@ mod tests {
             }
         }
         assert_eq!(res.shape_index as usize, min_j);
+    }
+
+    #[test]
+    fn half_codebook_search_confines_shape_index_to_the_requested_half() {
+        // §3.11: bit 0 ⇒ shape ∈ 0..=63, bit 1 ⇒ shape ∈ 64..=127.
+        // Drive a generic non-trivial cascade + target so the unrobbed
+        // optimum could fall in either half, then confirm each robbed
+        // search stays in its half and the top shape bit equals the bit.
+        let mut a = allpass_a();
+        a[1] = -0.55;
+        a[2] = 0.18;
+        a[3] = -0.05;
+        let mut q = [0.0f64; LPCW + 1];
+        q[0] = 1.0;
+        q[1] = -0.35;
+        q[2] = 0.12;
+        let w = WeightingFilterCoeff::from_lpc(&q);
+        let mut cs = CodebookSearch::new();
+        cs.update_impulse_response(&a, &w);
+
+        let target = [13.7, -42.1, 8.9, 27.3, -19.6];
+        let sigma = 3.25;
+
+        let r0 = cs.search_with_sync_bit(&target, sigma, false);
+        assert!(
+            r0.shape_index < 64,
+            "bit0 shape {} not in 0..64",
+            r0.shape_index
+        );
+        assert!(!crate::extract_sync_bit(r0.channel_index));
+
+        let r1 = cs.search_with_sync_bit(&target, sigma, true);
+        assert!(
+            r1.shape_index >= 64,
+            "bit1 shape {} not in 64..128",
+            r1.shape_index
+        );
+        assert!(crate::extract_sync_bit(r1.channel_index));
+    }
+
+    #[test]
+    fn half_codebook_search_finds_the_best_in_half_by_brute_force() {
+        // The half-codebook search must select the same (i, j) as a
+        // brute-force minimisation of eq. 3-16 restricted to the chosen
+        // half — only the shape scan range narrows; the gain decision
+        // tree is unchanged.
+        let mut a = allpass_a();
+        a[1] = -0.4;
+        a[2] = 0.2;
+        let w = WeightingFilterCoeff::from_lpc(&{
+            let mut q = [0.0f64; LPCW + 1];
+            q[0] = 1.0;
+            q[1] = -0.3;
+            q
+        });
+        let mut cs = CodebookSearch::new();
+        cs.update_impulse_response(&a, &w);
+        let h = *cs.impulse_response();
+        let target = [5.1, -8.3, 2.7, 11.0, -4.4];
+        let sigma = 2.0;
+
+        for bit in [false, true] {
+            let res = cs.search_with_sync_bit(&target, sigma, bit);
+            let (lo, hi) = if bit { (64usize, 128usize) } else { (0, 64) };
+            let mut xhat = [0.0f64; IDIM];
+            for k in 0..IDIM {
+                xhat[k] = target[k] / sigma;
+            }
+            let mut best = f64::INFINITY;
+            let mut best_pair = (0usize, 0usize);
+            for j in lo..hi {
+                let row = y_row(j);
+                let mut filtered = [0.0f64; IDIM];
+                for n in 0..IDIM {
+                    for m in 0..=n {
+                        filtered[n] += h[n - m] * row[m];
+                    }
+                }
+                for i in 0..NG {
+                    let mut d = 0.0f64;
+                    for k in 0..IDIM {
+                        let e = xhat[k] - GQ[i] * filtered[k];
+                        d += e * e;
+                    }
+                    if d < best {
+                        best = d;
+                        best_pair = (i, j);
+                    }
+                }
+            }
+            assert_eq!(
+                (res.gain_index as usize, res.shape_index as usize),
+                best_pair,
+                "half-search bit={bit} disagrees with brute force"
+            );
+        }
     }
 }
