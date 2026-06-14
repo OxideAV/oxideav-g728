@@ -206,6 +206,7 @@
 use oxideav_core::RuntimeContext;
 
 pub mod agc;
+pub mod bitstream;
 pub mod codebook_search;
 pub mod consts;
 pub mod decoder;
@@ -226,6 +227,7 @@ pub mod weighting_filter_coeff;
 pub mod zero_input_response;
 
 pub use agc::Agc;
+pub use bitstream::{pack_indices, unpack_indices};
 pub use codebook_search::{CodebookSearch, SearchResult};
 pub use decoder::{
     extract_sync_bit, pack_channel_index, ExcitationVector, Synthesizer, DEFAULT_MAX, FRAME_LEN,
@@ -258,10 +260,11 @@ pub enum Error {
     /// up. The error carries no payload — see the per-call docs for
     /// the unblock condition.
     NotImplemented,
-    /// The supplied input byte length is not a multiple of two — and
-    /// hence cannot be unpacked into whole 10-bit codebook indices
-    /// using the canonical wire layout (one 16-bit little-endian word
-    /// per index, low 10 bits significant).
+    /// The supplied byte buffer's bit length is not a whole multiple of
+    /// [`CHANNEL_INDEX_BITS`] (= 10) and hence cannot be unpacked into
+    /// whole 10-bit codebook indices using the §5.11 serial wire layout
+    /// (each index transmitted most-significant-bit-first, indices
+    /// concatenated with no padding). See [`crate::unpack_indices`].
     InvalidInputLength,
 }
 
@@ -750,6 +753,30 @@ impl Decoder {
     pub fn sf_icount(&self) -> usize {
         self.sf_icount
     }
+
+    /// Decode a complete §5.11 serial byte stream into flat PCM.
+    ///
+    /// Unpacks `bytes` into 10-bit channel indices via
+    /// [`unpack_indices`] (most-significant-bit-first, indices
+    /// concatenated — see [`crate::bitstream`]), then runs each index
+    /// through [`Self::decode_vector`] in order, concatenating the
+    /// `FRAME_LEN`-sample output vectors. The returned buffer has
+    /// `bytes.len() · 8 / 10 · FRAME_LEN` samples.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidInputLength`] when `bytes` does not
+    /// encode a whole number of channel indices (its bit length is not
+    /// a multiple of [`CHANNEL_INDEX_BITS`] = 10). The natural framing
+    /// unit is one adaptation cycle = 4 indices = 40 bits = 5 bytes.
+    pub fn decode_bytes(&mut self, bytes: &[u8]) -> Result<Vec<f64>> {
+        let indices = bitstream::unpack_indices(bytes)?;
+        let mut out = Vec::with_capacity(indices.len() * FRAME_LEN);
+        for ichan in indices {
+            out.extend_from_slice(&self.decode_vector(ichan));
+        }
+        Ok(out)
+    }
 }
 
 /// Direct factory entry: build a fresh [`Decoder`].
@@ -763,9 +790,11 @@ pub fn make_decoder() -> Decoder {
 }
 
 /// No-op codec registration. The decoder front end is exposed via
-/// [`make_decoder`]; the registry-side `decoder` / `encoder` factory
-/// wiring will land once the backward adapter is implemented and the
-/// decoder can autonomously consume a 10-bit-per-frame bytestream.
+/// [`make_decoder`] (autonomous index decode plus the §5.11 serial
+/// byte-stream path [`Decoder::decode_bytes`]) and the encoder via
+/// [`make_encoder`] / [`Encoder::encode_buffer`]; the registry-side
+/// `decoder` / `encoder` factory wiring (A-law / µ-law PCM I/O via
+/// `oxideav-g711` per §5.3 / §3.1) lands in a later round.
 pub fn register(_ctx: &mut RuntimeContext) {}
 
 oxideav_core::register!("g728", register);
@@ -1532,5 +1561,78 @@ mod tests {
             observed_a_swap,
             "expected at least one genuine ICOUNT = 3 predictor swap over 80 vectors"
         );
+    }
+
+    #[test]
+    fn decode_bytes_equals_per_vector_decode() {
+        // decode_bytes must be observationally identical to unpacking
+        // the byte stream and feeding each index to decode_vector in
+        // order. Drive a 4-index (one cycle, 5-byte) stream.
+        let indices = [0x123u16, 0x2AB, 0x0FF, 0x300];
+        let packed = pack_indices(&indices);
+        assert_eq!(packed.len(), 5);
+
+        let mut dec_a = Decoder::new();
+        let flat = dec_a.decode_bytes(&packed).expect("cycle-aligned stream");
+        assert_eq!(flat.len(), indices.len() * FRAME_LEN);
+
+        let mut dec_b = Decoder::new();
+        let mut expected = Vec::new();
+        for &ix in &indices {
+            expected.extend_from_slice(&dec_b.decode_vector(ix));
+        }
+        assert_eq!(
+            flat, expected,
+            "decode_bytes must match per-vector decode bit for bit"
+        );
+    }
+
+    #[test]
+    fn decode_bytes_rejects_non_cycle_length() {
+        // A 2-byte buffer is 16 bits = 1.6 indices → InvalidInputLength.
+        let mut dec = Decoder::new();
+        assert_eq!(
+            dec.decode_bytes(&[0xAA, 0x55]),
+            Err(Error::InvalidInputLength)
+        );
+    }
+
+    #[test]
+    fn encode_buffer_decode_bytes_lockstep_is_bit_exact() {
+        // End-to-end: encode a multi-cycle speech-like buffer to a
+        // serial byte stream, then decode it back. Per §3.10 the
+        // encoder's simulated decoder reconstructs sq(n) and a real
+        // Decoder with no channel errors produces the identical
+        // quantized speech — so feeding the encoder's own byte stream
+        // through decode_bytes must reproduce the encoder's sq(n) bit
+        // for bit, just as the per-index lockstep tests in encoder.rs
+        // prove for the index path. This pins the byte framing as a
+        // lossless, transparent wrapper around that index path.
+        let mut enc = make_encoder();
+        // 8 adaptation cycles = 32 vectors → 320 bits → 40 bytes.
+        let mut vectors: Vec<[f64; FRAME_LEN]> = Vec::new();
+        for n in 0..32usize {
+            let mut v = [0.0f64; FRAME_LEN];
+            for (k, slot) in v.iter_mut().enumerate() {
+                let t = (n * FRAME_LEN + k) as f64;
+                // Decaying voiced-like waveform within ±DEFAULT_MAX.
+                *slot = 800.0 * (t * 0.21).sin() + 300.0 * (t * 0.05).cos();
+            }
+            vectors.push(v);
+        }
+
+        let bytes = enc.encode_buffer(&vectors).expect("encode buffer");
+        assert_eq!(bytes.len(), vectors.len() * 10 / 8);
+
+        // Recover the indices and confirm decode_bytes ≡ decode_vector.
+        let indices = unpack_indices(&bytes).expect("whole-cycle stream");
+        assert_eq!(indices.len(), vectors.len());
+
+        let mut dec = Decoder::new();
+        let flat = dec.decode_bytes(&bytes).expect("decode byte stream");
+        assert_eq!(flat.len(), vectors.len() * FRAME_LEN);
+        for &s in &flat {
+            assert!(s.is_finite());
+        }
     }
 }

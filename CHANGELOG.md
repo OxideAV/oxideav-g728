@@ -6,6 +6,30 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **§5.11 serial byte-stream framing (r303)** — new `bitstream` module
+  serialises the 16 kbit/s channel per the block-18 transmit epilogue
+  of the §5.11 pseudo-code: each 10-bit `ICHAN` is packed
+  most-significant-bit-first (`b9` first, … `b0` last), indices
+  concatenated with no padding, packed into bytes MSB-first.
+  `pack_indices(&[u16]) -> Vec<u8>` and `unpack_indices(&[u8]) ->
+  Result<Vec<u16>>` are exact inverses; `unpack_indices` returns
+  `Error::InvalidInputLength` when the buffer's bit length is not a
+  whole multiple of `CHANNEL_INDEX_BITS = 10`. Whole-stream wrappers
+  `Encoder::encode_buffer(&[[f64; 5]]) -> Result<Vec<u8>>` and
+  `Decoder::decode_bytes(&[u8]) -> Result<Vec<f64>>` bridge the
+  per-vector encode / decode path to the serial wire format. Eleven
+  per-tests pin the MSB-first layout, byte-boundary straddles, masking,
+  rejection of non-multiple-of-10 lengths, and an end-to-end
+  `encode_buffer` → `decode_bytes` drive.
+
+### Changed
+
+- `Error::InvalidInputLength` now documents its spec-faithful §5.11
+  meaning (bit length not a multiple of 10) instead of the earlier
+  placeholder 16-bit-little-endian-word layout.
+
+### Added (earlier)
+
 - **§3.11 synchronization / in-band-signalling bit robbing (r297)** —
   the encoder can now rob the leftmost codeword bit of a chosen vector
   to carry a synchronization or in-band-signalling bit, the in-stream

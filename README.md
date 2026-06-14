@@ -2,7 +2,42 @@
 
 Pure-Rust ITU-T G.728 Low-Delay CELP (LD-CELP, 16 kbit/s) speech codec.
 
-## Status: clean-room rebuild — autonomous decoder + full §4.7 postfilter chain + **complete encoder loop**: §3.9 codebook search (blocks 12–18) + §3.10 memory update, `encode_vector` in bit-exact lockstep with `decode_vector` (round 276) + §3.11 in-band-signalling bit robbing (round 297)
+## Status: clean-room rebuild — autonomous decoder + full §4.7 postfilter chain + **complete encoder loop**: §3.9 codebook search (blocks 12–18) + §3.10 memory update, `encode_vector` in bit-exact lockstep with `decode_vector` (round 276) + §3.11 in-band-signalling bit robbing (round 297) + §5.11 serial byte-stream framing (round 303)
+
+## §5.11 serial byte-stream framing (round 303)
+
+The codec channel is a serial stream of one 10-bit index `ICHAN` per
+`IDIM = 5`-sample vector, with **no in-band framing** — only the bit
+*order* is specified. The block-18 transmit epilogue of the §5.11
+pseudo-code pins it exactly: the most-significant bit of `ICHAN` is
+transmitted first, so for `ICHAN = b9 b8 … b0` the wire order is
+`b9, b8, …, b0`. The new `bitstream` module realises that convention:
+
+- **`pack_indices(&[u16]) -> Vec<u8>`.** Serialises channel indices
+  most-significant-bit-first (`b9` first, masked to the low
+  `CHANNEL_INDEX_BITS = 10` bits), concatenated with no inter-index
+  padding, packed into bytes MSB-first (first serial bit → bit 7 of
+  byte 0). This keeps the §3.11 robbed "leftmost bit of the codeword"
+  (`b9`) first on the wire and makes a single index occupy the high ten
+  bits of its first two bytes — directly readable in a hex dump.
+- **`unpack_indices(&[u8]) -> Result<Vec<u16>>`.** The exact inverse;
+  returns [`Error::InvalidInputLength`] when the buffer's bit length is
+  not a whole multiple of 10 (cannot hold a whole number of indices) —
+  finally giving that reserved error variant its spec-faithful meaning
+  (it previously documented a placeholder 16-bit-word layout).
+- **`Encoder::encode_buffer(&[[f64; 5]]) -> Result<Vec<u8>>`** and
+  **`Decoder::decode_bytes(&[u8]) -> Result<Vec<f64>>`** are the
+  whole-stream convenience wrappers around `encode_vector` /
+  `decode_vector` plus the pack/unpack pair. The natural framing unit
+  is one adaptation cycle = 4 indices = 40 bits = 5 bytes.
+
+Eleven per-tests pin the layout: cycle-aligned round trips, the
+boundary indices 0 / 1023, `b9` landing in bit 7 of byte 0 and `b0` in
+byte 1, masking of bits above `b9`, rejection of non-multiple-of-10
+bit lengths, the empty stream, a two-index byte-boundary straddle, an
+exhaustive single-index sweep, `decode_bytes ≡ per-vector decode`, and
+an end-to-end `encode_buffer` → `decode_bytes` drive over 8 adaptation
+cycles.
 
 The crate was reset to a register-only scaffold under the workspace
 clean-room policy (round 171, master `14e3bad`): the previous
@@ -549,12 +584,15 @@ non-stationary drive, with at least one genuine swap observed.
 ## What is NOT yet wired up
 
 - A-law / µ-law PCM I/O — `oxideav-g711` handles this per §5.3 / §3.1.
-- Byte-stream framing helpers (`Error::InvalidInputLength` is reserved
-  for them). The §3.11 in-band-signalling **bit-robbing** itself landed
-  in round 297 (see above); what remains is the optional bit-level
-  packing/unpacking of a contiguous 10-bit-per-vector byte stream.
+  The `oxideav-core` registry-side `decoder` / `encoder` factory wiring
+  lands once that PCM I/O is plumbed.
 - Annex G fixed-point variant and Annex I frame-loss concealment
   remain deferred behind the floating-point build.
+
+The §5.11 serial byte-stream framing (bit-level packing / unpacking of
+the contiguous 10-bit-per-vector stream) landed in round 303 — see the
+section above; `Error::InvalidInputLength` now carries its
+spec-faithful meaning.
 
 ## Clean-room provenance
 

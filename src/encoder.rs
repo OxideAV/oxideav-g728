@@ -504,6 +504,27 @@ impl Encoder {
         self.encode_vector_inner(input, Some(sync_bit))
     }
 
+    /// Encode a sequence of input vectors into a §5.11 serial byte
+    /// stream.
+    ///
+    /// Runs each `FRAME_LEN`-sample input vector through
+    /// [`Self::encode_vector`] in order, then packs the resulting 10-bit
+    /// channel indices most-significant-bit-first into a contiguous byte
+    /// stream via [`crate::pack_indices`] (the on-the-wire layout the
+    /// block-18 transmit epilogue prescribes). The inverse on the
+    /// decode side is [`crate::Decoder::decode_bytes`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`Error`] from the underlying per-vector encode.
+    pub fn encode_buffer(&mut self, vectors: &[[f64; FRAME_LEN]]) -> Result<Vec<u8>, Error> {
+        let mut indices = Vec::with_capacity(vectors.len());
+        for v in vectors {
+            indices.push(self.encode_vector(v)?);
+        }
+        Ok(crate::bitstream::pack_indices(&indices))
+    }
+
     fn encode_vector_inner(
         &mut self,
         input: &[f64; FRAME_LEN],
