@@ -117,6 +117,30 @@ pub const FEFAC: f64 = 0.97;
 /// third vector in the 5th adaptation cycle").
 pub const FE_LPC_CYCLES_PER_STEP: usize = 4;
 
+/// Frame-erasure gain-growth limit, in dB per 5-sample vector (Annex I,
+/// §I.4.5 / Table I.1/G.728, `FEGAINMAX`). After a frame erasure the
+/// backward-adapted log-gain is not allowed to grow by more than this
+/// many dB per vector relative to the last log-gain, for the first few
+/// good frames; the spec spells it out as "we limit the gain growth to
+/// no more than `FEGAINMAX = +2 dB` per 5-sample vector".
+pub const FEGAINMAX: f64 = 2.0;
+
+/// Maximum gain-clamping duration after a frame erasure, in 2.5 ms
+/// adaptation cycles (Annex I, §I.4.5 / Table I.1/G.728, `AFTERFEMAX`).
+/// The gain-growth clamp lasts for the length of the erasure but never
+/// longer than `AFTERFEMAX` cycles (= 40 ms): "If the frame erasure is
+/// longer than 40 ms long, the gain clamping is limited to the first
+/// 40 ms after the erasure."
+pub const AFTERFEMAX: usize = 16;
+
+/// Initial / reset value of the "last predicted gain in dB" tracker
+/// `OGAINDB` (Annex I, §I.5.1 — `OGAINDB = -32 | Last predicted gain in
+/// dB`). The gain-growth limiter clamps the new log-gain to at most
+/// `OGAINDB + FEGAINMAX`; before any gain has been predicted the
+/// reference value is the log-gain floor (`GAIN = 0` maps to
+/// `0 - GOFF = -32` dB after the §3.8 offset subtraction).
+pub const OGAINDB_INIT: f64 = -32.0;
+
 /// Total number of vectors per encoded second at 16 kbit/s.
 ///
 /// G.728 emits one 10-bit codebook index per IDIM-sample vector; 8 kHz

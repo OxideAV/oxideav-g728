@@ -6,6 +6,26 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Annex I §I.4.5 gain-growth limitation after frame erasure (r316)** —
+  new `gain_growth_limiter` module realises Block 47AF (the §I.5.6
+  floating-point replacement for the normal Block 47 log-gain limiter)
+  plus the §I.5.1 main-loop `AFTERFE` / `FECOUNT` / `OGAINDB`
+  bookkeeping. `limit_log_gain(gain, ogaindb, afterfe) -> f64` is the
+  pure transform: the normal `[0, 60]` dB range clamp followed by the
+  Annex I addition `if AFTERFE > 0 and GAIN - OGAINDB > FEGAINMAX, GAIN =
+  OGAINDB + FEGAINMAX` (caps backward-adapted log-gain growth to
+  `FEGAINMAX = +2 dB`/vector for the first few good frames after an
+  erasure, preventing the post-erasure gain "pop"). `GainGrowthLimiter`
+  drives the cycle bookkeeping: a good cycle decrements an active
+  `AFTERFE`; the first good cycle after an erasure loads `AFTERFE` with
+  the erasure length `FECOUNT` saturated at `AFTERFEMAX = 16` cycles
+  (= 40 ms); an erased cycle increments `FECOUNT`; `OGAINDB` starts at
+  the `-32` dB log-gain floor. New `consts` `FEGAINMAX`, `AFTERFEMAX`,
+  `OGAINDB_INIT`. Twelve per-tests pin the range-clamp-before-growth
+  ordering, the `+2 dB`/vector cap, decrease-never-clamped, the
+  `AFTERFE = FECOUNT` load + saturation + decrement cadence, `OGAINDB`
+  threading through `limit`, and the Table I.1 literals (incl. the
+  `16 × 2.5 ms = 40 ms` cross-check).
 - **Annex I §I.4.2 frame-erasure LPC filter softening (r312)** — new
   `frame_erasure_lpc` module realises the first Annex I (frame/packet
   loss concealment) mechanism: during an erased frame the decoder reuses

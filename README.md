@@ -44,6 +44,12 @@ Implemented end-to-end:
 - **Annex I §I.4.2 frame-erasure LPC softening** — `soften_predictor`
   + `FrameErasureLpc` step bookkeeping (progressive `(0.97)^{k·i}`
   bandwidth expansion of the last good predictor during erased frames).
+- **Annex I §I.4.5 gain-growth limit** — `limit_log_gain` (Block 47AF,
+  §I.5.6) clamps the backward-adapted log-gain to at most `FEGAINMAX =
+  +2 dB`/vector above the last log-gain for the first few good frames
+  after an erasure, plus `GainGrowthLimiter` driving the §I.5.1
+  `AFTERFE` / `FECOUNT` / `OGAINDB` bookkeeping (clamp lasts the erasure
+  length, saturated at `AFTERFEMAX = 16` cycles = 40 ms).
 
 ### Not yet implemented
 
@@ -51,8 +57,7 @@ Implemented end-to-end:
   A-law / µ-law PCM I/O per §5.3 / §3.1, handled by `oxideav-g711`).
 - The remaining Annex I concealment mechanisms (§I.4.1 excitation
   extrapolation, §I.4.3 continued backward adaptation, §I.4.4 floating
-  post-filter, §I.4.5 gain-growth limit) and the decoder erasure-flag
-  drive path.
+  post-filter) and the decoder erasure-flag drive path.
 - Annex G fixed-point variant (deferred behind the floating-point
   build).
 

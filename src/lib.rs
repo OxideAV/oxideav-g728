@@ -213,6 +213,7 @@ pub mod decoder;
 pub mod encoder;
 pub mod frame_erasure_lpc;
 pub mod gain_adapter;
+pub mod gain_growth_limiter;
 pub mod hybrid_window;
 pub mod levinson;
 pub mod long_term_postfilter;
@@ -236,6 +237,7 @@ pub use decoder::{
 pub use encoder::{make_encoder, Encoder, CHANNEL_INDEX_BITS};
 pub use frame_erasure_lpc::{soften_predictor, FrameErasureLpc};
 pub use gain_adapter::GainAdapter;
+pub use gain_growth_limiter::{limit_log_gain, GainGrowthLimiter};
 pub use hybrid_window::{HybridWindow, HybridWindowState};
 pub use levinson::{levinson_durbin, LevinsonError};
 pub use long_term_postfilter::LongTermPostfilter;
