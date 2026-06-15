@@ -2,7 +2,47 @@
 
 Pure-Rust ITU-T G.728 Low-Delay CELP (LD-CELP, 16 kbit/s) speech codec.
 
-## Status: clean-room rebuild — autonomous decoder + full §4.7 postfilter chain + **complete encoder loop**: §3.9 codebook search (blocks 12–18) + §3.10 memory update, `encode_vector` in bit-exact lockstep with `decode_vector` (round 276) + §3.11 in-band-signalling bit robbing (round 297) + §5.11 serial byte-stream framing (round 303)
+## Status: clean-room rebuild — autonomous decoder + full §4.7 postfilter chain + **complete encoder loop**: §3.9 codebook search (blocks 12–18) + §3.10 memory update, `encode_vector` in bit-exact lockstep with `decode_vector` (round 276) + §3.11 in-band-signalling bit robbing (round 297) + §5.11 serial byte-stream framing (round 303) + **Annex I §I.4.2 frame-erasure LPC softening** (round 312)
+
+## Annex I §I.4.2 frame-erasure LPC filter softening (round 312)
+
+First Annex I (frame / packet-loss concealment, 05/99) mechanism. Annex
+I modifies **only the decoder**, only during erased frames; when a frame
+is erased there is no channel index, so the backward synthesis-filter
+adapter (blocks 49/50/51) cannot run. §I.4.2 instead reuses the **last
+good** 50th-order LPC predictor but "softens" it with an extra
+bandwidth expansion — flattening the synthesis filter's spectral peaks
+so the §I.4.1 extrapolated excitation does not ring an unchanged sharp
+filter:
+
+- **`soften_predictor(&[f64; 51], step) -> [f64; 51]`.** The pure
+  block-51-style transform `a′_i = (FEFAC^step)^i · a_i =
+  FEFAC^{step·i}·a_i` over the spec `A` layout `[1.0, a_1, …, a_50]`,
+  leaving the implicit `a_0 = 1` tap untouched (block 51 keeps
+  `FACV(1) = 1.0`). The expansion factor `FEFAC = 0.97` replaces the
+  normal `FAC = 253/256 ≈ 0.9883` of good frames (§I.4.2: "the
+  bandwidth expansion factor FAC (5.1/G.728) is 0.97 rather than
+  253/256"). `step = 0` is the identity (non-erased state).
+- **`FrameErasureLpc` — §I.4.2 step bookkeeping.** The softening is
+  *progressive*: the first erased frame uses `(0.97)^i` (step `k = 1`),
+  re-softened to `(0.97)^{2i}` if the erasure lasts beyond 10 ms, and in
+  general `(0.97)^{k·i}` after `k·10 ms`. One adaptation cycle is
+  `NFRSZ = 20` samples = 2.5 ms, so the step increments every
+  `FE_LPC_CYCLES_PER_STEP = 4` adaptation cycles ("updated again at the
+  third vector in the 5th adaptation cycle"). `on_erased_cycle` advances
+  one erased cycle and returns the new step; `on_good_cycle` resets to
+  step 0 so the next erasure restarts at `0.97` ("next time there is a
+  bad frame again, the process starts from … 0.97 again").
+
+New `consts` `FEFAC = 0.97` and `FE_LPC_CYCLES_PER_STEP = 4`. Nine
+per-tests pin the closed-form `(0.97)^{k·i}` scaling against the spec's
+phrasing, the `a_0 = 1` invariant, the strict high-order tap flattening,
+the 4-cycle step cadence (`1,1,1,1,2,2,2,2,3,…`), the good-cycle reset,
+and `FEFAC < FAC`. The remaining Annex I mechanisms (§I.4.1 excitation
+extrapolation, §I.4.3 continued vital backward adaptation, §I.4.4
+floating post-filter, §I.4.5 gain-growth limit) are queued for later
+rounds; §I.4.1's `VOICEDFEGAIN()` / `UNVOICEDFEGAIN()` scaling arrays
+live in the §I.5 pseudo-code / Appendix I.I of the staged Annex I PDF.
 
 ## §5.11 serial byte-stream framing (round 303)
 
@@ -586,8 +626,12 @@ non-stationary drive, with at least one genuine swap observed.
 - A-law / µ-law PCM I/O — `oxideav-g711` handles this per §5.3 / §3.1.
   The `oxideav-core` registry-side `decoder` / `encoder` factory wiring
   lands once that PCM I/O is plumbed.
-- Annex G fixed-point variant and Annex I frame-loss concealment
-  remain deferred behind the floating-point build.
+- Annex G fixed-point variant remains deferred behind the
+  floating-point build.
+- Annex I frame-loss concealment: the §I.4.2 LPC-softening transform +
+  step bookkeeping landed in round 312 (see the section above); the
+  other four mechanisms (§I.4.1 / §I.4.3 / §I.4.4 / §I.4.5) and the
+  decoder erasure-flag drive path are queued for later rounds.
 
 The §5.11 serial byte-stream framing (bit-level packing / unpacking of
 the contiguous 10-bit-per-vector stream) landed in round 303 — see the

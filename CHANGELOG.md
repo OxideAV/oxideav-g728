@@ -6,6 +6,23 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Annex I §I.4.2 frame-erasure LPC filter softening (r312)** — new
+  `frame_erasure_lpc` module realises the first Annex I (frame/packet
+  loss concealment) mechanism: during an erased frame the decoder reuses
+  the last good 50th-order LPC predictor but "softens" it by an extra
+  bandwidth expansion `a′_i = (0.97)^{k·i}·a_i` (factor `FEFAC = 0.97`
+  rather than the normal `FAC = 253/256`), progressively re-softened by
+  another factor of `0.97` every additional 10 ms of erasure (step `k`
+  incrementing every `FE_LPC_CYCLES_PER_STEP = 4` adaptation cycles).
+  `soften_predictor(&[f64; 51], step) -> [f64; 51]` is the pure block-51-
+  style transform (leaving the implicit `a_0 = 1` tap untouched);
+  `FrameErasureLpc` tracks the §I.4.2 step `k` across runs of erased /
+  good adaptation cycles (step 1 on the first erased cycle, +1 per 10 ms,
+  reset to 0 on the next good frame). New `consts` `FEFAC` and
+  `FE_LPC_CYCLES_PER_STEP`. Nine per-tests pin the closed-form
+  `(0.97)^{k·i}` scaling, the `a_0` invariant, the 4-cycle step cadence
+  (`1,1,1,1,2,2,2,2,3,…`), good-cycle reset, and the `FEFAC < FAC`
+  guard.
 - **§5.11 serial byte-stream framing (r303)** — new `bitstream` module
   serialises the 16 kbit/s channel per the block-18 transmit epilogue
   of the §5.11 pseudo-code: each 10-bit `ICHAN` is packed

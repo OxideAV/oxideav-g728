@@ -211,6 +211,7 @@ pub mod codebook_search;
 pub mod consts;
 pub mod decoder;
 pub mod encoder;
+pub mod frame_erasure_lpc;
 pub mod gain_adapter;
 pub mod hybrid_window;
 pub mod levinson;
@@ -233,6 +234,7 @@ pub use decoder::{
     extract_sync_bit, pack_channel_index, ExcitationVector, Synthesizer, DEFAULT_MAX, FRAME_LEN,
 };
 pub use encoder::{make_encoder, Encoder, CHANNEL_INDEX_BITS};
+pub use frame_erasure_lpc::{soften_predictor, FrameErasureLpc};
 pub use gain_adapter::GainAdapter;
 pub use hybrid_window::{HybridWindow, HybridWindowState};
 pub use levinson::{levinson_durbin, LevinsonError};

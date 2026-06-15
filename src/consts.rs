@@ -101,6 +101,22 @@ pub const WPCF: f64 = 0.6;
 /// (Table 1/G.728).
 pub const WZCF: f64 = 0.9;
 
+/// Frame-erasure LPC-softening bandwidth-expansion factor (Annex I,
+/// §I.4.2). During erased frames the last good 50th-order LPC predictor
+/// is "softened" by bandwidth expansion using this factor instead of
+/// the normal `FAC = 253/256 ≈ 0.9883` of block 51; the spec spells it
+/// out as "the bandwidth expansion factor FAC (5.1/G.728) is 0.97
+/// rather than 253/256".
+pub const FEFAC: f64 = 0.97;
+
+/// Frame-erasure LPC re-softening cadence, in adaptation cycles per
+/// 10 ms (Annex I, §I.4.2). The softened predictor is further expanded
+/// by another factor of `FEFAC` every additional 10 ms of erasure; one
+/// adaptation cycle is `NFRSZ = 20` samples = 2.5 ms, so 10 ms is four
+/// adaptation cycles ("the LPC coefficients are updated again at the
+/// third vector in the 5th adaptation cycle").
+pub const FE_LPC_CYCLES_PER_STEP: usize = 4;
+
 /// Total number of vectors per encoded second at 16 kbit/s.
 ///
 /// G.728 emits one 10-bit codebook index per IDIM-sample vector; 8 kHz
