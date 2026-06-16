@@ -41,6 +41,17 @@ Implemented end-to-end:
   whole-stream wrappers `Encoder::encode_buffer` /
   `Decoder::decode_bytes`. The natural framing unit is one adaptation
   cycle = 4 indices = 40 bits = 5 bytes.
+- **Annex I §I.4.1 frame-erasure excitation extrapolation** —
+  `FrameErasureExcitation` (blocks 31SF / 31FE / 31E) maintains the
+  `ETPAST()` gain-scaled-excitation history and synthesises one `ET()`
+  vector per erased vector: at onset the last good `PTAP` (vs lowered
+  `VTH = PPFTH/1.4`) picks **voiced** (periodic decaying repeat of the
+  last `KP` samples, `FESCALE` stepping `0.8 → 0` over 50 ms) or
+  **unvoiced** (random `5..=140`-sample slide-back, magnitude-matched to
+  the pre-erasure `AVMAG`, attenuated over 60 ms). The "random"
+  slide-back is a pluggable `SlideSource` (default dependency-free LCG)
+  since the spec licenses any aperiodic `5..=140` sequence during
+  erasures. Floating-point only.
 - **Annex I §I.4.2 frame-erasure LPC softening** — `soften_predictor`
   + `FrameErasureLpc` step bookkeeping (progressive `(0.97)^{k·i}`
   bandwidth expansion of the last good predictor during erased frames).
@@ -55,9 +66,9 @@ Implemented end-to-end:
 
 - Registry-side `decoder` / `encoder` factory wiring (waits on
   A-law / µ-law PCM I/O per §5.3 / §3.1, handled by `oxideav-g711`).
-- The remaining Annex I concealment mechanisms (§I.4.1 excitation
-  extrapolation, §I.4.3 continued backward adaptation, §I.4.4 floating
-  post-filter) and the decoder erasure-flag drive path.
+- The remaining Annex I concealment mechanisms (§I.4.3 continued
+  backward adaptation, §I.4.4 floating post-filter) and the decoder
+  erasure-flag drive path that wires §I.4.1/§I.4.2/§I.4.5 together.
 - Annex G fixed-point variant (deferred behind the floating-point
   build).
 

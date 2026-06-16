@@ -6,6 +6,27 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Annex I §I.4.1 frame-erasure excitation extrapolation (r322)** — new
+  `excitation_extrapolation` module realises blocks 31SF / 31FE / 31E
+  (§I.5.2–§I.5.4 floating-point pseudo-code). `FrameErasureExcitation`
+  maintains the `ETPAST()` gain-scaled-excitation history (`KPMAX + IDIM`
+  samples) and extrapolates one `ET()` vector per erased vector. Block
+  31SF (`on_erased_cycle`) latches the voiced/unvoiced decision at
+  erasure onset from the last good `PTAP` against the lowered threshold
+  `VTH = PPFTH/1.4`, saving `FEDELAY = KP` (voiced) or the magnitude
+  reference `AVMAG = (1/8)·Σ|last 40 ETPAST|` (unvoiced), and refreshes
+  the scale `FESCALE` from the `VOICEDFEGAIN`/`UNVOICEDFEGAIN` schedules
+  per 10 ms of erasure (forced to 0 past 50/60 ms). Block 31FE
+  (`extrapolate`) produces the vector: voiced = `FESCALE · ETPAST(i −
+  FEDELAY)` (periodic decaying repeat), unvoiced = a random 5-sample
+  slide-back magnitude-matched via `RATIO = FESCALE / MAG`. Block 31E
+  (`push`) slides `ETPAST()` by `IDIM` and appends, run every frame so
+  the history is ready at erasure onset. The unvoiced "random" slide-back
+  is a `SlideSource` trait (spec licenses any aperiodic `5..=140`
+  sequence); a dependency-free `LcgSlideSource` is the default, tests
+  drive a fixed sequence. Floating-point only — fixed-point Q2 `ETPAST`
+  stays with the deferred Annex G build. 13 module tests + a `VTH`
+  cross-check.
 - **Annex I §I.4.5 gain-growth limitation after frame erasure (r316)** —
   new `gain_growth_limiter` module realises Block 47AF (the §I.5.6
   floating-point replacement for the normal Block 47 log-gain limiter)

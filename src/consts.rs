@@ -141,6 +141,55 @@ pub const AFTERFEMAX: usize = 16;
 /// `0 - GOFF = -32` dB after the §3.8 offset subtraction).
 pub const OGAINDB_INIT: f64 = -32.0;
 
+/// Frame-erasure voicing threshold for excitation extrapolation (Annex
+/// I, §I.4.1). At the first erased frame the decoder reuses the last
+/// good single-tap pitch-predictor weight `PTAP` (block 83) to decide
+/// voiced vs unvoiced extrapolation, but against a *lowered* threshold
+/// `VTH = PPFTH / 1.4` (rather than the normal `PPFTH = 0.6` used to
+/// gate the long-term postfilter): "we use a voicing threshold,
+/// `VTH = PPFTH/1.4`, that is lower than `PPFTH`".
+pub const VTH: f64 = PPFTH / 1.4;
+
+/// Frame-erasure voiced excitation-extrapolation scaling factors
+/// (Annex I, §I.5.2 block 31SF, `VOICEDFEGAIN`). Indexed by
+/// `N10MSEC = FECOUNT >> 2` (the number of completed 10 ms intervals of
+/// the erasure). The floating-point pseudo-code spells out
+/// `VOICEDFEGAIN(0:4) = .8, .8, .6, .4, .2`; beyond index 4 the scale
+/// `FESCALE` is forced to 0 (no extrapolation past 50 ms) to avoid
+/// "long, unnatural, periodic artifacts".
+pub const VOICED_FE_GAIN: [f64; 5] = [0.8, 0.8, 0.6, 0.4, 0.2];
+
+/// Frame-erasure unvoiced excitation-extrapolation attenuation factors
+/// (Annex I, §I.5.2 block 31SF, `UNVOICEDFEGAIN`). Indexed by
+/// `N10MSEC = FECOUNT >> 2`. The floating-point pseudo-code spells out
+/// `UNVOICEDFEGAIN(0:5) = 1., 1., .8, .6, .4, .2`; beyond index 5 the
+/// scale `FESCALE` is forced to 0 (no extrapolation past 60 ms). These
+/// multiply the magnitude-match scale `AVMAG` so the extrapolated
+/// excitation level decays as the erasure lengthens.
+pub const UNVOICED_FE_GAIN: [f64; 6] = [1.0, 1.0, 0.8, 0.6, 0.4, 0.2];
+
+/// Length of the `ETPAST()` look-back window for the unvoiced random
+/// slide-back (Annex I, §I.4.1 / block 31FE). The unvoiced extrapolator
+/// randomly slides the 5-sample window back "between 5 and 140 samples"
+/// into `ETPAST()`; `KPMAX = 140` is the maximum slide-back and equals
+/// the maximum pitch period, so the look-back buffer must hold at least
+/// `KPMAX` past samples (plus the current `IDIM` vector).
+pub const FE_UNVOICED_MAX_SLIDE: usize = KPMAX;
+
+/// Minimum slide-back for the unvoiced random extrapolator (Annex I,
+/// §I.4.1 / block 31FE): "a random integer between 5 and 140". Five is
+/// the vector dimension `IDIM`, so the random segment never overlaps
+/// the vector currently being written.
+pub const FE_UNVOICED_MIN_SLIDE: usize = IDIM;
+
+/// Number of past `ET()` samples used to compute the unvoiced
+/// magnitude-match reference `AVMAG` (Annex I, §I.5.2 block 31SF). The
+/// sum is taken over "the last 40 samples of `ETPAST()`" (the last
+/// 5 ms before the erasure) and then divided by 8 — the spec keeps the
+/// `/8` rather than `/40` because only the *ratio* of the 5-sample
+/// segment magnitude to this reference matters in block 31FE.
+pub const FE_AVMAG_SAMPLES: usize = 40;
+
 /// Total number of vectors per encoded second at 16 kbit/s.
 ///
 /// G.728 emits one 10-bit codebook index per IDIM-sample vector; 8 kHz
