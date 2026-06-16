@@ -206,6 +206,7 @@
 use oxideav_core::RuntimeContext;
 
 pub mod agc;
+pub mod annex_g_arith;
 pub mod bitstream;
 pub mod codebook_search;
 pub mod consts;
@@ -230,6 +231,7 @@ pub mod weighting_filter_coeff;
 pub mod zero_input_response;
 
 pub use agc::Agc;
+pub use annex_g_arith::{divide, findnls, rnd, vscale, ScalarFloat};
 pub use bitstream::{pack_indices, unpack_indices};
 pub use codebook_search::{CodebookSearch, SearchResult};
 pub use decoder::{

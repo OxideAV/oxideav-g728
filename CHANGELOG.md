@@ -6,6 +6,26 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Annex G fixed-point arithmetic foundation §G.1.2 / §G.1.3 (r326)** —
+  new `annex_g_arith` module lands the bottom layer the Annex G
+  (1994-11) bit-exact fixed-point variant is built on. Numerical
+  representations of §G.1.2 (single/double-precision fixed point, scalar
+  floating point as a normalized `[16384, 32767]` mantissa + `NLS`,
+  block floating point) plus the §G.1.3 arithmetic primitives: `shr_sat`
+  / `shl_sat` (the §G.1.3.1 sign-extending right shift with the
+  documented `3>>1=1` / `−3>>1=−2` magnitude anomaly, and the
+  over-wide-shift-collapses-to-sign-fill rule), `rnd` (the §G.1.3.1
+  `RND(.)` round-to-nearest-with-saturation on the 32-bit accumulator,
+  matching the worked 1.5→2 / −1.5→−1 examples), `findnls` / `vscale`
+  (the §G.1.3 `FINDNLS` / `VSCALE` block-floating-point normalization,
+  with the three sign/magnitude cases and the zero-vector `NLS = MLS+1`
+  rule, `MLS = 14` single / `30` double), `ScalarFloat::from_i16`
+  (`FLOAT(.)`), and `divide` (the §G.1.3.4 `DIVIDE` 16-bit-precision
+  scalar-float long division used inside Durbin's recursion, with the
+  15-iteration restoring loop + 16th-bit rounding). 18 module tests
+  including float-reference cross-checks for `DIVIDE` and the spec's
+  worked `RND` / shift examples. Arithmetic-only foundation; the Annex G
+  per-block coder is still deferred.
 - **Annex I §I.4.1 frame-erasure excitation extrapolation (r322)** — new
   `excitation_extrapolation` module realises blocks 31SF / 31FE / 31E
   (§I.5.2–§I.5.4 floating-point pseudo-code). `FrameErasureExcitation`

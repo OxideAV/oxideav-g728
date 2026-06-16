@@ -69,8 +69,13 @@ Implemented end-to-end:
 - The remaining Annex I concealment mechanisms (§I.4.3 continued
   backward adaptation, §I.4.4 floating post-filter) and the decoder
   erasure-flag drive path that wires §I.4.1/§I.4.2/§I.4.5 together.
-- Annex G fixed-point variant (deferred behind the floating-point
-  build).
+- Annex G fixed-point variant — the §G.1.2 numerical representations
+  and the §G.1.3 arithmetic primitives (`shr_sat` / `shl_sat`, `rnd`,
+  `findnls` / `vscale`, `ScalarFloat`, `divide`) are landed in the
+  `annex_g_arith` module as the bit-exact foundation; the §G.2 gain
+  adapter / Levinson-Durbin changes and the §G.3 per-block fixed-point
+  pseudo-code that build on it remain deferred behind the floating-point
+  build.
 
 ## Usage
 
