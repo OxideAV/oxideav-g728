@@ -6,6 +6,42 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Annex G §G.2.2 fixed-point Levinson-Durbin recursion (r337)** — new
+  `annex_g_levinson` module lands the §G.2.2 bit-exact reformulation of
+  the three Levinson-Durbin modules (block 50 synthesis filter, block 37
+  weighting filter, block 44 log-gain predictor — identical code, renamed
+  variables per the §G.2.2 translation table). Built on the
+  `annex_g_arith` `RND(.)` primitive. `simpdiv()` is the §G.2.2 `SIMPDIV`
+  subroutine — the "different and simpler division algorithm" the
+  recursion uses for its two divisions (the first-order reflection
+  coefficient and each `RC = −SUM/ALPHATMP`): a plain 16-iteration
+  restoring long division of two 16-bit integers, output in the low 17
+  bits of an accumulator (distinct from the §G.1.3.4 `DIVIDE` used
+  elsewhere). `levinson_durbin_fixed()` realises the full fresh-run
+  pseudo-code: the autocorrelation `RTMP` arrives `Q15` block-floating-
+  point (largest magnitude in `[0.5, 1)`); `ATMP` starts `Q15` and
+  down-shifts to `Q14`/`Q13` on overflow (the `NRS` strategy — on an
+  `AA0`/`AA1` overflow, `NRS += 1`, halve every `ATMP(2..=MINC+1)`, and
+  recompute the overflowed term, restarting the half-step with both terms
+  re-derived when the second product overflows); `ALPHATMP` is carried as
+  the rounded 16-bit accumulator high word; the output `NLSATMP = 15 −
+  NRS` signals the `Q` format to the downstream bandwidth-expansion
+  module. The first floating-point `RTMP(LPC+1) = 0` test is taken as the
+  upstream `ILLCOND` input (block 49 tests the full 32-bit accumulator,
+  per the §G.2.2 interoperability fix), and failures set `ILLCOND` /
+  `ILLCONDP` (postfilter coeffs also invalid when the stop order ≤ 10)
+  plus the `NLSATMP < 13` post-check. `levinson_durbin_fixed_resume()`
+  realises the decoder restart at `MINC0 = 10` (the recursion is
+  interrupted after the order-10 postfilter coefficients, then resumed
+  carrying `ATMP` / `NRS` / `ALPHATMP`). 10 module tests: SIMPDIV vs
+  scaled integer division, both pre-recursion failure paths, AR(1)/AR(2)
+  coefficient agreement with the floating-point `levinson` reference,
+  `NLSATMP ∈ {13,14,15}`, unity-tap reconstruction, a 50th-order
+  well-conditioned completion, and a decoder-resume run that reproduces
+  the one-shot 1→50 run's orders 11..50 bit for bit. Floating-point build
+  still drives the live codec; the §G.5/§G.6 Q-format packing stays
+  deferred.
+
 - **Annex G §G.2.1 reformulated backward vector gain adapter (r332)** —
   new `annex_g_gain` module lands the §G.2.1 mathematically-equivalent
   log-gain measurement that replaces the floating-point adapter's

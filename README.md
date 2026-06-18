@@ -77,9 +77,17 @@ Implemented end-to-end:
   (`gain_log_db` = `20·log10|g_i|`, `shape_log_db` = `10·log10·P[y_j]`,
   Figure G.1 blocks 93/94) plus the adder-96/limiter-97
   `offset_removed_log_gain` (eq. G-14) — is landed in the `annex_g_gain`
-  module. The §G.2.2 variable-precision Levinson-Durbin changes and the
-  §G.3 per-block fixed-point pseudo-code that build on this foundation
-  remain deferred behind the floating-point build.
+  module. The §G.2.2 variable-precision Levinson-Durbin recursion is
+  landed in the `annex_g_levinson` module — the bit-exact reformulation
+  of the three recursion blocks (37 / 44 / 50): the `SIMPDIV` 16-bit
+  restoring division, the `Q15→Q14→Q13` `NRS` overflow-rescale strategy
+  for the predictor coefficients, the saved-high-word `ALPHATMP`, the
+  `NLSATMP = 15 − NRS` precision signal to the bandwidth-expansion
+  module, the `ILLCOND` / `ILLCONDP` ill-conditioning flags, and the
+  decoder `MINC0 = 10` restart — proven against the floating-point
+  `levinson` reference and with a bit-exact resume-vs-one-shot test. The
+  §G.3 per-block fixed-point pseudo-code that builds on this foundation
+  remains deferred behind the floating-point build.
 
 ## Usage
 
