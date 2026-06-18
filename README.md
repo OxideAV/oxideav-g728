@@ -72,10 +72,14 @@ Implemented end-to-end:
 - Annex G fixed-point variant — the §G.1.2 numerical representations
   and the §G.1.3 arithmetic primitives (`shr_sat` / `shl_sat`, `rnd`,
   `findnls` / `vscale`, `ScalarFloat`, `divide`) are landed in the
-  `annex_g_arith` module as the bit-exact foundation; the §G.2 gain
-  adapter / Levinson-Durbin changes and the §G.3 per-block fixed-point
-  pseudo-code that build on it remain deferred behind the floating-point
-  build.
+  `annex_g_arith` module as the bit-exact foundation, and the §G.2.1
+  reformulated backward vector gain adapter — the two log-gain dB tables
+  (`gain_log_db` = `20·log10|g_i|`, `shape_log_db` = `10·log10·P[y_j]`,
+  Figure G.1 blocks 93/94) plus the adder-96/limiter-97
+  `offset_removed_log_gain` (eq. G-14) — is landed in the `annex_g_gain`
+  module. The §G.2.2 variable-precision Levinson-Durbin changes and the
+  §G.3 per-block fixed-point pseudo-code that build on this foundation
+  remain deferred behind the floating-point build.
 
 ## Usage
 

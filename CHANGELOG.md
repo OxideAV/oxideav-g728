@@ -6,6 +6,30 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Annex G §G.2.1 reformulated backward vector gain adapter (r332)** —
+  new `annex_g_gain` module lands the §G.2.1 mathematically-equivalent
+  log-gain measurement that replaces the floating-point adapter's
+  per-vector logarithm (blocks 39 / 40) with two precomputed dB
+  table-lookups (Figure G.1 blocks 93 / 94). `gain_log_db()` is the
+  block-93 gain-codebook log-gain table `20·log10|g_i|` (8 entries,
+  sign-symmetric over the four distinct `|GQ[i]|` magnitudes);
+  `shape_log_db()` is the block-94 shape-codebook log-gain table
+  `10·log10·P[y_j]` (128 entries) where `P[y_j] = E_j / IDIM =
+  Y_ENERGY[j]·DIMINV`; both are derived at runtime from the already-
+  transcribed `GQ` / `Y_ENERGY` tables (the dB conversion needs
+  `f64::log10`, so unlike `Y_ENERGY` they cannot be `const`).
+  `offset_removed_log_gain()` realises adder 96 + limiter 97:
+  `δ(n−1) = δ̂(n−1) + 20·log10|g_i| + 10·log10·P[y_j]` (eq. G-14,
+  corrected), floored to `−32` dB (eq. G-9 / eq. G-7's `P[e(n)] ≥ 1`
+  clip) — the value mathematically equal to the adder-42 output of
+  Figure 6/G.728. The printed eq. G-14 shows the shape term with
+  coefficient 1, but eq. G-8 / G-13 and the prose both carry the factor
+  10; the module follows the factor-10 prose, and a per-test proves the
+  factor-10 form reproduces the direct `10·log10·P[e(n)]−32` while the
+  factor-1 form diverges. 12 module tests including the full
+  reformulation-vs-direct-log equivalence sweep across σ / gain index /
+  shape index. Floating-point only; the §G.5 / §G.6 Q-format packing of
+  these dB tables stays deferred behind the floating-point build.
 - **Annex G fixed-point arithmetic foundation §G.1.2 / §G.1.3 (r326)** —
   new `annex_g_arith` module lands the bottom layer the Annex G
   (1994-11) bit-exact fixed-point variant is built on. Numerical
