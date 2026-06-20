@@ -17,6 +17,9 @@
 //! | G.3.9  | 17/18 | [`search`] — best `(IS, IG)`, `ICHAN` |
 //! | G.3.10 | 19/21 | [`excitation`] — `ET = GAIN·GQ·Y` |
 //!
+//! The whole chain is driven end-to-end for one vector by
+//! [`encode_vector`].
+//!
 //! All arithmetic is built on the §G.1.3 primitives in
 //! [`crate::annex_g_arith`] ([`rnd`](crate::annex_g_arith::rnd),
 //! [`vscale`](crate::annex_g_arith::vscale),
@@ -519,6 +522,80 @@ pub fn excitation(result: &SearchResult, gain: i16, nlsgain: i32) -> ([i16; IDIM
 }
 
 // ---------------------------------------------------------------------
+// End-to-end §G.3 fixed-point coder driver (blocks 11 → 21).
+// ---------------------------------------------------------------------
+
+/// The full per-vector output of the §G.3 fixed-point coder: the chosen
+/// codebook indices / channel index ([`SearchResult`]) plus the
+/// reconstructed gain-scaled excitation `ET` and its NLS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoderOutput {
+    /// The codebook search result (`is`, `ig`, `ichan`).
+    pub result: SearchResult,
+    /// Gain-scaled excitation `ET(1..IDIM)` (block 19/21).
+    pub et: [i16; IDIM],
+    /// `NLSET` — the block-floating-point shift of `et`.
+    pub nlset: i32,
+}
+
+/// Drive the entire §G.3.4 … §G.3.10 fixed-point coder for one
+/// 5-sample vector, chaining the per-block modules of this file in the
+/// Figure 2/G.728 order:
+///
+/// ```text
+/// block 11 → TARGET = SW − ZIR
+/// block 12 → H (impulse response of F(z)·W(z))
+/// block 14 → Y2 (filtered-shape energies)
+/// block 16 → TARGET / GAIN  (sets NLSTARGET)
+/// block 13 → PN (time-reversed convolution)
+/// block 17 → best (IS, IG), ICHAN
+/// block 19/21 → ET (gain-scaled excitation)
+/// ```
+///
+/// Inputs:
+/// * `sw` / `zir` — the weighted-speech and zero-input-response vectors,
+///   `Q2` (block 11 inputs).
+/// * `a` / `awz` / `awp` — the `Q14` cascade predictor coefficients
+///   indexed `[i] = coeff(i)` for `i = 2 … IDIM` (length `IDIM + 1`;
+///   see [`impulse_response`]).
+/// * `gain` / `nlsgain` — the scalar-floating-point excitation gain σ(n)
+///   (block 46 output): mantissa + NLS.
+///
+/// Returns the [`CoderOutput`]. This is the fixed-point analogue of the
+/// floating-point [`crate::codebook_search::CodebookSearch::search`]
+/// path, with the impulse response / energy table recomputed per call
+/// from the supplied coefficients (the per-cycle reuse and the backward
+/// adapters that produce `a`/`awz`/`awp`/`gain` live in the
+/// floating-point [`crate::encoder`] and the §G.2 fixed-point adapters).
+#[must_use]
+pub fn encode_vector(
+    sw: &[i16; IDIM],
+    zir: &[i16; IDIM],
+    a: &[i16; IDIM + 1],
+    awz: &[i16; IDIM + 1],
+    awp: &[i16; IDIM + 1],
+    gain: i16,
+    nlsgain: i32,
+) -> CoderOutput {
+    // Block 11: VQ target.
+    let target = vq_target(sw, zir);
+    // Block 12: cascade impulse response.
+    let h = impulse_response(a, awz, awp);
+    // Blocks 14/15: filtered-shape energies.
+    let y2 = codevector_energy(&h);
+    // Block 16: normalize the target by the gain (sets NLSTARGET).
+    let (target_n, nlstarget) = normalize_target(&target, gain, nlsgain);
+    // Block 13: time-reversed convolution → PN (uses NLSTARGET).
+    let pn = time_reversed_convolution(&target_n, &h, nlstarget);
+    // Blocks 17/18: best codebook index.
+    let result = search(&pn, &y2);
+    // Blocks 19/21: gain-scaled excitation.
+    let (et, nlset) = excitation(&result, gain, nlsgain);
+
+    CoderOutput { result, et, nlset }
+}
+
+// ---------------------------------------------------------------------
 // Small saturation / shift helpers (§G.3 "clip" lines).
 // ---------------------------------------------------------------------
 
@@ -893,6 +970,67 @@ mod tests {
             mismatches <= trials / 20,
             "too many shape-index mismatches: {mismatches}/{trials}"
         );
+    }
+
+    // --- End-to-end §G.3 coder driver -----------------------------
+
+    #[test]
+    fn encode_vector_chain_agrees_with_float_search_identity_cascade() {
+        // With the identity cascade (all predictor coefficients zero ⇒
+        // H = unit impulse) and unit gain, encode_vector must reproduce
+        // the floating-point coder's shape decision for a deterministic
+        // target sweep, end-to-end through all of blocks 11 → 21.
+        use crate::codebook_search::CodebookSearch;
+
+        let float_search = CodebookSearch::new();
+        let zero = [0i16; IDIM + 1];
+
+        let mut state: u64 = 0x0f1e_2d3c_4b5a_6978;
+        let mut mismatches = 0;
+        let trials = 256;
+        for _ in 0..trials {
+            // SW − ZIR = TARGET in Q2; pick SW directly, ZIR = 0.
+            let mut sw = [0i16; IDIM];
+            let mut target_f = [0f64; IDIM];
+            for k in 0..IDIM {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let v = ((state >> 40) as i32 & 0x3ff) - 512; // [-512, 511] Q2
+                sw[k] = v as i16;
+                target_f[k] = v as f64 / 4.0; // Q2 → real
+            }
+            let zir = [0i16; IDIM];
+
+            // Gain = 1.0 (mantissa 16384, NLSGAIN = 14).
+            let out = encode_vector(&sw, &zir, &zero, &zero, &zero, 16384, 14);
+            let fr = float_search.search(&target_f, 1.0);
+
+            if (out.result.is - 1) as u8 != fr.shape_index {
+                mismatches += 1;
+            }
+            // ICHAN must always be a valid 10-bit field.
+            assert!(out.result.ichan < 1024);
+        }
+        assert!(
+            mismatches <= trials / 20,
+            "too many end-to-end shape mismatches: {mismatches}/{trials}"
+        );
+    }
+
+    #[test]
+    fn encode_vector_excitation_matches_standalone_excitation() {
+        // The driver's ET must equal calling excitation() directly with
+        // the driver's own SearchResult and gain — i.e. the chaining is
+        // faithful, not silently re-deriving a different index.
+        let mut sw = [0i16; IDIM];
+        for k in 0..IDIM {
+            sw[k] = (k as i16 - 2) * 80;
+        }
+        let zir = [0i16; IDIM];
+        let zero = [0i16; IDIM + 1];
+        let out = encode_vector(&sw, &zir, &zero, &zero, &zero, 16384, 14);
+        let (et, nlset) = excitation(&out.result, 16384, 14);
+        assert_eq!(out.et, et);
+        assert_eq!(out.nlset, nlset);
     }
 
     #[test]
