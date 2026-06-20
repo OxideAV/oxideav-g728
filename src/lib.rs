@@ -207,6 +207,7 @@ use oxideav_core::RuntimeContext;
 
 pub mod agc;
 pub mod annex_g_arith;
+pub mod annex_g_codebook;
 pub mod annex_g_gain;
 pub mod annex_g_levinson;
 pub mod bitstream;
