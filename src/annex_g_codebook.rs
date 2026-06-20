@@ -14,8 +14,8 @@
 //! | G.3.6  | 13    | [`time_reversed_convolution`] — `PN` |
 //! | G.3.7  | 14/15 | [`codevector_energy`] — `Y2[j]` |
 //! | G.3.8  | 16    | [`normalize_target`] — `TARGET / GAIN` |
-//! | G.3.9  | 17/18 | `search` — best `(IS, IG)`, `ICHAN` (next) |
-//! | G.3.10 | 19/21 | `excitation` — `ET = GAIN·GQ·Y` (next) |
+//! | G.3.9  | 17/18 | [`search`] — best `(IS, IG)`, `ICHAN` |
+//! | G.3.10 | 19/21 | [`excitation`] — `ET = GAIN·GQ·Y` |
 //!
 //! All arithmetic is built on the §G.1.3 primitives in
 //! [`crate::annex_g_arith`] ([`rnd`](crate::annex_g_arith::rnd),
@@ -38,7 +38,7 @@
 //! [`crate::codebook_search`]; this module is the §G.3 fixed-point
 //! reformulation and is self-contained: it introduces no codec state.
 
-use crate::annex_g_arith::{divide, vscale};
+use crate::annex_g_arith::{divide, rnd, vscale};
 use crate::consts::{IDIM, NCWD, NG};
 use crate::tables::Y_Q11;
 
@@ -368,6 +368,157 @@ pub fn normalize_target(target: &[i16; IDIM], gain: i16, nlsgain: i32) -> ([i16;
 }
 
 // ---------------------------------------------------------------------
+// §G.3.9 — Blocks 17 / 18: VQ search error calculator + best index.
+// ---------------------------------------------------------------------
+
+/// Result of the §G.3.9 codebook search: the 1-based shape index `is`
+/// (`1 … NCWD`), the 1-based gain index `ig` (`1 … NG`), and the
+/// packed 10-bit channel index `ichan = (IS − 1)·NG + (IG − 1)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchResult {
+    /// 1-based best shape codebook index `IS` (`1 … NCWD`).
+    pub is: usize,
+    /// 1-based best gain codebook index `IG` (`1 … NG`).
+    pub ig: usize,
+    /// Packed 10-bit channel index `(IS − 1)·NG + (IG − 1)`.
+    pub ichan: u16,
+}
+
+/// Blocks 17 / 18 (§G.3.9) — VQ search error calculator and best
+/// codebook index selector.
+///
+/// For each of the `NCWD` shape codevectors this computes the inner
+/// product `P_j = Σ_k PN(K)·Y(J1+K)`, picks the best gain level for its
+/// magnitude via the `GB` cell boundaries, evaluates the distortion
+/// `D = GSQ(IG)·Y2 − G2(IG)·|P_j|`, and tracks the minimum. After the
+/// loop the sign of the winning inner product selects between the
+/// positive (`IG`) and sign-mirrored negative (`IG + 4`) gain level.
+///
+/// The fixed-point code (per §G.3.9) uses the *absolute value* of the
+/// correlation during the search to avoid a branch in the inner loop,
+/// then re-derives the sign once at the end. `pn` is the `Q7` array
+/// from block 13; `y2` is the `NLSY2 = 5` energy array from block
+/// 14/15. Returns the [`SearchResult`].
+#[must_use]
+pub fn search(pn: &[i16; IDIM], y2: &[i16; NCWD]) -> SearchResult {
+    // DISTM = largest representable (double precision).
+    let mut distm: i64 = i64::from(i32::MAX);
+    let mut ig: usize = 1; // 1-based positive gain index
+    let mut is: usize = 1; // 1-based shape index
+
+    for j in 0..NCWD {
+        // AA0 = Σ PN(K)·Y(J1+K). NLS for AA0 is 7 + 11 = 18.
+        let mut aa0: i64 = 0;
+        for k in 0..IDIM {
+            aa0 += pn[k] as i64 * Y_Q11[j][k] as i64;
+        }
+        // Take absolute value (gain search uses |correlation|).
+        if aa0 < 0 {
+            aa0 = -aa0;
+        }
+
+        // IDXG starts at 1 (1-based); bump once per crossed positive
+        // boundary GB(1), GB(2), GB(3). NLS for P is 13 + 5 = 18,
+        // matching AA0's NLS so the comparison is direct.
+        let mut idxg: usize = 1;
+        for kb in 0..(N1 - 1) {
+            let p = GB_Q13[kb] as i64 * y2[j] as i64;
+            if aa0 >= p {
+                idxg += 1;
+            }
+        }
+
+        // AA0 = AA0 >> 14 (NLS 18 → 4), then clip to 16 bits.
+        let mut aa0s = aa0 >> 14;
+        if aa0s > i16::MAX as i64 {
+            aa0s = i16::MAX as i64;
+        }
+
+        // AA1 = GSQ(IDXG)·Y2(J) (NLS 11 + 5 = 16);
+        // P   = G2(IDXG)·AA0   (NLS 12 + 4 = 16).
+        let aa1 = GSQ_Q11[idxg - 1] as i64 * y2[j] as i64;
+        let p = G2_Q12[idxg - 1] as i64 * aa0s;
+        let dist = aa1 - p;
+
+        if dist < distm {
+            distm = dist;
+            ig = idxg;
+            is = j + 1; // store 1-based shape index
+        }
+    }
+
+    // Re-determine the sign of the winning correlation: if it is ≤ 0,
+    // select the sign-mirrored negative gain level IG + 4.
+    let j1 = is - 1; // 0-based winning shape row
+    let mut aa0: i64 = 0;
+    for k in 0..IDIM {
+        aa0 += pn[k] as i64 * Y_Q11[j1][k] as i64;
+    }
+    if aa0 <= 0 {
+        ig += 4;
+    }
+
+    let ichan = ((is - 1) * NG + (ig - 1)) as u16;
+    SearchResult { is, ig, ichan }
+}
+
+// ---------------------------------------------------------------------
+// §G.3.10 — Block 19: excitation VQ codebook + block 21: gain scaling.
+// ---------------------------------------------------------------------
+
+/// Blocks 19 / 21 (§G.3.10) — reconstruct the gain-scaled excitation
+/// `ET(K) = GAIN·GQ(IG)·Y(NN+K)` from the chosen indices.
+///
+/// `result` is the winning [`SearchResult`]; `gain`/`nlsgain` is the
+/// scalar floating-point excitation gain (block 46). The product
+/// `GQ(IG)·GAIN` is normalized to 32 bits (left-shift by `NNGQ(IG)`)
+/// before rounding to a 16-bit `TMP`; the selected shape codevector is
+/// block-floated to 16 bits; the per-sample product is rounded to a
+/// 15-bit `ET`.
+///
+/// Returns `(et, nlset)`: the `IDIM`-length excitation and its NLS.
+#[must_use]
+pub fn excitation(result: &SearchResult, gain: i16, nlsgain: i32) -> ([i16; IDIM], i32) {
+    let ig = result.ig; // 1-based gain index
+    let is = result.is; // 1-based shape index
+
+    // AA0 = GQ(IG)·GAIN (Q13·gain). The §G.3.10 note guarantees AA0 has
+    // NNGQ(IG) leading zeros, so the product fits a 32-bit accumulator
+    // and normalizing by << NNGQ(IG) keeps it in 32 bits. Round to the
+    // upper 16 bits → TMP.
+    let aa0 = (GQ_Q13[ig - 1] * gain as i32) << NNGQ[ig - 1];
+    let tmp = rnd(aa0);
+
+    // NLSAA0 = 13 + NLSGAIN; NLSTMP = NLSAA0 + NNGQ(IG) − 16.
+    let nlsaa0 = 13 + nlsgain;
+    let nlstmp = nlsaa0 + NNGQ[ig - 1] as i32 - 16;
+
+    // Normalize the selected Q11 shape codevector to 16 bits (TEMP).
+    let nn = is - 1; // 0-based shape row
+    let row: [i32; IDIM] = {
+        let mut r = [0i32; IDIM];
+        for k in 0..IDIM {
+            r[k] = Y_Q11[nn][k] as i32;
+        }
+        r
+    };
+    let (temp, nls) = vscale(&row, IDIM, 14);
+
+    // ET(K) = round(TMP·TEMP(K)) — both are 16-bit normalized, so the
+    // product has one leading zero; rounding to the high word gives a
+    // 15-bit ET.
+    let mut et = [0i16; IDIM];
+    for k in 0..IDIM {
+        let aa0 = tmp as i32 * temp[k];
+        et[k] = rnd(aa0);
+    }
+
+    // NLSET = NLSTMP + 11 + NLS − 16.
+    let nlset = nlstmp + 11 + nls - 16;
+    (et, nlset)
+}
+
+// ---------------------------------------------------------------------
 // Small saturation / shift helpers (§G.3 "clip" lines).
 // ---------------------------------------------------------------------
 
@@ -590,6 +741,179 @@ mod tests {
                 (got - want).abs() < 1e-2,
                 "normalize_target[{k}]: got {got}, want {want}"
             );
+        }
+    }
+
+    // --- §G.3.9 Blocks 17/18 --------------------------------------
+
+    #[test]
+    fn search_picks_codevector_aligned_with_target() {
+        // Build a PN that is a positive multiple of one shape
+        // codevector's Q11 row. The inner product with that row is the
+        // largest positive correlation, so the search should select it
+        // (IS = that 1-based index) with a positive gain (IG ≤ N1).
+        let want_is0 = 17usize; // 0-based target row
+        let mut pn = [0i16; IDIM];
+        for k in 0..IDIM {
+            // Scale the Q11 row into the PN range, staying within i16.
+            pn[k] = Y_Q11[want_is0][k] / 4;
+        }
+        let h = {
+            let mut hh = [0i16; IDIM];
+            hh[0] = 8192;
+            hh
+        };
+        let y2 = codevector_energy(&h);
+        let r = search(&pn, &y2);
+        assert_eq!(r.is, want_is0 + 1, "selected shape index");
+        // Positive correlation ⇒ positive gain half (IG in 1..=N1).
+        assert!(r.ig <= N1, "expected positive gain, got IG = {}", r.ig);
+        assert_eq!(r.ichan, ((r.is - 1) * NG + (r.ig - 1)) as u16);
+    }
+
+    #[test]
+    fn search_negated_target_flips_gain_sign() {
+        // Negating PN flips the sign of every correlation, so the same
+        // shape is selected but with the sign-mirrored negative gain
+        // level (IG bumped by 4).
+        let want_is0 = 42usize;
+        let mut pn = [0i16; IDIM];
+        for k in 0..IDIM {
+            pn[k] = -(Y_Q11[want_is0][k] / 4);
+        }
+        let h = {
+            let mut hh = [0i16; IDIM];
+            hh[0] = 8192;
+            hh
+        };
+        let y2 = codevector_energy(&h);
+        let r = search(&pn, &y2);
+        assert_eq!(r.is, want_is0 + 1, "selected shape index");
+        assert!(r.ig > N1, "expected negative gain, got IG = {}", r.ig);
+    }
+
+    #[test]
+    fn search_ichan_is_in_range() {
+        // For an arbitrary PN the packed index must always fit the
+        // 10-bit channel field (0 ..= 1023).
+        let pn = [123i16, -456, 789, -321, 654];
+        let h = {
+            let mut hh = [0i16; IDIM];
+            hh[0] = 8192;
+            hh
+        };
+        let y2 = codevector_energy(&h);
+        let r = search(&pn, &y2);
+        assert!(r.ichan < 1024, "ICHAN out of 10-bit range: {}", r.ichan);
+        assert!((1..=NCWD).contains(&r.is));
+        assert!((1..=NG).contains(&r.ig));
+    }
+
+    // --- §G.3.10 Blocks 19/21 -------------------------------------
+
+    #[test]
+    fn excitation_reconstructs_gain_scaled_shape() {
+        // With GAIN = 1.0 (mantissa 16384, NLSGAIN = 14) and a chosen
+        // positive gain index, ET should be ≈ GQ(IG)·Y(IS) in real
+        // value. Cross-check the reconstructed real ET against the
+        // floating-point GQ·Y product to a small tolerance.
+        let result = SearchResult {
+            is: 10,
+            ig: 2,
+            ichan: ((10 - 1) * NG + (2 - 1)) as u16,
+        };
+        let (et, nlset) = excitation(&result, 16384, 14);
+        let gq = crate::tables::GQ[result.ig - 1];
+        for k in 0..IDIM {
+            let got = et[k] as f64 / (1i64 << nlset) as f64;
+            let y = Y_Q11[result.is - 1][k] as f64 / 2048.0;
+            let want = gq * y;
+            assert!((got - want).abs() < 5e-3, "ET[{k}]: got {got}, want {want}");
+        }
+    }
+
+    // --- Cross-equivalence with the floating-point search --------
+
+    #[test]
+    fn fixed_point_search_agrees_with_float_on_shape_index() {
+        // The §G.3.9 fixed-point reformulation must reproduce the
+        // decisions of the existing floating-point coder
+        // ([`crate::codebook_search`]). Drive both from the cold-start
+        // identity cascade (H = unit impulse) so PN(k) = TARGET(k) and
+        // Y2[j] = E_j, then feed a deterministic sweep of target
+        // vectors and assert the selected *shape* index matches.
+        //
+        // The gain index can legitimately differ by one level for
+        // targets that land within a Q-quantum of a gain-cell boundary
+        // (the float path uses exact GB, the fixed path the Q13 GB), so
+        // the strong invariant asserted here is shape-index agreement,
+        // which is what dominates perceived quality.
+        use crate::codebook_search::CodebookSearch;
+
+        let float_search = CodebookSearch::new();
+        let mut h = [0i16; IDIM];
+        h[0] = 8192; // unit impulse, Q13
+        let y2_fixed = codevector_energy(&h);
+
+        // Deterministic LCG target sweep; values chosen well inside the
+        // Q2 range so no clipping occurs and both paths see the same
+        // real-valued target.
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        let mut mismatches = 0;
+        let trials = 256;
+        for _ in 0..trials {
+            // PN / TARGET in Q7 for the fixed path (identity H ⇒
+            // PN = TARGET), and the matching real value for the float.
+            let mut pn = [0i16; IDIM];
+            let mut target_f = [0f64; IDIM];
+            for k in 0..IDIM {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let v = ((state >> 40) as i32 & 0x1fff) - 4096; // [-4096, 4095]
+                pn[k] = v as i16;
+                // PN is Q7, so the real target value is v / 128.
+                target_f[k] = v as f64 / 128.0;
+            }
+
+            // Gain = 1.0 for both. (The float search divides the target
+            // by GAIN before the inner product; with GAIN = 1 the
+            // normalized target equals the raw target.)
+            let fr = float_search.search(&target_f, 1.0);
+
+            // Fixed path: PN already Q7, Y2 from block 14/15.
+            let xr = search(&pn, &y2_fixed);
+
+            // Float shape_index is 0-based; fixed `is` is 1-based.
+            if (xr.is - 1) as u8 != fr.shape_index {
+                mismatches += 1;
+            }
+        }
+        // Allow a small number of near-boundary disagreements; the bulk
+        // must agree, proving the reformulation tracks the float coder.
+        assert!(
+            mismatches <= trials / 20,
+            "too many shape-index mismatches: {mismatches}/{trials}"
+        );
+    }
+
+    #[test]
+    fn excitation_negative_gain_flips_sign() {
+        // A negative gain index (IG in N1+1..=NG) yields a sign-flipped
+        // excitation relative to the matching positive index.
+        let pos = SearchResult {
+            is: 5,
+            ig: 3,
+            ichan: 0,
+        };
+        let neg = SearchResult {
+            is: 5,
+            ig: 3 + 4,
+            ichan: 0,
+        };
+        let (ep, np) = excitation(&pos, 16384, 14);
+        let (en, nn) = excitation(&neg, 16384, 14);
+        assert_eq!(np, nn, "matching positive/negative NLS");
+        for k in 0..IDIM {
+            assert_eq!(ep[k], -en[k], "ET sign flip at {k}");
         }
     }
 }
