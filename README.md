@@ -61,6 +61,22 @@ Implemented end-to-end:
   after an erasure, plus `GainGrowthLimiter` driving the §I.5.1
   `AFTERFE` / `FECOUNT` / `OGAINDB` bookkeeping (clamp lasts the erasure
   length, saturated at `AFTERFEMAX = 16` cycles = 40 ms).
+- **Annex G §G.3 fixed-point coder** (`annex_g_codebook`) — the
+  bit-exact fixed-point analysis-by-synthesis codebook search of
+  blocks 11 – 21, transcribed from the §G.3.4 – §G.3.10 pseudo-code one
+  sub-clause at a time: block 11 VQ target (`Q2`), block 12 cascade
+  impulse response `H` (`Q13`, combined-accumulator `>> 14`), block 13
+  time-reversed convolution `PN` (`NLSPN = 7`), block 14/15
+  filtered-shape energies `Y2` (`NLSY2 = 5`), block 16 target
+  normalization via `DIVIDE` + `VSCALE`, block 17/18 `|correlation|`
+  gain decision + double-precision distortion search + end-of-loop
+  sign re-derivation, and block 19/21 gain-scaled excitation `ET` with
+  the `NNGQ`-normalized `GQ·GAIN` product. The `encode_vector` driver
+  chains all blocks for one vector. The §G.5/§G.3.9 Q-format gain
+  tables (`GQ_Q13`, `GB_Q13`, `G2_Q12`, `GSQ_Q11`, `NNGQ`) are
+  const-derived and cross-checked against the float tables; the search
+  is proven to track the floating-point `codebook_search` shape
+  decisions over a 256-target sweep on the identity cascade.
 
 ### Not yet implemented
 
@@ -85,9 +101,13 @@ Implemented end-to-end:
   `NLSATMP = 15 − NRS` precision signal to the bandwidth-expansion
   module, the `ILLCOND` / `ILLCONDP` ill-conditioning flags, and the
   decoder `MINC0 = 10` restart — proven against the floating-point
-  `levinson` reference and with a bit-exact resume-vs-one-shot test. The
-  §G.3 per-block fixed-point pseudo-code that builds on this foundation
-  remains deferred behind the floating-point build.
+  `levinson` reference and with a bit-exact resume-vs-one-shot test.
+  The §G.3 fixed-point **coder** (analysis-by-synthesis codebook
+  search) is now landed in the `annex_g_codebook` module (see the
+  Implemented section); the remaining §G.3 per-block modules (the
+  decoder synthesis filter / hybrid-window / postfilter blocks 32 / 36 /
+  43 / 45 / 46 / 49 / 71–85) stay deferred behind the floating-point
+  build.
 
 ## Usage
 
