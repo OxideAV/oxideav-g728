@@ -77,6 +77,33 @@ Implemented end-to-end:
   const-derived and cross-checked against the float tables; the search
   is proven to track the floating-point `codebook_search` shape
   decisions over a 256-target sweep on the identity cascade.
+- **Annex G §G.3.11 fixed-point decoder synthesis filter**
+  (`annex_g_decoder`) — block 32, the 50th-order LPC synthesis filter
+  `1/A(z)` reconstructing the quantized-speech vector `ST` from the
+  gain-scaled excitation `ET`. `SynthesisFilterFixed` holds `STATELPC`
+  in segmented block-floating-point form (one shared NLS per
+  `IDIM`-sample segment, `NLSSTATE[1..=10]` init 16 + scratch min slot)
+  and runs the four §G.3.11 phases in lockstep — the zero-input
+  "ringing" response with per-segment memory shift, the
+  `VSCALE`-to-15-bit re-normalization, the zero-state response of `ET`
+  with the `AA0 << 3` overflow probe + `LABEL1` retry, and the
+  three-case `LABEL2` alignment that sums ZIR + ZSR, clips to `±4095` at
+  segment scale, `VSCALE`s to 14 bits, and reverses the top `IDIM` taps
+  into `ST`. Cross-checked against an in-test transcription of the
+  §G.3.11 floating-point pseudo-code.
+- **Annex G §G.3.20–§G.3.23 fixed-point adaptive postfilter**
+  (`annex_g_postfilter`) — the decoder's bit-exact postfilter chain
+  (blocks 71 – 77). `PostfilterFixed::filter_vector` runs the long-term
+  pitch postfilter (`GL` Q14 / `GLB` Q16 / lag `KP` over the Q2/Q0 `SST`
+  buffer) cascaded with the short-term all-zero (`AZ` Q14), all-pole
+  (`AP` Q14) and spectral-tilt (`TILTZ` Q14) postfilter (blocks 71/72,
+  combined per §G.3.20 with Q2 `STPFFIR`/`STPFIIR` memory), the
+  sum-of-absolute-value calculators (73/74), the `SCALE = SUMUNFIL /
+  SUMFIL` ratio via the §G.1.3.4 `DIVIDE` (75), and the first-order
+  low-pass + output gain scaling (76/77, `SCALEFIL` Q14 init 16384,
+  `AGCFAC = 16220` Q14 / `AGCFAC1 = 20972` Q21) yielding the
+  postfiltered vector `SPF` (Q2). Cross-checked against an in-test
+  transcription of the §G.3.20 floating-point short-term postfilter.
 
 ### Not yet implemented
 
@@ -103,11 +130,15 @@ Implemented end-to-end:
   decoder `MINC0 = 10` restart — proven against the floating-point
   `levinson` reference and with a bit-exact resume-vs-one-shot test.
   The §G.3 fixed-point **coder** (analysis-by-synthesis codebook
-  search) is now landed in the `annex_g_codebook` module (see the
-  Implemented section); the remaining §G.3 per-block modules (the
-  decoder synthesis filter / hybrid-window / postfilter blocks 32 / 36 /
-  43 / 45 / 46 / 49 / 71–85) stay deferred behind the floating-point
-  build.
+  search), the §G.3.11 decoder **synthesis filter** (block 32), and the
+  §G.3.20–§G.3.23 adaptive **postfilter** (blocks 71–77) are now landed
+  in the `annex_g_codebook` / `annex_g_decoder` / `annex_g_postfilter`
+  modules (see the Implemented section). The remaining §G.3 per-block
+  modules — the hybrid-window / bandwidth-expansion / log-gain backward
+  adaptation (blocks 36 / 43 / 45 / 46 / 49 / 51) and the postfilter
+  *coefficient* calculators (block 81 LPC inverse, 82 pitch extraction,
+  83 pitch tap, 84 long-term coeff, 85 short-term coeff) — stay deferred
+  behind the floating-point build.
 
 ## Usage
 

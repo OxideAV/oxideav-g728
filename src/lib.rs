@@ -211,6 +211,7 @@ pub mod annex_g_codebook;
 pub mod annex_g_decoder;
 pub mod annex_g_gain;
 pub mod annex_g_levinson;
+pub mod annex_g_postfilter;
 pub mod bitstream;
 pub mod codebook_search;
 pub mod consts;
@@ -241,6 +242,10 @@ pub use annex_g_gain::{gain_log_db, offset_removed_log_gain, shape_log_db, DELTA
 pub use annex_g_levinson::{
     levinson_durbin_fixed, levinson_durbin_fixed_resume, simpdiv, LevinsonInput, LevinsonStatus,
     RecursionResume,
+};
+pub use annex_g_postfilter::{
+    scale_factor, LongTermCoeff, PostfilterFixed, ShortTermCoeff, AGCFAC1_Q21, AGCFAC_Q14,
+    PF_ORDER, SCALEFIL_INIT_Q14,
 };
 pub use bitstream::{pack_indices, unpack_indices};
 pub use codebook_search::{CodebookSearch, SearchResult};

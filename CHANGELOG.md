@@ -6,6 +6,31 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Annex G §G.3.20–§G.3.23 fixed-point adaptive postfilter (r358)** —
+  new `annex_g_postfilter` module lands the decoder's bit-exact
+  fixed-point postfilter chain (blocks 71 – 77), the final §4.7/G.728
+  stage applied to the reconstructed speech. `PostfilterFixed::
+  filter_vector` runs, per `IDIM`-sample vector: blocks 71/72 (combined
+  per §G.3.20) — the long-term pitch postfilter (`GL` Q14, `GLB = GL·B`
+  Q16, lag `KP`, reading the Q2/Q0 decoded-speech buffer `SST`) cascaded
+  with the short-term all-zero FIR (`AZ` Q14), all-pole IIR (`AP` Q14),
+  and spectral-tilt (`TILTZ` Q14) postfilter (`STPFFIR`/`STPFIIR` memory
+  Q2); blocks 73/74 — the sums of absolute values of decoded and
+  filtered speech; block 75 (`scale_factor`) — their ratio `SCALE` in
+  scalar-float form via the §G.1.3.4 `DIVIDE` (with the `SUMFIL ≤ 4 ⇒
+  SCALE = 1` guard); blocks 76/77 — the first-order low-pass of `SCALE`
+  (`SCALEFIL` Q14 init 16384, `AGCFAC = 16220` Q14 / `AGCFAC1 = 20972`
+  Q21) and the output gain scaling to the postfiltered vector `SPF`
+  (Q2). The §G.4 Table G.1/G.728 fixed-point constants are transcribed
+  verbatim. An in-test transcription of the §G.3.20 *floating-point*
+  short-term postfilter is the cross-check oracle (tracked within the
+  block's stated precision across a multi-vector sweep). **Docs note:**
+  the §G.3.20 fixed-point all-pole memory store renders literally as
+  `AA0 = AA0 >> 14; STPFIIR(1) = AA0`, but `AA0` there holds
+  `longterm << 2`, not the all-pole output; the §G.3.20 floating-point
+  pseudo-code on the same page (`STPFIIR(1) = TEMP(K)`, the all-pole
+  output before tilt) and the stated Q-formats force the source to be
+  the Q16 accumulator `AA1` — implemented as `STPFIIR(1) = AA1 >> 14`.
 - **Annex G §G.3.11 fixed-point decoder synthesis filter (r358)** — new
   `annex_g_decoder` module lands block 32, the 50th-order LPC decoder
   synthesis filter `1/A(z)`, as the first fixed-point **decoder** block
