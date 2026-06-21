@@ -6,6 +6,29 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Annex G §G.3.11 fixed-point decoder synthesis filter (r358)** — new
+  `annex_g_decoder` module lands block 32, the 50th-order LPC decoder
+  synthesis filter `1/A(z)`, as the first fixed-point **decoder** block
+  (the prior Annex G work covered the §G.2 gain adapter / Levinson and
+  the §G.3.4–§G.3.10 coder search). `SynthesisFilterFixed::synthesize`
+  drives one gain-scaled excitation vector `ET` (15-bit block-floating,
+  `NLSET`) through the filter to reconstruct the quantized-speech vector
+  `ST` (14-bit block-floating, `NLSST`). The `STATELPC` 50-tap memory is
+  held in segmented block-floating-point form with one shared left-shift
+  per `IDIM`-sample segment (`NLSSTATE[1..=10]`, init 16, plus the
+  scratch running-minimum slot 11). The four §G.3.11 phases are
+  transcribed in lockstep: (A) the zero-input "ringing" response with the
+  per-segment memory shift and `NLSSTATE`-aligned accumulation, (B) the
+  `VSCALE`-to-15-bit re-normalization that refreshes `NLSSTATE`, (C) the
+  zero-state response of `ET` with the `AA0 << 3` overflow probe and the
+  "halve `ET`, drop `NLSET`, restart `LABEL1`" retry, and (D) the
+  three-case `LABEL2` alignment that sums ZIR + ZSR, clips the synthesis
+  memory to `±4095` at segment scale, `VSCALE`s to 14 bits, and reverses
+  the top `IDIM` taps into `ST`. Built on the §G.1.3 `vscale` /
+  `shl_sat` / `shr_sat` primitives in `annex_g_arith`; an in-test
+  transcription of the §G.3.11 *floating-point* pseudo-code is the
+  cross-check oracle (identity-filter pass-through and a first-order
+  all-pole filter tracked within the annex's stated precision).
 - **Annex G §G.2.2 fixed-point Levinson-Durbin recursion (r337)** — new
   `annex_g_levinson` module lands the §G.2.2 bit-exact reformulation of
   the three Levinson-Durbin modules (block 50 synthesis filter, block 37
