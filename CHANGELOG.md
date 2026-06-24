@@ -6,6 +6,52 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Annex G §G.3.17–§G.3.19 fixed-point backward synthesis-filter adapter
+  (r367)** — new `annex_g_synth_adapter` module lands the fixed-point
+  reformulation of the decoder's backward synthesis-filter adaptation
+  chain (blocks 49 / HWMCORE / 51), the fixed-point analogue of the
+  floating-point `synthesis_adapter`. `SynthAdapterFixed::adapt` runs one
+  adaptation cycle: **block 49** (§G.3.17) applies the Q15 hybrid window
+  `WNR` to the segmented-block-floating-point (SBFL) signal buffer `SB` of
+  past quantized speech — shifting in the four newest `ST` segments with
+  their per-segment `NLSSB`, finding the common minimum shift `NLSTMP`,
+  aligning each segment via the `NRSH = NLSSB(J) − NLSTMP − 1` per-segment
+  shift (with the `NRSH = −1 ⇒ P << 1` Q15-multiplication compensation),
+  and rounding the products into the BFL windowed signal `WS`. **HWMCORE**
+  (§G.3.18) accumulates the recursive autocorrelation component (3/4 decay
+  realised as `−RREC << NLSATT50(=14) + RREC << 16`) and the non-recursive
+  component across the three `NLSRREC`-vs-`NLSAA0` alignment cases, applies
+  the `>> 8` white-noise correction (`257/256`) to `R(1)`, `VSCALE`-
+  normalizes against `MLS = 30`, and emits `RTMP(1..=LPC+1)` (BFL, 16-bit)
+  plus the `ILLCOND` verdict (the full 32-bit `R(LPC+1)` accumulator being
+  zero — the §G.2.2 interoperability fix that moves the zero-test upstream
+  of the 16-bit-rounded Levinson input). **Block 50** is the already-
+  landed §G.2.2 `levinson_durbin_fixed`. **Block 51** (§G.3.19) bandwidth-
+  expands `ATMP` (Q13/Q14/Q15 per `NLSATMP`) by `FACV` into the live Q14
+  predictor `A`, shifting to `Q30` (`<< 3 / 2 / 1` for `NLSATMP =
+  13 / 14 / 15`) before `RND`, and keeps the previous cycle's `A` on
+  `ILLCOND` or a Q14 overflow (the §G.3.19 `LABEL` "do not update" path).
+  The produced Q14 `A` array is exactly the coefficient set the §G.3.11
+  block-32 fixed-point synthesis filter (`SynthesisFilterFixed`) consumes,
+  closing the fixed-point decoder's backward-adaptation loop. New
+  `consts`: `N1` / `N2` / `N3` / `N4` / `N5` / `N6` (the §G.3.17 buffer
+  dimensions 70 / 85 / 105 / 21 / 4 / 17), `NLSATT50 = 14`, `NLSSB_INIT`.
+  Public surface: `SynthAdapterFixed`, `StSegment` (one 14-bit BFL `ST`
+  segment + its `NLS`), `HwmcoreOut`. 11 module tests: fresh all-pass
+  predictor, the §G.3.17 buffer dimensions, the SBFL shift-in of new
+  segments at the `SB` tail, zero-input ⇒ `ILLCOND` ⇒ all-pass preserved,
+  a broadband-input end-to-end drive that completes the §G.2.2 Levinson
+  and commits a non-trivial Q14 predictor once the `N3 = 105`-sample
+  hybrid-window history fills, block-51 `FACV·ATMP` scaling + `ILLCOND`
+  decline, and an autocorrelation-shape cross-check against the §G.3.17
+  *floating-point* hybrid window (`hybrid_window::HybridWindowState`) on
+  the same requantized speech (normalized `R(k)/R(1)` tracked within the
+  BFL-arithmetic tolerance). Floating-point build still drives the live
+  codec; this is the §G.3 fixed-point variant. **Docs note:** the
+  §G.3.18 Case-2/3 recursive-tap lines read `AA1 = RREC << NLSATT`, then
+  `AA1 = −AA1 + RREC << 16` (negated), matching the `I = 0` line; only
+  Case-1's recursive *taps* use the un-negated `AA1 = AA1 + RREC << 16`
+  (the `I = 0` Case-1 line stays negated). Total crate tests: 385 → 396.
 - **Annex G §G.3.20–§G.3.23 fixed-point adaptive postfilter (r358)** —
   new `annex_g_postfilter` module lands the decoder's bit-exact
   fixed-point postfilter chain (blocks 71 – 77), the final §4.7/G.728

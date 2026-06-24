@@ -104,6 +104,25 @@ Implemented end-to-end:
   `AGCFAC = 16220` Q14 / `AGCFAC1 = 20972` Q21) yielding the
   postfiltered vector `SPF` (Q2). Cross-checked against an in-test
   transcription of the §G.3.20 floating-point short-term postfilter.
+- **Annex G §G.3.17–§G.3.19 fixed-point backward synthesis-filter adapter**
+  (`annex_g_synth_adapter`) — the decoder's bit-exact backward LPC
+  adaptation chain (blocks 49 / HWMCORE / 51), the fixed-point analogue of
+  the floating-point `synthesis_adapter`. `SynthAdapterFixed::adapt` runs
+  block 49 (the segmented-block-floating-point hybrid window on past
+  quantized speech `SB`, with the `NRSH` per-segment alignment to the
+  common `NLSTMP` and the Q15-window-multiply `−1` compensation), HWMCORE
+  (the recursive 3/4-decay + non-recursive autocorrelation accumulation
+  across the three `NLSRREC`-vs-`NLSAA0` alignment cases, the `>> 8`
+  white-noise correction, the `VSCALE`/`MLS = 30` normalization, and the
+  32-bit `R(LPC+1) = 0` `ILLCOND` interoperability test), block 50 (the
+  §G.2.2 `levinson_durbin_fixed`), and block 51 (`FACV` bandwidth
+  expansion to the live Q14 predictor `A`, with the `NLSATMP`-driven
+  `<< 3/2/1 → Q30` shift and the keep-old-`A`-on-overflow/`ILLCOND`
+  path). The emitted Q14 `A` is exactly the coefficient set the §G.3.11
+  block-32 fixed-point synthesis filter consumes — closing the fixed-point
+  decoder's backward-adaptation loop. Cross-checked against the §G.3.17
+  floating-point hybrid window (`HybridWindowState`) on identical
+  requantized speech.
 
 ### Not yet implemented
 
@@ -133,12 +152,17 @@ Implemented end-to-end:
   search), the §G.3.11 decoder **synthesis filter** (block 32), and the
   §G.3.20–§G.3.23 adaptive **postfilter** (blocks 71–77) are now landed
   in the `annex_g_codebook` / `annex_g_decoder` / `annex_g_postfilter`
-  modules (see the Implemented section). The remaining §G.3 per-block
-  modules — the hybrid-window / bandwidth-expansion / log-gain backward
-  adaptation (blocks 36 / 43 / 45 / 46 / 49 / 51) and the postfilter
-  *coefficient* calculators (block 81 LPC inverse, 82 pitch extraction,
-  83 pitch tap, 84 long-term coeff, 85 short-term coeff) — stay deferred
-  behind the floating-point build.
+  modules (see the Implemented section). The synthesis-filter backward
+  adaptation chain (block 49 hybrid window, HWMCORE, block 51 bandwidth
+  expansion) is now landed in the `annex_g_synth_adapter` module (see the
+  Implemented section), closing the fixed-point decoder's backward
+  adaptation loop with the already-landed §G.3.11 block-32 synthesis
+  filter. The remaining §G.3 per-block modules — the *perceptual
+  weighting* and *log-gain* backward adaptation (blocks 36 / 43 / 45 / 46,
+  which reuse the same HWMCORE core with the LPCW / LPCLG dimensions) and
+  the postfilter *coefficient* calculators (block 81 LPC inverse, 82 pitch
+  extraction, 83 pitch tap, 84 long-term coeff, 85 short-term coeff) —
+  stay deferred behind the floating-point build.
 
 ## Usage
 
