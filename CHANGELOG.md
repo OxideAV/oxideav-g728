@@ -52,6 +52,23 @@ All notable changes to this project will be documented in this file.
   `AA1 = −AA1 + RREC << 16` (negated), matching the `I = 0` line; only
   Case-1's recursive *taps* use the un-negated `AA1 = AA1 + RREC << 16`
   (the `I = 0` Case-1 line stays negated). Total crate tests: 385 → 396.
+- **Annex G §G.3.15 fixed-point log-gain bandwidth expansion (block 45)
+  + shared expansion core (r367)** — the §G.3.15 and §G.3.19 bandwidth-
+  expansion modules (blocks 45 and 51) have identical fixed-point
+  structure, so the block-51 body is factored into a shared
+  `bandwidth_expand_q14(coeff, fac, nlsatmp)` function: scale each tap
+  `2..=order+1` by the Q14 broadening table, shift the `Q27/Q28/Q29`
+  product up to `Q30` per the Levinson `NLSATMP` (`<< 3 / 2 / 1` for
+  `Q13/Q14/Q15`), `RND` the high word to `Q14`, and return `None` (keep
+  the previous coefficients) on a `Q14` overflow or out-of-range
+  `NLSATMP`. `log_gain_bandwidth_expand(gptmp, nlsgptmp, illcondg)` is the
+  block-45 wrapper — the `LPCLG = 10`-order log-gain predictor expansion
+  with the `FACGPV` table, gated by the log-gain ill-conditioning flag
+  `ILLCONDG` — the gain-adapter analogue of block 51 (committed at
+  `ICOUNT = 2` vs block 51's `ICOUNT = 3`). 4 new tests: the shared helper
+  reproduces block 51 tap-for-tap, declines on bad `NLSATMP`, the
+  `FACGPV·GPTMP` block-45 scaling, and the `ILLCONDG` decline. Total crate
+  tests: 396 → 400.
 - **Annex G §G.3.20–§G.3.23 fixed-point adaptive postfilter (r358)** —
   new `annex_g_postfilter` module lands the decoder's bit-exact
   fixed-point postfilter chain (blocks 71 – 77), the final §4.7/G.728

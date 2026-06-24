@@ -57,8 +57,8 @@
 
 use crate::annex_g_arith::{findnls, rnd, shl_sat, shr_sat};
 use crate::annex_g_levinson::{levinson_durbin_fixed, LevinsonInput, LevinsonStatus};
-use crate::consts::{IDIM, LPC, NFRSZ, NONR};
-use crate::tables::{FACV_Q14, WNR_Q15};
+use crate::consts::{IDIM, LPC, LPCLG, NFRSZ, NONR};
+use crate::tables::{FACGPV_Q14, FACV_Q14, WNR_Q15};
 
 /// `N1 = LPC + NFRSZ = 70` — end of the recursive-component tap range.
 pub const N1: usize = LPC + NFRSZ;
@@ -483,31 +483,88 @@ impl SynthAdapterFixed {
         if status.illcond {
             return;
         }
-        let shift = match status.nlsatmp {
-            13 => 3,
-            14 => 2,
-            15 => 1,
-            // Defensive: out-of-range NLSATMP ⇒ decline the update (the
-            // §G.2.2 NLSATMP < 13 post-check already sets ILLCOND, but a
-            // value > 15 would mean the format assumption is violated).
-            _ => return,
-        };
-
-        let mut new_a = [0i16; LPC + 1];
-        new_a[0] = 1 << 14; // ATMP(1) = 16384 (Q14 unity)
-        for i in 2..=(LPC + 1) {
-            // AA0 = FACV(I) * ATMP(I)  (Q27/Q28/Q29) ; then << shift → Q30.
-            let aa0 = FACV_Q14[i - 1] as i64 * atmp[i - 1] as i64;
-            let aa0 = aa0 << shift;
-            // | If AA0 overflowed above, go to LABEL    | keep old A
-            if aa0 > i32::MAX as i64 || aa0 < i32::MIN as i64 {
-                return; // Q14 overflow ⇒ do not update.
-            }
-            // ATMP(I) = RND(AA0)  → high word is the Q14 coefficient.
-            new_a[i - 1] = rnd(aa0 as i32);
+        if let Some(new_a) = bandwidth_expand_q14(&atmp[..=LPC], &FACV_Q14, status.nlsatmp) {
+            self.a.copy_from_slice(&new_a);
         }
-        self.a = new_a;
+        // Otherwise (ill-conditioned / Q14 overflow / bad NLSATMP) keep
+        // the previous cycle's `A` — the §G.3.19 `LABEL` "do not update".
     }
+}
+
+/// Shared §G.3.15 / §G.3.19 bandwidth-expansion core (blocks 45 and 51).
+///
+/// Both bandwidth-expansion modules have identical fixed-point structure:
+/// scale every tap `2..=order+1` by the broadening table `fac` (Q14),
+/// shift the `Q27/Q28/Q29` product up to `Q30` according to the input
+/// format `NLSATMP` (the Levinson-Durbin output `Q` signal: `<< 3` for
+/// `Q13`, `<< 2` for `Q14`, `<< 1` for `Q15`), and round the high word to
+/// the final `Q14` coefficient. The only differences are the table
+/// (`FACV` vs `FACGPV`), the order (`LPC = 50` vs `LPCLG = 10`) and the
+/// commit timing / ill-conditioning flag, all handled by the caller.
+///
+/// Returns `Some(out)` (an `order + 1`-length Q14 array with `out[0] =
+/// 16384` and `out[i]` the expanded taps) when the expansion succeeds, or
+/// `None` when a `Q14` overflow is detected (`AA0` exceeds the 32-bit
+/// accumulator after the `<< shift`) or `nlsatmp` is outside `13..=15` —
+/// in both cases the §G.3.15 / §G.3.19 `LABEL` rule says keep the previous
+/// cycle's coefficients.
+///
+/// `coeff` is the bandwidth-unexpanded predictor `ATMP` / `GPTMP`
+/// (`coeff[0]` the implicit unity tap in the `nlsatmp` `Q` format,
+/// `coeff[1..=order]` the taps). `fac` must be at least `order + 1` long.
+#[must_use]
+pub fn bandwidth_expand_q14(coeff: &[i16], fac: &[i16], nlsatmp: i32) -> Option<Vec<i16>> {
+    let order = coeff.len() - 1;
+    debug_assert!(fac.len() > order, "FAC table shorter than predictor order");
+    // Make `AA0` Q30 for all three input formats by the appropriate shift.
+    let shift = match nlsatmp {
+        13 => 3,
+        14 => 2,
+        15 => 1,
+        _ => return None,
+    };
+    let mut out = vec![0i16; order + 1];
+    out[0] = 1 << 14; // ATMP(1) / GPTMP(1) = 16384 (Q14 unity)
+    for i in 2..=(order + 1) {
+        // AA0 = FAC(I) * COEFF(I)  (Q27/Q28/Q29) ; then << shift → Q30.
+        let aa0 = fac[i - 1] as i64 * coeff[i - 1] as i64;
+        let aa0 = aa0 << shift;
+        // | If AA0 overflowed above, go to LABEL    | keep old coefficients
+        if aa0 > i32::MAX as i64 || aa0 < i32::MIN as i64 {
+            return None;
+        }
+        // RND(AA0) → high word is the Q14 coefficient.
+        out[i - 1] = rnd(aa0 as i32);
+    }
+    Some(out)
+}
+
+/// §G.3.15 block 45 — fixed-point log-gain bandwidth expansion.
+///
+/// The log-gain predictor's bandwidth-expansion module: structurally
+/// identical to block 51 ([`bandwidth_expand_q14`]) but operating on the
+/// `LPCLG = 10`-order log-gain predictor `GPTMP` with the `FACGPV` table,
+/// committed at `ICOUNT = 2` (vs block 51's `ICOUNT = 3`) and gated by the
+/// log-gain ill-conditioning flag `ILLCONDG`.
+///
+/// Returns `Some(gp)` (the Q14 log-gain predictor `GP(1..=LPCLG+1)`,
+/// `gp[0] = 16384`) on success, or `None` when `illcondg` is set, a `Q14`
+/// overflow occurs, or `nlsgptmp` is outside `13..=15` — the §G.3.15
+/// `LABEL` "keep the previous coefficients" path.
+#[must_use]
+pub fn log_gain_bandwidth_expand(
+    gptmp: &[i16; LPCLG + 1],
+    nlsgptmp: i32,
+    illcondg: bool,
+) -> Option<[i16; LPCLG + 1]> {
+    // | If ILLCONDG = .TRUE., skip the execution of this block.
+    if illcondg {
+        return None;
+    }
+    let out = bandwidth_expand_q14(&gptmp[..=LPCLG], &FACGPV_Q14, nlsgptmp)?;
+    let mut gp = [0i16; LPCLG + 1];
+    gp.copy_from_slice(&out);
+    Some(gp)
 }
 
 /// Output of the §G.3.17 block-49 windowing step.
@@ -544,6 +601,7 @@ fn clamp_i32(v: i64) -> i32 {
 mod tests {
     use super::*;
     use crate::hybrid_window::{HybridWindow, HybridWindowState};
+    use crate::tables::facgpv_f64;
     use crate::tables::{facv_f64, wnr_f64};
 
     /// Build the four SBFL `STTMP` segments from `NFRSZ` float speech
@@ -868,5 +926,77 @@ mod tests {
             a.adapt(&segs);
             assert_eq!(a.predictor()[0], 1 << 14);
         }
+    }
+
+    #[test]
+    fn shared_bandwidth_expand_matches_block51() {
+        // The shared `bandwidth_expand_q14` helper must reproduce block
+        // 51's expansion exactly: drive both through the same ATMP and
+        // assert tap-for-tap equality.
+        let mut atmp = [0i16; LPC + 1];
+        atmp[0] = 1 << 14;
+        atmp[1] = -(1 << 13);
+        atmp[2] = 1 << 12;
+        atmp[7] = 1 << 10;
+        let out = bandwidth_expand_q14(&atmp[..=LPC], &FACV_Q14, 14)
+            .expect("well-formed ATMP must expand");
+        assert_eq!(out.len(), LPC + 1);
+        assert_eq!(out[0], 1 << 14, "unity head");
+        let facv = facv_f64();
+        for i in 2..=8 {
+            let expected = (facv[i - 1] * (atmp[i - 1] as f64 / 16384.0) * 16384.0).round();
+            assert!(
+                (out[i - 1] as f64 - expected).abs() <= 1.0,
+                "tap {i}: {} vs expected {expected}",
+                out[i - 1]
+            );
+        }
+    }
+
+    #[test]
+    fn bandwidth_expand_declines_on_bad_nlsatmp() {
+        // NLSATMP outside 13..=15 ⇒ the format assumption is violated and
+        // the helper returns None (caller keeps the previous coefficients).
+        let mut atmp = [0i16; LPC + 1];
+        atmp[0] = 1 << 14;
+        atmp[1] = 1 << 12;
+        assert!(bandwidth_expand_q14(&atmp[..=LPC], &FACV_Q14, 12).is_none());
+        assert!(bandwidth_expand_q14(&atmp[..=LPC], &FACV_Q14, 16).is_none());
+    }
+
+    #[test]
+    fn log_gain_bandwidth_expand_block45() {
+        // Block 45: the LPCLG = 10-order log-gain expansion with FACGPV.
+        // A well-formed GPTMP expands to a Q14 GP with the unity head and
+        // each tap ≈ FACGPV(I)·GPTMP(I).
+        let mut gptmp = [0i16; LPCLG + 1];
+        gptmp[0] = 1 << 14;
+        gptmp[1] = -(1 << 13); // -0.5 Q14
+        gptmp[2] = 1 << 11; // 0.125 Q14
+        let gp = log_gain_bandwidth_expand(&gptmp, 14, false).expect("expansion must succeed");
+        assert_eq!(gp.len(), LPCLG + 1);
+        assert_eq!(gp[0], 1 << 14, "GP(1) = Q14 unity");
+        let facgpv = facgpv_f64();
+        for i in 2..=3 {
+            let expected = (facgpv[i - 1] * (gptmp[i - 1] as f64 / 16384.0) * 16384.0).round();
+            assert!(
+                (gp[i - 1] as f64 - expected).abs() <= 1.0,
+                "GP({i}) = {} vs expected {expected} (FACGPV·GPTMP)",
+                gp[i - 1]
+            );
+        }
+    }
+
+    #[test]
+    fn log_gain_bandwidth_expand_declines_on_illcondg() {
+        // ILLCONDG ⇒ block 45 returns None (keep the previous log-gain
+        // predictor), regardless of the GPTMP content.
+        let mut gptmp = [0i16; LPCLG + 1];
+        gptmp[0] = 1 << 14;
+        gptmp[1] = -(1 << 13);
+        assert!(
+            log_gain_bandwidth_expand(&gptmp, 14, true).is_none(),
+            "ILLCONDG must decline the update"
+        );
     }
 }

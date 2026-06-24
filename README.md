@@ -122,7 +122,11 @@ Implemented end-to-end:
   block-32 fixed-point synthesis filter consumes — closing the fixed-point
   decoder's backward-adaptation loop. Cross-checked against the §G.3.17
   floating-point hybrid window (`HybridWindowState`) on identical
-  requantized speech.
+  requantized speech. The block-51 expansion is factored into a shared
+  `bandwidth_expand_q14` core that also backs the §G.3.15 block-45
+  log-gain bandwidth expansion (`log_gain_bandwidth_expand`, `FACGPV`,
+  `LPCLG = 10`, `ILLCONDG`-gated) — the first fixed-point piece of the
+  backward *gain* adapter.
 
 ### Not yet implemented
 
@@ -157,12 +161,15 @@ Implemented end-to-end:
   expansion) is now landed in the `annex_g_synth_adapter` module (see the
   Implemented section), closing the fixed-point decoder's backward
   adaptation loop with the already-landed §G.3.11 block-32 synthesis
-  filter. The remaining §G.3 per-block modules — the *perceptual
-  weighting* and *log-gain* backward adaptation (blocks 36 / 43 / 45 / 46,
-  which reuse the same HWMCORE core with the LPCW / LPCLG dimensions) and
-  the postfilter *coefficient* calculators (block 81 LPC inverse, 82 pitch
-  extraction, 83 pitch tap, 84 long-term coeff, 85 short-term coeff) —
-  stay deferred behind the floating-point build.
+  filter. Block 45 (the §G.3.15 log-gain bandwidth expansion) is also
+  landed via the shared `bandwidth_expand_q14` core. The remaining §G.3
+  per-block modules — the *perceptual weighting* and *log-gain* hybrid
+  windows + Levinson wiring (blocks 36 / 43, which reuse the same HWMCORE
+  core with the LPCW / LPCLG dimensions), the §G.3.16 block-46 log-gain
+  linear prediction, and the postfilter *coefficient* calculators
+  (block 81 LPC inverse, 82 pitch extraction, 83 pitch tap, 84 long-term
+  coeff, 85 short-term coeff) — stay deferred behind the floating-point
+  build.
 
 ## Usage
 

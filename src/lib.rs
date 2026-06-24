@@ -248,7 +248,10 @@ pub use annex_g_postfilter::{
     scale_factor, LongTermCoeff, PostfilterFixed, ShortTermCoeff, AGCFAC1_Q21, AGCFAC_Q14,
     PF_ORDER, SCALEFIL_INIT_Q14,
 };
-pub use annex_g_synth_adapter::{HwmcoreOut, StSegment, SynthAdapterFixed, NLSATT50, NLSSB_INIT};
+pub use annex_g_synth_adapter::{
+    bandwidth_expand_q14, log_gain_bandwidth_expand, HwmcoreOut, StSegment, SynthAdapterFixed,
+    NLSATT50, NLSSB_INIT,
+};
 pub use bitstream::{pack_indices, unpack_indices};
 pub use codebook_search::{CodebookSearch, SearchResult};
 pub use decoder::{
