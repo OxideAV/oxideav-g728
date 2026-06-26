@@ -127,6 +127,31 @@ Implemented end-to-end:
   log-gain bandwidth expansion (`log_gain_bandwidth_expand`, `FACGPV`,
   `LPCLG = 10`, `ILLCONDG`-gated) — the first fixed-point piece of the
   backward *gain* adapter.
+- **Annex G §G.3.17/§G.3.18 shared fixed-point hybrid-window core**
+  (`annex_g_hybrid`) — the §G.3.17 windowing step + §G.3.18 HWMCORE,
+  factored out of the LPC-hard-coded synthesis adapter into a
+  dimension-agnostic `HybridWindowFixed` / `HybridWindowFixedState` (the
+  fixed-point analogue of the floating-point `HybridWindowState`). It
+  carries the permanent SBFL signal-history `SB` / `NLSSB` and the BFL
+  recursive-autocorrelation `REXP` / `NLSREXP`, and runs the
+  segment-shift / window-multiply / three-NLS-case
+  recursive+non-recursive autocorrelation / white-noise-correction chain
+  for any `(order, l, n, window)` — emitting `RTMP(1..=order+1)` plus the
+  §G.2.2 `ILLCOND` verdict. `SynthAdapterFixed` (block 49) and the new
+  `WeightAdapterFixed` (block 36) both drive it.
+- **Annex G §G.3 fixed-point perceptual-weighting-filter backward adapter**
+  (`annex_g_weight_adapter`) — the encoder's `W(z) = Q̃(z/γ₁) / Q̃(z/γ₂)`
+  backward adaptation in bit-exact fixed point, the analogue of the
+  floating-point `weighting_filter_adapter` (blocks 36/37) +
+  `weighting_filter_coeff` (block 38). `WeightAdapterFixed::adapt` chains
+  block 36 (the shared hybrid-window core at `LPCW = 10` / `NONRW = 30` /
+  `WNRW`), block 37 (the §G.2.2 `levinson_durbin_fixed` at order `LPCW`),
+  and block 38 (two `bandwidth_expand_q14` expansions: the numerator with
+  `WZCFV_Q14`, the denominator with `WPCFV_Q14`, eq. 3-4b/3-4c), emitting
+  the Q14 `WeightCoeffFixed` pair. Keeps the previous cycle's pair on
+  ill-conditioning / Q14 overflow; `disabled` collapses to the §3.4.1
+  non-speech `W(z) = 1` all-pass. Cross-checked against the
+  floating-point chain on identical requantized speech.
 
 ### Not yet implemented
 
@@ -162,14 +187,21 @@ Implemented end-to-end:
   Implemented section), closing the fixed-point decoder's backward
   adaptation loop with the already-landed §G.3.11 block-32 synthesis
   filter. Block 45 (the §G.3.15 log-gain bandwidth expansion) is also
-  landed via the shared `bandwidth_expand_q14` core. The remaining §G.3
-  per-block modules — the *perceptual weighting* and *log-gain* hybrid
-  windows + Levinson wiring (blocks 36 / 43, which reuse the same HWMCORE
-  core with the LPCW / LPCLG dimensions), the §G.3.16 block-46 log-gain
-  linear prediction, and the postfilter *coefficient* calculators
-  (block 81 LPC inverse, 82 pitch extraction, 83 pitch tap, 84 long-term
-  coeff, 85 short-term coeff) — stay deferred behind the floating-point
-  build.
+  landed via the shared `bandwidth_expand_q14` core. The block 49 / block
+  36 hybrid window + HWMCORE is now factored into the shared
+  `annex_g_hybrid` core, and the *perceptual-weighting-filter* backward
+  adapter (blocks 36 / 37 / 38) is landed in `annex_g_weight_adapter`
+  (see the Implemented section). The remaining §G.3 per-block modules —
+  the *log-gain* hybrid window + Levinson wiring (block 43, which reuses
+  the same hybrid core at the `LPCLG` dimensions; note its 4-scalar
+  log-gain input differs from the segmented-speech input of blocks 36/49),
+  the §G.3.16 block-46 log-gain linear prediction, and the postfilter
+  *coefficient* calculators (block 81 LPC inverse, 82 pitch extraction,
+  83 pitch tap, 84 long-term coeff, 85 short-term coeff) — stay deferred
+  behind the floating-point build. The full fixed-point log-gain adapter
+  (blocks 43–48) additionally requires the §G.3.12–§G.3.16 log-gain
+  Q-format scaling, which the staged §G.3 trace flags as a documented gap
+  (per-module Q scaling / rounding / saturation not reproduced).
 
 ## Usage
 

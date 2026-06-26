@@ -6,6 +6,58 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Annex G §G.3 fixed-point perceptual-weighting-filter backward adapter
+  (blocks 36/37/38) (r374)** — new `annex_g_weight_adapter` module lands the
+  fixed-point reformulation of the encoder's perceptual weighting filter
+  `W(z) = Q̃(z/γ₁) / Q̃(z/γ₂)` backward adaptation, the fixed-point analogue
+  of the floating-point `weighting_filter_adapter` (blocks 36/37) +
+  `weighting_filter_coeff` (block 38). `WeightAdapterFixed::adapt` runs one
+  cycle: **block 36** (§G.3.17 windowing structure) drives the shared
+  §G.3.17/§G.3.18 hybrid-window core (`annex_g_hybrid`) with the `LPCW = 10`
+  / `NONRW = 30` / `WNRW` dimensions on past input speech, producing the 11
+  autocorrelation taps `R(1..=LPCW+1)`; **block 37** is the §G.2.2
+  `levinson_durbin_fixed` at order `LPCW`, yielding the order-10 predictor
+  `QTMP` in its `Q13/Q14/Q15` block-floating format; **block 38** (eq. 3-4b
+  / 3-4c) bandwidth-expands `QTMP` twice via the shared
+  `bandwidth_expand_q14` core — the numerator `Q̃(z/γ₁)` with `γ₁ = WZCF =
+  0.9` (`WZCFV_Q14`) and the denominator `Q̃(z/γ₂)` with `γ₂ = WPCF = 0.6`
+  (`WPCFV_Q14`) — emitting the Q14 `WeightCoeffFixed` pair. On
+  ill-conditioning or a Q14 overflow the previous cycle's pair is kept (the
+  §3.4 "keep the previous coefficients" rule); the §3.4.1 non-speech `W(z) =
+  1` disabling collapses both vectors to the all-pass `(16384, 0, …, 0)` via
+  `WeightCoeffFixed::disabled` / `WeightAdapterFixed::disabled_coeffs`. The
+  emitted Q14 numerator/denominator pair is exactly the coefficient set a
+  fixed-point encoder weighting filter (blocks 4/10) would consume. Public
+  surface: `WeightAdapterFixed`, `WeightCoeffFixed`, `N5W`. 8 module tests:
+  disabled cold-start, default-vs-new, spec dimensions (`N3 = 60`,
+  `N5W = 4`), zero-input ⇒ ILLCOND ⇒ disabled pair preserved, block-38
+  unity heads + the `γ₂ < γ₁` pole-vs-zero radius ordering, a broadband
+  end-to-end drive that commits a real `W(z)`, the disabled-helper
+  cross-check, and a normalized-predictor shape cross-check against the
+  floating-point `WeightingFilterAdapter` + `WeightingFilterCoeff` on
+  identical requantized speech. Crate tests: 406 → 414.
+- **Annex G §G.3.17/§G.3.18 shared fixed-point hybrid-window core (r374)** —
+  new `annex_g_hybrid` module extracts the §G.3.17 windowing step (block 49)
+  + §G.3.18 HWMCORE from the LPC-hard-coded `SynthAdapterFixed` into a
+  parameterized, dimension-agnostic core `HybridWindowFixed` /
+  `HybridWindowFixedState` — the fixed-point analogue of the floating-point
+  `HybridWindowState` that already factors the three G.728 hybrid windows
+  (blocks 36/43/49) into one parameter object. The core carries the
+  permanent SBFL signal-history buffer `SB` with its per-segment `NLSSB` and
+  the BFL recursive-autocorrelation `REXP` / `NLSREXP`, and runs the
+  segment-shift / window-multiply / three-NLS-case recursive+non-recursive
+  autocorrelation / white-noise-correction chain for any `(order, l, n,
+  window)`, emitting `RTMP(1..=order+1)` plus the §G.2.2 `ILLCOND` verdict;
+  the `3/4` recursive decay (`NLSATT50 = 14`) is shared across blocks.
+  `SynthAdapterFixed` now delegates blocks 49 + HWMCORE to the shared core
+  (via a `BflSegment` conversion of its `StSegment` input), keeping only its
+  block-50 Levinson + block-51 expansion wiring; its public `HwmcoreOut` /
+  `NLSATT50` are re-exported from the new module unchanged. The
+  autocorrelation-vs-float-window cross-check moves into the core and now
+  also covers the `LPCW` (block 36) window. New public surface:
+  `HybridWindowFixed`, `HybridWindowFixedState`, `BflSegment`, plus the
+  relocated `HwmcoreOut` / `NLSATT50`. 11 module tests. Crate tests:
+  400 → 406.
 - **Annex G §G.3.17–§G.3.19 fixed-point backward synthesis-filter adapter
   (r367)** — new `annex_g_synth_adapter` module lands the fixed-point
   reformulation of the decoder's backward synthesis-filter adaptation
