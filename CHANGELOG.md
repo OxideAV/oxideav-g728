@@ -6,6 +6,31 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Annex G §G.3 fixed-point short-term postfilter coefficient calculator
+  (block 85) (r374)** — new `annex_g_pf_coeff` module lands the fixed-point
+  reformulation of the §4.6 adaptive postfilter's short-term coefficient
+  calculator (eq. 4-3 / 4-4 / 4-5), the analogue of the floating-point
+  `ShortTermPostfilter::set_from_synthesis_byproduct`.
+  `short_term_coeff_fixed(atil, k1, nlsatmp)` derives the Q14
+  `ShortTermCoeff` the §G.3.20–§G.3.23 postfilter (`PostfilterFixed`)
+  consumes from the order-10 synthesis-filter LPC by-product: **AZ** (the
+  all-zero numerator, `b̄_i = ã_i·SPFZCF^i`, `SPFZCF = 0.65`) and **AP**
+  (the all-pole denominator, `ā_i = ã_i·SPFPCF^i`, `SPFPCF = 0.75`) are the
+  two §G.3.15/§G.3.19 `bandwidth_expand_q14` expansions of the same `ATMP`
+  predictor with the staged Q14 broadening tables `SPFZCFV_Q14` /
+  `SPFPCFV_Q14` (postfilter analogue of weighting-filter block 38), and
+  **TILTZ** (the spectral-tilt term `µ = TILTF·k1`, `TILTF = 0.15`) is the
+  one-multiply Q14 round of `TILTF_Q14 · k1` over `2¹⁵` (new
+  `TILTF_Q14 = 2458` const). Returns `None` (keep the previous cycle's
+  postfilter coefficients) on a Q14 overflow / out-of-range `NLSATMP`. No
+  new dB-domain Q-format is introduced — AZ/AP reuse the already-specified
+  Table-G.2 Q14 coefficient format and `k1` is the §G.2.2 recursion's Q15
+  `RC1`. Public surface: `short_term_coeff_fixed`, `TILTF_Q14`. 6 module
+  tests: `TILTF_Q14` constant, unity heads + orders, the `SPFZCF < SPFPCF`
+  zero-vs-pole radius ordering, the tilt-term half-LSB match vs float, an
+  AZ/AP/TILTZ cross-check against the floating-point block-85 calculator on
+  an identical order-10 predictor, and the bad-`NLSATMP` decline. Crate
+  tests: 414 → 420.
 - **Annex G §G.3 fixed-point perceptual-weighting-filter backward adapter
   (blocks 36/37/38) (r374)** — new `annex_g_weight_adapter` module lands the
   fixed-point reformulation of the encoder's perceptual weighting filter

@@ -152,6 +152,17 @@ Implemented end-to-end:
   ill-conditioning / Q14 overflow; `disabled` collapses to the §3.4.1
   non-speech `W(z) = 1` all-pass. Cross-checked against the
   floating-point chain on identical requantized speech.
+- **Annex G §G.3 fixed-point short-term postfilter coefficient calculator**
+  (`annex_g_pf_coeff`) — the §4.6 block-85 calculator (eq. 4-3/4-4/4-5) in
+  bit-exact fixed point, producing the Q14 `ShortTermCoeff` (`AZ` / `AP` /
+  `TILTZ`) the §G.3.20–§G.3.23 postfilter consumes from the order-10
+  synthesis-filter LPC by-product. `AZ` (`ã_i·0.65^i`, `SPFZCFV_Q14`) and
+  `AP` (`ã_i·0.75^i`, `SPFPCFV_Q14`) are two `bandwidth_expand_q14`
+  expansions of the same predictor (the postfilter analogue of weighting
+  block 38); `TILTZ = 0.15·k1` is the Q14 tilt term (`TILTF_Q14 = 2458`,
+  `k1` the §G.2.2 Q15 `RC1`). Keeps the previous coefficients on Q14
+  overflow / out-of-range `NLSATMP`. Cross-checked against the
+  floating-point `set_from_synthesis_byproduct`.
 
 ### Not yet implemented
 
@@ -195,10 +206,11 @@ Implemented end-to-end:
   the *log-gain* hybrid window + Levinson wiring (block 43, which reuses
   the same hybrid core at the `LPCLG` dimensions; note its 4-scalar
   log-gain input differs from the segmented-speech input of blocks 36/49),
-  the §G.3.16 block-46 log-gain linear prediction, and the postfilter
-  *coefficient* calculators (block 81 LPC inverse, 82 pitch extraction,
-  83 pitch tap, 84 long-term coeff, 85 short-term coeff) — stay deferred
-  behind the floating-point build. The full fixed-point log-gain adapter
+  the §G.3.16 block-46 log-gain linear prediction, and the *remaining*
+  postfilter coefficient calculators (block 81 LPC inverse, 82 pitch
+  extraction, 83 pitch tap, 84 long-term coeff) — stay deferred behind the
+  floating-point build (block-85 short-term coeff is now landed in
+  `annex_g_pf_coeff`). The full fixed-point log-gain adapter
   (blocks 43–48) additionally requires the §G.3.12–§G.3.16 log-gain
   Q-format scaling, which the staged §G.3 trace flags as a documented gap
   (per-module Q scaling / rounding / saturation not reproduced).
