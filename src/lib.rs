@@ -210,6 +210,7 @@ pub mod annex_g_arith;
 pub mod annex_g_codebook;
 pub mod annex_g_decoder;
 pub mod annex_g_gain;
+pub mod annex_g_hybrid;
 pub mod annex_g_levinson;
 pub mod annex_g_postfilter;
 pub mod annex_g_synth_adapter;

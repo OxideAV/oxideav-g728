@@ -55,10 +55,13 @@
 //! assert the autocorrelation and predictor track it within the annex's
 //! stated precision.
 
-use crate::annex_g_arith::{findnls, rnd, shl_sat, shr_sat};
+use crate::annex_g_arith::rnd;
+use crate::annex_g_hybrid::{BflSegment, HybridWindowFixed, HybridWindowFixedState};
 use crate::annex_g_levinson::{levinson_durbin_fixed, LevinsonInput, LevinsonStatus};
 use crate::consts::{IDIM, LPC, LPCLG, NFRSZ, NONR};
 use crate::tables::{FACGPV_Q14, FACV_Q14, WNR_Q15};
+
+pub use crate::annex_g_hybrid::{HwmcoreOut, NLSATT50};
 
 /// `N1 = LPC + NFRSZ = 70` — end of the recursive-component tap range.
 pub const N1: usize = LPC + NFRSZ;
@@ -72,16 +75,6 @@ pub const N4: usize = N3 / IDIM;
 pub const N5: usize = NFRSZ / IDIM;
 /// `N6 = N4 - N5 = 17` — number of `NLSSB` entries kept across the shift.
 pub const N6: usize = N4 - N5;
-
-/// `NLSATT50 = 14` — the attenuation NLS for the synthesis-filter hybrid
-/// window's recursive component (`3/4` decay realised in HWMCORE as the
-/// `RREC << NLSATT` / `−RREC` combination, §G.3.17 "NLSATT50 = 14").
-pub const NLSATT50: i32 = 14;
-
-/// `MLS` for the double-precision accumulator passed to the §G.1.3
-/// `VSCALE` / `FINDNLS` inside HWMCORE (the 32-bit `AA0` / `AA1`
-/// accumulators normalize against `MLS = 30`).
-const MLS_ACC: i32 = 30;
 
 /// Initial value of every per-segment `NLSSB` / `NLSREXP` entry. The
 /// fresh `SB` buffer is all zero, held at the maximum left shift; the
@@ -110,34 +103,30 @@ impl StSegment {
     }
 }
 
-/// Result of one §G.3.18 HWMCORE call: the autocorrelation `RTMP`
-/// (BFL, 16-bit mantissas, Q15-normalized so `RTMP(1)` dominates) plus
-/// the `ILLCOND` verdict (`RTMP(LPC+1)`'s 32-bit accumulator was zero).
-#[derive(Debug, Clone)]
-pub struct HwmcoreOut {
-    /// `R(1..=LPO+1)` BFL mantissas (`rtmp[0]` is the spec's `R(1)`).
-    pub rtmp: Vec<i16>,
-    /// `ILLCOND` — `true` when the 32-bit `R(LPO+1)` accumulator is zero.
-    pub illcond: bool,
+/// The §G.3.17 synthesis-filter hybrid window descriptor (block 49):
+/// order `LPC = 50`, `l = NFRSZ = 20`, `n = NONR = 35`, window `WNR`.
+fn synth_window() -> HybridWindowFixed<'static> {
+    HybridWindowFixed {
+        order: LPC,
+        l: NFRSZ,
+        n: NONR,
+        window: &WNR_Q15,
+    }
 }
 
 /// Fixed-point backward synthesis-filter adapter (Annex G §G.3.17 –
 /// §G.3.19, blocks 49 / HWMCORE / 51).
 ///
-/// Owns the permanent state of the chain: the SBFL signal-history buffer
-/// `SB` with its per-segment `NLSSB`, the recursive-autocorrelation
-/// `REXP` (BFL) with its shift `NLSREXP`, and the live Q14 predictor `A`
-/// (held from the previous cycle when block 51 declines to update).
+/// Owns the permanent state of the chain: the shared §G.3.17 / §G.3.18
+/// hybrid-window core [`HybridWindowFixedState`] (the SBFL signal-history
+/// buffer `SB`, its per-segment `NLSSB`, and the recursive-autocorrelation
+/// `REXP` / `NLSREXP`), plus the live Q14 predictor `A` (held from the
+/// previous cycle when block 51 declines to update).
 #[derive(Debug, Clone)]
 pub struct SynthAdapterFixed {
-    /// `SB(1..=N3)` SBFL mantissas, 0-based. 14-bit precision.
-    sb: [i16; N3],
-    /// `NLSSB(1..=N4)` per-segment shifts, 0-based.
-    nlssb: [i32; N4],
-    /// `REXP(1..=LPC+1)` recursive-autocorrelation BFL mantissas, 0-based.
-    rexp: [i16; LPC + 1],
-    /// `NLSREXP` — the shared shift of the BFL `REXP` block.
-    nlsrexp: i32,
+    /// Blocks 49 + HWMCORE — the shared §G.3.17 / §G.3.18 hybrid-window
+    /// core sized for the `LPC = 50`-order synthesis filter.
+    hw: HybridWindowFixedState,
     /// Live synthesis predictor `A(1..=LPC+1)` in Q14, 0-based:
     /// `a[0] = 16384` (`A(1) = 1`), `a[i]` the expanded `−aᵢ` taps.
     a: [i16; LPC + 1],
@@ -157,10 +146,7 @@ impl SynthAdapterFixed {
         let mut a = [0i16; LPC + 1];
         a[0] = 1 << 14; // A(1) = 1.0 in Q14
         Self {
-            sb: [0; N3],
-            nlssb: [NLSSB_INIT; N4],
-            rexp: [0; LPC + 1],
-            nlsrexp: 0,
+            hw: HybridWindowFixedState::new(&synth_window()),
             a,
         }
     }
@@ -173,26 +159,26 @@ impl SynthAdapterFixed {
 
     /// Borrow the SBFL signal-history buffer `SB` (for tests/audit).
     #[must_use]
-    pub fn sb(&self) -> &[i16; N3] {
-        &self.sb
+    pub fn sb(&self) -> &[i16] {
+        self.hw.sb()
     }
 
     /// Borrow the per-segment shift array `NLSSB` (for tests/audit).
     #[must_use]
-    pub fn nlssb(&self) -> &[i32; N4] {
-        &self.nlssb
+    pub fn nlssb(&self) -> &[i32] {
+        self.hw.nlssb()
     }
 
     /// Borrow the recursive-autocorrelation `REXP` (for tests/audit).
     #[must_use]
-    pub fn rexp(&self) -> &[i16; LPC + 1] {
-        &self.rexp
+    pub fn rexp(&self) -> &[i16] {
+        self.hw.rexp()
     }
 
     /// `NLSREXP` — the shared shift of `REXP` (for tests/audit).
     #[must_use]
     pub fn nlsrexp(&self) -> i32 {
-        self.nlsrexp
+        self.hw.nlsrexp()
     }
 
     /// Run one adaptation cycle: block 49 (hybrid window) → HWMCORE →
@@ -209,11 +195,12 @@ impl SynthAdapterFixed {
     /// (the decoder applies the freshly-expanded `A` at the third vector
     /// of the cycle — see [`crate::synthesis_adapter`] cycle-timing prose).
     pub fn adapt(&mut self, sttmp: &[StSegment; N5]) -> LevinsonStatus {
-        // ---- Block 49: hybrid window on the SBFL buffer SB ----
-        let ws = self.block49(sttmp);
-
-        // ---- HWMCORE: recursive + non-recursive autocorrelation ----
-        let core = self.hwmcore(&ws.ws, ws.nlstmp);
+        // ---- Blocks 49 + HWMCORE: shared §G.3.17 / §G.3.18 core ----
+        let segs: [BflSegment; N5] = std::array::from_fn(|j| BflSegment {
+            samples: sttmp[j].st,
+            nls: sttmp[j].nls,
+        });
+        let core = self.hw.run(&synth_window(), &segs);
 
         // ---- Block 50: §G.2.2 Levinson-Durbin recursion ----
         let input = LevinsonInput {
@@ -228,249 +215,6 @@ impl SynthAdapterFixed {
         self.block51(&atmp, &status);
 
         status
-    }
-
-    /// §G.3.17 block 49: shift the SBFL `SB` buffer, multiply by the Q15
-    /// window `WNR` after aligning every segment to the common minimum
-    /// shift `NLSTMP`, and return the BFL windowed signal `WS` with that
-    /// shared shift.
-    fn block49(&mut self, sttmp: &[StSegment; N5]) -> Block49Out {
-        // | For N = 1, ..., N2: SB(N) = SB(N + NFRSZ)   | Shift old part of SB
-        for n in 0..N2 {
-            self.sb[n] = self.sb[n + NFRSZ];
-        }
-        // | For N = 1, ..., N6: NLSSB(N) = NLSSB(N + N5) | Shift old NLSSB
-        for n in 0..N6 {
-            self.nlssb[n] = self.nlssb[n + N5];
-        }
-        // | For N = 1, ..., NFRSZ: SB(N2 + N) = STTMP(N) | Shift in new part
-        // | For N = 1, ..., N5: NLSSB(N6 + N) = NLSSTTMP(N)
-        //
-        // STTMP is the four newest ST vectors concatenated; segment j of
-        // STTMP lands at SB(N2 + j*IDIM ..) with shift NLSSTTMP(j).
-        for (j, seg) in sttmp.iter().enumerate() {
-            let base = N2 + j * IDIM;
-            self.sb[base..base + IDIM].copy_from_slice(&seg.st);
-            self.nlssb[N6 + j] = seg.nls;
-        }
-
-        // | NLSTMP = Min{NLSSB(1), ..., NLSSB(N4)}       | determines NLSWS
-        let nlstmp = *self.nlssb.iter().min().expect("N4 > 0");
-
-        // | K = 1; N = N3                                | multiply SB by window
-        // | For J = 1, ..., N4:
-        // |   NRSH = NLSSB(J) − NLSTMP − 1               | −1 for Q15 mult
-        // |   For M = 1, ..., IDIM:
-        // |     P = SB(K) * WNR(N)                        | WNR is Q15
-        // |     If NRSH = −1, AA0 = P << 1
-        // |     If NRSH > −1, AA0 = P >> NRSH
-        // |     WS(K) = RND(AA0); N = N − 1; K = K + 1
-        //
-        // Spec 1-based: WNR(N) for N = N3..1 is WNR_Q15[N-1]; the window
-        // walks newest-first (K=1 ↔ N=N3) so SB(K) (K=1..N3, oldest-first)
-        // pairs with WNR_Q15[N3 - K] = WNR_Q15[N3 - 1 - (K-1)] in 0-based.
-        let mut ws = [0i16; N3];
-        let mut k = 0usize; // 0-based SB / WS index
-        for j in 0..N4 {
-            let nrsh = self.nlssb[j] - nlstmp - 1;
-            for _m in 0..IDIM {
-                let p = self.sb[k] as i32 * WNR_Q15[N3 - 1 - k] as i32;
-                let aa0 = if nrsh == -1 {
-                    shl_sat(p, 1)
-                } else {
-                    // nrsh > -1 (≥ 0): right shift.
-                    shr_sat(p, nrsh as u32)
-                };
-                ws[k] = rnd(aa0);
-                k += 1;
-            }
-        }
-
-        Block49Out { ws, nlstmp }
-    }
-
-    /// §G.3.18 HWMCORE for block 49 (LPO = LPC, N1 = 70, N3 = 105,
-    /// NLSATT = NLSATT50). Accumulates the recursive and non-recursive
-    /// autocorrelation components, threads the BFL shift through the
-    /// `REXP` update, applies the white-noise correction, and emits the
-    /// BFL `RTMP` plus the `ILLCOND` verdict.
-    fn hwmcore(&mut self, ws: &[i16; N3], nlstmp: i32) -> HwmcoreOut {
-        let lpo = LPC;
-
-        // | NLSAA0 = 2 * NLSTMP                          | scale of WS²
-        let nls_aa0 = 2 * nlstmp;
-
-        // ---- Recursive component RREC(1..=LPO+1) ----
-        // Recompute the energy AA0 = Σ_{N=LPO+1..N1} WS(N)² for R(1).
-        let energy = |i: usize| -> i64 {
-            // AA0 = Σ_{N=LPO+1..N1} WS(N) * WS(N−i)   (recursive range)
-            let mut acc = 0i64;
-            for n in (lpo + 1)..=N1 {
-                // 1-based WS(N) is ws[N-1].
-                acc += ws[n - 1] as i64 * ws[n - 1 - i] as i64;
-            }
-            acc
-        };
-
-        // Compute REXP update for I = 0..=LPO across the three NLS cases.
-        // RREC = REXP (BFL, shift NLSREXP, attenuation NLSATT). The annex
-        // scales RREC by 3/4 via `RREC<<NLSATT` combined with `±RREC<<16`
-        // and a `>>1` (Case 2/3) or `>>IR` (Case 1) alignment.
-        let nls_rrec = self.nlsrexp;
-        let nlsre: i32;
-        let mut new_rexp = [0i16; LPC + 1];
-
-        // R(1) recursive part (I = 0).
-        let aa0_e0 = energy(0); // 32-bit-headroom energy of WS over recursive range
-        if nls_rrec > nls_aa0 {
-            // Case 1.
-            let ir = nls_rrec - nls_aa0 + 1;
-            let aa0 = aa0_e0 >> 1;
-            // AA1 = RREC(1)<<NLSATT ; AA1 = −AA1 + RREC(1)<<16 ; AA1 >>= IR
-            let r1 = self.rexp[0] as i64;
-            let aa1 = (-(r1 << NLSATT50)) + (r1 << 16);
-            let aa1 = aa1 >> ir;
-            let combined = aa0 + aa1;
-            // VSCALE(AA0,1,1,30,AA0,NLSRE): find NLS then apply it before RND.
-            nlsre = findnls(&[clamp_i32(combined)], 1, MLS_ACC);
-            new_rexp[0] = rnd(clamp_i32(shl_acc(combined, nlsre)));
-            // REXP update for I = 1..=LPO.
-            for i in 1..=lpo {
-                let mut aa0 = energy(i) >> 1;
-                let ri = self.rexp[i] as i64;
-                let aa1 = ((ri << NLSATT50) + (ri << 16)) >> ir;
-                aa0 += aa1;
-                aa0 = shl_acc(aa0, nlsre);
-                new_rexp[i] = rnd(clamp_i32(aa0));
-            }
-            self.nlsrexp = nls_aa0 - 1 + nlsre;
-        } else if nls_rrec == nls_aa0 {
-            // Case 2.
-            let r1 = self.rexp[0] as i64;
-            let aa1 = (-(r1 << NLSATT50)) + (r1 << 16);
-            let aa0 = aa0_e0 >> 1;
-            let aa1 = aa1 >> 1;
-            let combined = aa0 + aa1;
-            nlsre = findnls(&[clamp_i32(combined)], 1, MLS_ACC);
-            new_rexp[0] = rnd(clamp_i32(shl_acc(combined, nlsre)));
-            for i in 1..=lpo {
-                let mut aa0 = energy(i) >> 1;
-                let ri = self.rexp[i] as i64;
-                // §G.3.18 Case 2 recursive-tap lines: AA1 = RREC<<NLSATT;
-                // AA1 = −AA1 + RREC<<16; AA1 >>= 1.
-                let aa1 = ((-(ri << NLSATT50)) + (ri << 16)) >> 1;
-                aa0 += aa1;
-                aa0 = shl_acc(aa0, nlsre);
-                new_rexp[i] = rnd(clamp_i32(aa0));
-            }
-            self.nlsrexp = nls_rrec - 1 + nlsre;
-        } else {
-            // Case 3: nls_rrec < nls_aa0.
-            let ir = nls_aa0 - nls_rrec + 1;
-            let aa0 = aa0_e0 >> ir;
-            let r1 = self.rexp[0] as i64;
-            let aa1 = ((-(r1 << NLSATT50)) + (r1 << 16)) >> 1;
-            let combined = aa0 + aa1;
-            nlsre = findnls(&[clamp_i32(combined)], 1, MLS_ACC);
-            new_rexp[0] = rnd(clamp_i32(shl_acc(combined, nlsre)));
-            for i in 1..=lpo {
-                let mut aa0 = energy(i) >> ir;
-                let ri = self.rexp[i] as i64;
-                let aa1 = ((-(ri << NLSATT50)) + (ri << 16)) >> 1;
-                aa0 += aa1;
-                aa0 = shl_acc(aa0, nlsre);
-                new_rexp[i] = rnd(clamp_i32(aa0));
-            }
-            self.nlsrexp = nls_rrec - 1 + nlsre;
-        }
-        self.rexp = new_rexp;
-
-        // ---- Non-recursive component → R = RTMP ----
-        // Re-derive the post-update NLSREXP / NLSAA0 relation: the
-        // non-recursive part adds Σ_{N=N1+1..N3} WS(N)·WS(N−i) and aligns
-        // with the just-updated RREC (now at shift self.nlsrexp).
-        let nls_rrec2 = self.nlsrexp;
-        let nonrec = |i: usize| -> i64 {
-            let mut acc = 0i64;
-            for n in (N1 + 1)..=N3 {
-                acc += ws[n - 1] as i64 * ws[n - 1 - i] as i64;
-            }
-            acc
-        };
-
-        let mut rtmp = vec![0i16; lpo + 1];
-        let mut illcond = false;
-        let nlsrr: i32;
-
-        if nls_rrec2 > nls_aa0 {
-            // Case 1.
-            let ir = nls_rrec2 - nls_aa0 + 1;
-            let r1 = self.rexp[0] as i64;
-            let aa1 = (r1 << 16) >> ir;
-            let aa0 = nonrec(0) >> 1;
-            let mut aa1 = aa0 + aa1;
-            // White-noise correction: AA0 = AA1 >> 8 ; AA1 = AA1 + AA0.
-            let wn = aa1 >> 8;
-            aa1 += wn;
-            nlsrr = findnls(&[clamp_i32(aa1)], 1, MLS_ACC);
-            rtmp[0] = rnd(clamp_i32(shl_acc(aa1, nlsrr)));
-            for i in 1..=lpo {
-                let aa0 = nonrec(i) >> 1;
-                let ri = self.rexp[i] as i64;
-                let aa1 = (ri << 16) >> ir;
-                let aa1 = aa0 + aa1;
-                let aa1 = shl_acc(aa1, nlsrr);
-                rtmp[i] = rnd(clamp_i32(aa1));
-                if i == lpo && aa1 == 0 {
-                    illcond = true;
-                }
-            }
-        } else if nls_rrec2 == nls_aa0 {
-            // Case 2.
-            let r1 = self.rexp[0] as i64;
-            let aa0 = nonrec(0) >> 1;
-            let aa1 = r1 << 15;
-            let mut aa1 = aa0 + aa1;
-            let wn = aa1 >> 8;
-            aa1 += wn;
-            nlsrr = findnls(&[clamp_i32(aa1)], 1, MLS_ACC);
-            rtmp[0] = rnd(clamp_i32(shl_acc(aa1, nlsrr)));
-            for i in 1..=lpo {
-                let aa0 = nonrec(i) >> 1;
-                let ri = self.rexp[i] as i64;
-                let aa1 = ri << 15;
-                let aa1 = aa0 + aa1;
-                let aa1 = shl_acc(aa1, nlsrr);
-                rtmp[i] = rnd(clamp_i32(aa1));
-                if i == lpo && aa1 == 0 {
-                    illcond = true;
-                }
-            }
-        } else {
-            // Case 3.
-            let ir = nls_aa0 - nls_rrec2 + 1;
-            let r1 = self.rexp[0] as i64;
-            let aa0 = nonrec(0) >> ir;
-            let aa1 = r1 << 15;
-            let mut aa1 = aa0 + aa1;
-            let wn = aa1 >> 8;
-            aa1 += wn;
-            nlsrr = findnls(&[clamp_i32(aa1)], 1, MLS_ACC);
-            rtmp[0] = rnd(clamp_i32(shl_acc(aa1, nlsrr)));
-            for i in 1..=lpo {
-                let aa0 = nonrec(i) >> ir;
-                let ri = self.rexp[i] as i64;
-                let aa1 = ri << 15;
-                let aa1 = aa0 + aa1;
-                let aa1 = shl_acc(aa1, nlsrr);
-                rtmp[i] = rnd(clamp_i32(aa1));
-                if i == lpo && aa1 == 0 {
-                    illcond = true;
-                }
-            }
-        }
-
-        HwmcoreOut { rtmp, illcond }
     }
 
     /// §G.3.19 block 51: bandwidth-expand `ATMP` (Q13/Q14/Q15, signalled
@@ -567,42 +311,11 @@ pub fn log_gain_bandwidth_expand(
     Some(gp)
 }
 
-/// Output of the §G.3.17 block-49 windowing step.
-struct Block49Out {
-    /// `WS(1..=N3)` BFL mantissas (0-based).
-    ws: [i16; N3],
-    /// `NLSTMP` — the shared shift of the BFL `WS` block.
-    nlstmp: i32,
-}
-
-/// Left-shift a 64-bit accumulator by a possibly-negative count: a
-/// positive `k` shifts left, a negative `k` shifts (arithmetic) right.
-/// Used for the HWMCORE `AA0 << NLSRE` line where `NLSRE` may be
-/// negative (`VSCALE` "the NLS value returned will be negative" when the
-/// accumulator needs right shifts to normalize).
-#[inline]
-fn shl_acc(acc: i64, k: i32) -> i64 {
-    if k >= 0 {
-        acc << k
-    } else {
-        acc >> (-k)
-    }
-}
-
-/// Saturate a 64-bit accumulator value into the 32-bit range so the
-/// §G.1.3 primitives ([`findnls`] / [`rnd`]), which operate on `i32`,
-/// see the same saturated value the annex's 32-bit accumulator holds.
-#[inline]
-fn clamp_i32(v: i64) -> i32 {
-    v.clamp(i32::MIN as i64, i32::MAX as i64) as i32
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hybrid_window::{HybridWindow, HybridWindowState};
     use crate::tables::facgpv_f64;
-    use crate::tables::{facv_f64, wnr_f64};
+    use crate::tables::facv_f64;
 
     /// Build the four SBFL `STTMP` segments from `NFRSZ` float speech
     /// samples by quantizing each `IDIM`-sample vector into a 14-bit BFL
@@ -755,88 +468,6 @@ mod tests {
              successful synthesis-filter adaptation"
         );
     }
-
-    /// Float oracle for the §G.3.17 hybrid window: run the same window
-    /// structure through [`HybridWindowState`] (block 49 floating point)
-    /// over the requantized speech, returning the float `RTMP`.
-    fn float_rtmp(
-        state: &mut HybridWindowState,
-        hw: &HybridWindow<'_>,
-        samples: &[f64; NFRSZ],
-    ) -> Vec<f64> {
-        let mut rtmp = vec![0.0f64; LPC + 1];
-        state.run(hw, samples, &mut rtmp);
-        rtmp
-    }
-
-    #[test]
-    fn autocorrelation_tracks_floating_point_window() {
-        // The fixed-point RTMP must track the floating-point block-49
-        // hybrid window's RTMP in *shape* (the normalized autocorrelation
-        // sequence). Both adapters are driven by the *same requantized*
-        // 14-bit speech, so any divergence is purely the §G.3.18 BFL
-        // arithmetic versus the exact floating-point recursion. We compare
-        // the low-order normalized autocorrelation R(k)/R(1) — the taps
-        // that drive the predictor — within a tolerance reflecting the
-        // 16-bit RTMP rounding and the segmented-BFL alignment shifts.
-        let wnr = wnr_f64();
-        let hw = HybridWindow {
-            m: LPC,
-            l: NFRSZ,
-            n: NONR,
-            window: &wnr,
-        };
-        let mut fstate = HybridWindowState::new(&hw);
-        let mut a = SynthAdapterFixed::new();
-
-        let mut last_norm_fixed = vec![0.0f64; LPC + 1];
-        let mut last_norm_float = vec![0.0f64; LPC + 1];
-        let mut compared = false;
-
-        let mut seed = 0x0bad_c0de_dead_beefu64;
-        // Drive ten cycles so the recursive history (N3 = 105 samples ≈ 6
-        // cycles) is fully populated before the comparison cycle.
-        for cyc in 0..10 {
-            let samples = lcg_samples(&mut seed, 7000.0);
-            let (segs, requant) = sbfl_segments(&samples);
-
-            // Float oracle on the requantized samples.
-            let frtmp = float_rtmp(&mut fstate, &hw, &requant);
-
-            // Fixed-point chain: expose RTMP via a direct HWMCORE call by
-            // re-running block 49 + HWMCORE (adapt also runs Levinson +
-            // block 51 but does not perturb the RTMP we recompute here).
-            let ws = a.block49(&segs);
-            let core = a.hwmcore(&ws.ws, ws.nlstmp);
-
-            // Compare only on a fully-populated cycle where both R(1) are
-            // safely non-zero.
-            if cyc >= 8 && frtmp[0].abs() > 1e-6 && core.rtmp[0] != 0 {
-                let fr1 = frtmp[0];
-                let xr1 = core.rtmp[0] as f64;
-                for k in 0..=LPC {
-                    last_norm_float[k] = frtmp[k] / fr1;
-                    last_norm_fixed[k] = core.rtmp[k] as f64 / xr1;
-                }
-                compared = true;
-            }
-        }
-
-        assert!(compared, "comparison cycle must have produced finite R(1)");
-        // Compare the low-order normalized autocorrelation (the taps that
-        // matter most for the predictor) within the BFL-arithmetic
-        // tolerance.
-        for k in 0..=8 {
-            let diff = (last_norm_fixed[k] - last_norm_float[k]).abs();
-            assert!(
-                diff < 0.12,
-                "normalized RTMP[{k}] mismatch: fixed {} vs float {} (diff {diff})",
-                last_norm_fixed[k],
-                last_norm_float[k]
-            );
-        }
-    }
-
     #[test]
     fn block51_q14_unity_and_facv_scaling() {
         // With a known ATMP in Q14 and NLSATMP = 14, block 51 multiplies
