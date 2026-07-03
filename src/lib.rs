@@ -208,6 +208,7 @@ use oxideav_core::RuntimeContext;
 pub mod agc;
 pub mod annex_g_arith;
 pub mod annex_g_codebook;
+pub mod annex_g_coder;
 pub mod annex_g_decoder;
 pub mod annex_g_encoder;
 pub mod annex_g_gain;
@@ -244,6 +245,7 @@ pub mod zero_input_response;
 
 pub use agc::Agc;
 pub use annex_g_arith::{divide, findnls, rnd, vscale, ScalarFloat};
+pub use annex_g_coder::{DecoderFixed, EncoderFixed};
 pub use annex_g_decoder::{SynthesisFilterFixed, NLSSTATE_INIT, NSEG, STATELPC_CLIP};
 pub use annex_g_encoder::{EncoderFiltersFixed, MemoryUpdateOut};
 pub use annex_g_gain::{gain_log_db, offset_removed_log_gain, shape_log_db, DELTA_FLOOR_DB};

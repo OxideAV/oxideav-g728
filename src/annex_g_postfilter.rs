@@ -159,6 +159,18 @@ impl PostfilterFixed {
         self.scalefil
     }
 
+    /// Borrow the quantized-speech buffer `SST` (oldest first; the deep
+    /// `Q0` past occupies `[0, SST_PAST)` with the previous vector's
+    /// last sample `SST(0)` at index `SST_PAST − 1`, and the current
+    /// `Q2` vector — once written by
+    /// [`filter_vector`](Self::filter_vector) — at the top `IDIM`
+    /// slots). Block 83 (the §G.3.26 pitch-tap calculator) correlates
+    /// over the `Q0` past region.
+    #[must_use]
+    pub fn sst(&self) -> &[i32] {
+        &self.sst
+    }
+
     /// Blocks 71 – 77 (§G.3.20 – §G.3.23) — postfilter one `IDIM`-sample
     /// reconstructed-speech vector.
     ///
