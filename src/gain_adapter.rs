@@ -105,15 +105,15 @@ impl GainAdapter {
         };
         let hw_state = HybridWindowState::new(&hw);
 
-        // Default predictor: GP(1) = 1.0 (unused by block 46 but
-        // mirrors the spec's leading-unity convention), GP(2..=LPCLG+1)
-        // = 0. This makes the first block-46 evaluation produce
-        // GAIN = 0, +GOFF = 32 dB, → 10^(32/20) ≈ 39.81 ... but the
-        // spec's Table 2 GSTATE initialiser of -32 dB means GSTATE
-        // is pre-loaded with the negative offset; together they
-        // cancel and the first predicted σ(n) = 10^(0/20) = 1.0.
+        // Table 2/G.728 initial predictor: GP = (1, −1, 0, …, 0)
+        // ("Initial value 1,–1,0,0,..."). The −1 second tap makes the
+        // initial prediction δ̂(n) = δ(n−1); with GSTATE pre-loaded at
+        // −32 dB the first block-46 evaluation is −(−1)·(−32) = −32 dB,
+        // +GOFF cancels to 0 dB, so the first predicted σ(n) is
+        // exactly 1.0.
         let mut gp = [0.0f64; LPCLG + 1];
         gp[0] = 1.0;
+        gp[1] = -1.0;
 
         Self {
             wnrg,
@@ -293,42 +293,33 @@ mod tests {
     #[test]
     fn fresh_adapter_has_table2_initial_state() {
         // Table 2/G.728 lists `-32,...,-32` for GSTATE and GTMP, and
-        // GP defaults to the all-pass predictor (the gain-adapter
-        // module's own initialisation choice — spec doesn't enumerate
-        // a GP initial value because the first ICOUNT=2 cycle would
-        // populate it; we set GP(1)=1, rest 0 so the first vector
-        // before any Levinson run still produces a finite gain).
+        // `1,-1,0,0,...` for GP (the "predict the previous log-gain"
+        // seed predictor).
         let a = GainAdapter::new();
         for &v in a.gstate() {
             assert_eq!(v, GSTATE_INIT_DB);
         }
         assert_eq!(a.gp()[0], 1.0);
-        assert!(a.gp()[1..].iter().all(|&v| v == 0.0));
+        assert_eq!(a.gp()[1], -1.0);
+        assert!(a.gp()[2..].iter().all(|&v| v == 0.0));
         assert_eq!(a.icount(), 1);
     }
 
     #[test]
     fn first_predict_with_zero_et_returns_unity_gain() {
         // With ET(1..IDIM) = 0, ETRMS is clipped to 1 → log10(1)·10 = 0
-        // → GSTATE(1) = 0 - GOFF = -32 dB. The all-pass GP predictor
-        // (GP[1..LPCLG+1] = 0) makes the block-46 sum identically 0.
-        // GAIN = 0 + GOFF = 32 dB → 10^(32/20) ≈ 39.81 ... but wait:
-        // we also shifted GSTATE before the dot product, so the new
-        // -32 sits at gstate[0]. With GP[1..LPCLG+1] all zero, the
-        // dot product is still zero. So predicted gain = 10^(32/20).
-        //
-        // This is the spec-correct "first vector" behaviour: the
-        // adapter hasn't seen any real speech yet, the all-pass GP
-        // is the safest predictor, and the first sigma reflects the
-        // GOFF offset alone.
+        // → GSTATE(1) = 0 - GOFF = -32 dB. Table 2's GP = (1, −1, 0…)
+        // predictor then evaluates block 46 as −GP(2)·GSTATE(1) =
+        // −(−1)·(−32) = −32 dB; adding GOFF back gives 0 dB, so the
+        // first predicted σ(n) is exactly 1.0 — the spec-correct
+        // "first vector" behaviour (the fixed-point Annex G adapter
+        // produces the same unity gain from its GP/GSTATE inits).
         let mut a = GainAdapter::new();
         let et_zero = [0.0f64; IDIM];
         let sigma = a.predict_next(&et_zero);
-        let expected = 10.0f64.powf(GOFF / 20.0);
         assert!(
-            (sigma - expected).abs() < 1e-9,
-            "expected first-vector sigma ≈ {} (10^(GOFF/20)), got {}",
-            expected,
+            (sigma - 1.0).abs() < 1e-9,
+            "expected first-vector sigma = 1.0, got {}",
             sigma
         );
     }

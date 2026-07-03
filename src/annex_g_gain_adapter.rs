@@ -281,11 +281,242 @@ pub fn gstate1_update(loggain: i16, ig: usize, is: usize) -> i16 {
     aa0 as i16
 }
 
+// ---------------------------------------------------------------------
+// The complete Figure G.1 fixed-point backward vector gain adapter.
+// ---------------------------------------------------------------------
+
+/// The full fixed-point backward vector gain adapter (Figure G.1/G.728
+/// blocks 43 – 48 + 91 – 99) — the fixed-point analogue of the
+/// floating-point [`crate::gain_adapter::GainAdapter`], with the §G.2.1
+/// index-table reformulation replacing the RMS/logarithm path.
+///
+/// Drive it per the §G.7 main-program order (`icount` is the 1-based
+/// vector counter within the adaptation cycle):
+///
+/// 1. [`predict`](Self::predict)`(icount)` before the codebook search /
+///    excitation decode — applies block 45 at `ICOUNT = 2`, then runs
+///    blocks 46/98/99/48 and returns the scalar-floating excitation
+///    gain `(GAIN, NLSGAIN)`.
+/// 2. [`update`](Self::update)`(icount, ig, is)` after the indices are
+///    known — blocks 93/94/96/97 write `GSTATE(1)`, and at `ICOUNT = 1`
+///    the per-cycle blocks 43 (hybrid window) + 44 (Levinson) refresh
+///    the pending predictor `GPTMP`.
+#[derive(Debug, Clone)]
+pub struct GainAdapterFixed {
+    /// `GSTATE(1..=LPCLG)` — Q9 offset-removed log-gain memory,
+    /// Table G.2 initial value −16384.
+    gstate: [i16; LPCLG],
+    /// `GP(1..=LPCLG+1)` — live Q14 log-gain predictor, Table G.2
+    /// initial value (16384, −16384, 0, …, 0).
+    gp: [i16; LPCLG + 1],
+    /// `GPTMP` — the block-44 output pending block 45's `ICOUNT = 2`
+    /// commit, in the Q format signalled by `nlsgptmp`.
+    gptmp: [i16; LPCLG + 1],
+    /// `NLSGPTMP` — block 44's precision signal (13/14/15).
+    nlsgptmp: i32,
+    /// `ILLCONDG` — the log-gain ill-conditioning flag (block 43's
+    /// zero-`R(LPCLG+1)` verdict or a block-44 failure).
+    illcondg: bool,
+    /// Block 95 — the previous predicted (and limited) log-gain, Q9.
+    loggain: i16,
+    /// Block 43 state (`SBLG` / `REXPLG` / `NLSREXPLG`).
+    window: LogGainWindowFixed,
+}
+
+impl Default for GainAdapterFixed {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GainAdapterFixed {
+    /// Fresh adapter with the Table G.2/G.728 initial state.
+    #[must_use]
+    pub fn new() -> Self {
+        let mut gp = [0i16; LPCLG + 1];
+        gp[0] = 16384; // GP(1) = 1.0 Q14
+        gp[1] = -16384; // GP(2) = −1.0 Q14 (δ̂(n) = δ(n−1) at reset)
+        Self {
+            gstate: [GSTATE_INIT_Q9; LPCLG],
+            gp,
+            gptmp: [0; LPCLG + 1],
+            nlsgptmp: 0,
+            illcondg: false,
+            loggain: GSTATE_INIT_Q9,
+            window: LogGainWindowFixed::new(),
+        }
+    }
+
+    /// Borrow the live Q14 log-gain predictor `GP` (for tests/audit).
+    #[must_use]
+    pub fn gp(&self) -> &[i16; LPCLG + 1] {
+        &self.gp
+    }
+
+    /// Borrow the Q9 log-gain memory `GSTATE` (for tests/audit).
+    #[must_use]
+    pub fn gstate(&self) -> &[i16; LPCLG] {
+        &self.gstate
+    }
+
+    /// The previous predicted+limited Q9 log-gain (block 95's content).
+    #[must_use]
+    pub fn loggain(&self) -> i16 {
+        self.loggain
+    }
+
+    /// `ILLCONDG` — the current log-gain ill-conditioning verdict.
+    #[must_use]
+    pub fn illcondg(&self) -> bool {
+        self.illcondg
+    }
+
+    /// Per-vector prediction: block 45 at `ICOUNT = 2` (gated by
+    /// `ILLCONDG` / Q14 overflow — keep the old `GP` on decline), then
+    /// blocks 46 → 98 → 99 → 48. Returns `(GAIN, NLSGAIN)` — the Q14
+    /// mantissa of `2^x` and its shift, i.e. `σ(n) = GAIN·2^(−NLSGAIN)`.
+    pub fn predict(&mut self, icount: usize) -> (i16, i32) {
+        debug_assert!((1..=NUPDATE).contains(&icount));
+        // | If ICOUNT = 2 and ILLCONDG = .FALSE., then do block 45
+        if icount == 2 {
+            if let Some(gp) = crate::annex_g_synth_adapter::log_gain_bandwidth_expand(
+                &self.gptmp,
+                self.nlsgptmp,
+                self.illcondg,
+            ) {
+                self.gp = gp;
+            }
+        }
+        // | do blocks 46, 98, 99, and 48
+        let lg = log_gain_predict(&self.gp, &mut self.gstate);
+        self.loggain = limit_log_gain_q9(lg);
+        inverse_log_gain(self.loggain)
+    }
+
+    /// Post-search update: blocks 93/94/96/97 write `GSTATE(1)` from
+    /// the chosen 1-based gain / shape indices, then — at `ICOUNT = 1`
+    /// — the per-cycle blocks 43 + 44 refresh `GPTMP` / `ILLCONDG`
+    /// (block 45 commits it at the next `ICOUNT = 2` [`predict`]).
+    pub fn update(&mut self, icount: usize, ig: usize, is: usize) {
+        debug_assert!((1..=NUPDATE).contains(&icount));
+        // | do blocks 93, 94, 96, and 97; GSTATE(1) = output of block 97
+        self.gstate[0] = gstate1_update(self.loggain, ig, is);
+
+        // | If ICOUNT = 1: GTMP(1) = GSTATE(4) … GTMP(4) = GSTATE(1);
+        // | do block 43; do block 44.
+        if icount == 1 {
+            let gtmp = [
+                self.gstate[3],
+                self.gstate[2],
+                self.gstate[1],
+                self.gstate[0],
+            ];
+            let core = self.window.run(&gtmp);
+            let mut gptmp = [0i16; LPCLG + 1];
+            let status = crate::annex_g_levinson::levinson_durbin_fixed(
+                &crate::annex_g_levinson::LevinsonInput {
+                    rtmp: &core.rtmp,
+                    illcond: core.illcond,
+                    lpc: LPCLG,
+                },
+                &mut gptmp,
+            );
+            self.illcondg = status.illcond;
+            if !status.illcond {
+                self.gptmp = gptmp;
+                self.nlsgptmp = status.nlsatmp;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hybrid_window::{HybridWindow, HybridWindowState};
     use crate::tables::wnrg_f64;
+
+    #[test]
+    fn adapter_fresh_state_predicts_unity() {
+        // First vector: GP = (1, −1, 0…), GSTATE = −16384 ⇒ δ̂ = −32 dB
+        // ⇒ σ = 1 exactly.
+        let mut a = GainAdapterFixed::new();
+        let (gain, nlsgain) = a.predict(1);
+        assert_eq!((gain, nlsgain), (16384, 14));
+        assert_eq!(a.loggain(), -16384);
+    }
+
+    #[test]
+    fn adapter_tracks_floating_point_gain_adapter() {
+        // Drive the fixed-point Figure G.1 adapter and the floating-point
+        // block-20/30 adapter with the SAME (IG, IS) index stream. The
+        // float takes the previous gain-scaled excitation ET = σ·gq·y —
+        // eq. G-14 proves the index-table path is mathematically
+        // equivalent — so feed it ET built from ITS OWN σ, and compare
+        // the two σ trajectories in dB. Differences come only from Q9
+        // log-gains, the Q11 dB tables, the Q14 predictor and the Q15
+        // antilog polynomial.
+        use crate::gain_adapter::GainAdapter;
+        use crate::tables::{y_f64, GQ};
+
+        let mut fixed = GainAdapterFixed::new();
+        let mut float = GainAdapter::new();
+        let y = y_f64();
+        let gc_db = crate::annex_g_gain::gain_log_db();
+        let sh_db = crate::annex_g_gain::shape_log_db();
+
+        let mut et_prev = [0.0f64; crate::consts::IDIM];
+        let mut worst_db = 0.0f64;
+        let mut sum_db = 0.0f64;
+        let mut count = 0usize;
+
+        for n in 0..400 {
+            let icount = (n % NUPDATE) + 1;
+
+            // Fixed side: predict σ, float side: ingest previous ET and
+            // predict σ (predict_next both updates and predicts).
+            let (gain, nlsgain) = fixed.predict(icount);
+            let sigma_x = f64::from(gain) * (2.0f64).powi(-nlsgain);
+            let sigma_f = float.predict_next(&et_prev);
+
+            // Choose the next indices the way a real encoder does: track
+            // a smooth log-gain target (a slow ±10 dB swell) by picking
+            // the (IG, IS) whose dB contribution lands δ(n) closest to
+            // it. Uncorrelated random indices would instead exercise the
+            // backward feedback loop as a chaos amplifier, where the two
+            // arithmetics legitimately diverge.
+            let delta_hat_f = 20.0 * sigma_f.log10() - 32.0;
+            let target_db = 10.0 * ((n as f64) * 0.045).sin() - 6.0;
+            let mut best = (1usize, 1usize, f64::INFINITY);
+            for ig in 1..=4usize {
+                for is in 1..=128usize {
+                    let d = (target_db - (delta_hat_f + gc_db[ig - 1] + sh_db[is - 1])).abs();
+                    if d < best.2 {
+                        best = (ig, is, d);
+                    }
+                }
+            }
+            let (ig, is, _) = best;
+
+            fixed.update(icount, ig, is);
+            for k in 0..crate::consts::IDIM {
+                et_prev[k] = sigma_f * GQ[ig - 1] * y[is - 1][k];
+            }
+
+            if n >= 40 {
+                let db = 20.0 * (sigma_x / sigma_f).log10();
+                worst_db = worst_db.max(db.abs());
+                sum_db += db.abs();
+                count += 1;
+            }
+        }
+        let mean_db = sum_db / count as f64;
+        assert!(
+            worst_db < 1.0,
+            "worst σ divergence {worst_db} dB (mean {mean_db})"
+        );
+        assert!(mean_db < 0.2, "mean σ divergence {mean_db} dB");
+    }
 
     #[test]
     fn inverse_log_gain_tracks_exact_antilog() {
