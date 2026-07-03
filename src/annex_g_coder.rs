@@ -192,6 +192,15 @@ impl EncoderFixed {
         let seg = &self.sttmp[self.icount - 1];
         (&seg.st, seg.nls)
     }
+
+    /// Encode a whole buffer of `Q2` speech vectors into the §5.11
+    /// serial byte stream (MSB-first 10-bit-per-vector packing via
+    /// [`crate::bitstream::pack_indices`]). The natural framing unit is
+    /// one adaptation cycle = 4 indices = 40 bits = 5 bytes.
+    pub fn encode_buffer(&mut self, vectors: &[[i16; IDIM]]) -> Vec<u8> {
+        let indices: Vec<u16> = vectors.iter().map(|v| self.encode_vector(v)).collect();
+        crate::bitstream::pack_indices(&indices)
+    }
 }
 
 /// The full §G.7 fixed-point decoder: input 10-bit channel indices,
@@ -435,6 +444,14 @@ impl DecoderFixed {
         let seg = &self.sttmp[self.icount - 1];
         (&seg.st, seg.nls)
     }
+
+    /// Decode a §5.11 serial byte stream (whole 10-bit indices only —
+    /// see [`crate::bitstream::unpack_indices`]) into postfiltered `Q2`
+    /// speech vectors.
+    pub fn decode_bytes(&mut self, bytes: &[u8]) -> crate::Result<Vec<[i32; IDIM]>> {
+        let indices = crate::bitstream::unpack_indices(bytes)?;
+        Ok(indices.iter().map(|&i| self.decode_vector(i)).collect())
+    }
 }
 
 #[cfg(test)]
@@ -549,6 +566,52 @@ mod tests {
             tail_peak <= 1024,
             "idle limit cycle must settle to near-silence (tail peak {tail_peak} Q2)"
         );
+    }
+
+    #[test]
+    fn byte_stream_roundtrip_preserves_lockstep() {
+        // §5.11 framing: encode_buffer → bytes → decode_bytes must be
+        // exactly the per-vector path (2 cycles = 10 bytes per chunk).
+        let mut enc_a = EncoderFixed::new();
+        let mut enc_b = EncoderFixed::new();
+        let mut dec = DecoderFixed::new();
+        let mut dec_ref = DecoderFixed::new();
+
+        let vectors: Vec<[i16; IDIM]> = (0..40).map(speech_vector).collect();
+        let bytes = enc_a.encode_buffer(&vectors);
+        assert_eq!(bytes.len(), 40 * 10 / 8, "40 vectors = 50 bytes");
+        let decoded = dec.decode_bytes(&bytes).expect("whole indices");
+        assert_eq!(decoded.len(), 40);
+
+        for (n, v) in vectors.iter().enumerate() {
+            let ichan = enc_b.encode_vector(v);
+            let spf = dec_ref.decode_vector(ichan);
+            assert_eq!(decoded[n], spf, "vector {n} through the byte path");
+        }
+    }
+
+    #[test]
+    fn decoder_survives_arbitrary_index_streams() {
+        // Robustness: a decoder fed arbitrary (even adversarial) 10-bit
+        // channel indices must never panic and never overflow its Q2
+        // output — every ICHAN value is a legal codeword by
+        // construction, but the resulting gain trajectory can ride the
+        // +28 dB limiter for long stretches.
+        let mut dec = DecoderFixed::new();
+        let mut seed = 0x0dd5_eed5_0000_1111u64;
+        for _ in 0..400 {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let ichan = ((seed >> 33) % 1024) as u16;
+            let spf = dec.decode_vector(ichan);
+            for &v in spf.iter() {
+                assert!(v.abs() <= i32::from(i16::MAX), "SPF escaped 16 bits: {v}");
+            }
+        }
+        // And every single codeword at least once, in order.
+        let mut dec = DecoderFixed::new();
+        for ichan in 0..1024u16 {
+            let _ = dec.decode_vector(ichan);
+        }
     }
 
     #[test]
