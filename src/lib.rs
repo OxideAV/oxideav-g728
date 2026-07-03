@@ -244,7 +244,10 @@ pub use agc::Agc;
 pub use annex_g_arith::{divide, findnls, rnd, vscale, ScalarFloat};
 pub use annex_g_decoder::{SynthesisFilterFixed, NLSSTATE_INIT, NSEG, STATELPC_CLIP};
 pub use annex_g_gain::{gain_log_db, offset_removed_log_gain, shape_log_db, DELTA_FLOOR_DB};
-pub use annex_g_gain_adapter::LogGainWindowFixed;
+pub use annex_g_gain_adapter::{
+    gstate1_update, inverse_log_gain, limit_log_gain_q9, log_gain_predict, LogGainWindowFixed,
+    GOFF_Q9, GSTATE_INIT_Q9, LOGGAIN_MAX_Q9, LOGGAIN_MIN_Q9,
+};
 pub use annex_g_hybrid::{
     BflSegment, HwmcoreOut, HwmcoreState, HybridWindowFixed, HybridWindowFixedState, NLSATT50,
     NLSREXP_INIT_G2, NLSSB_INIT_G2,

@@ -37,7 +37,7 @@
 use crate::annex_g_arith::{findnls, rnd};
 use crate::annex_g_hybrid::{HwmcoreOut, HwmcoreState};
 use crate::consts::{LPCLG, NONRLG, NUPDATE};
-use crate::tables::WNRG_Q15;
+use crate::tables::{GCBLG_Q11, SHAPELG_Q11, WNRG_Q15};
 
 /// `N1 = LPCLG + NUPDATE = 14` — end of the recursive-component taps.
 pub const N1LG: usize = LPCLG + NUPDATE;
@@ -145,11 +145,235 @@ impl LogGainWindowFixed {
     }
 }
 
+// ---------------------------------------------------------------------
+// §G.3.16 — the per-vector blocks: 46 (log-gain linear prediction),
+// 98 (log-gain limiter), 99 (offset adder), 48 (inverse logarithm) and
+// 93/94/96/97 (the GSTATE(1) update from the chosen codebook indices).
+// ---------------------------------------------------------------------
+
+/// `GSTATE` / `GTMP` initial value — Table G.2/G.728: `−16384` in Q9
+/// (= −32 dB, the offset-removed log-gain floor).
+pub const GSTATE_INIT_Q9: i16 = -16384;
+
+/// Block 98's log-gain limits in Q9: `−32 dB ≤ δ̂(n) ≤ +28 dB`
+/// (§G.3.16: "If LOGGAIN > 14336 … If LOGGAIN < −16384").
+pub const LOGGAIN_MAX_Q9: i32 = 14336;
+/// See [`LOGGAIN_MAX_Q9`].
+pub const LOGGAIN_MIN_Q9: i32 = -16384;
+
+/// `GOFF = 32 dB` in Q9 (Table G.1/G.728: 16384, "Q9") — the log-gain
+/// offset added back by block 99 before the inverse logarithm.
+pub const GOFF_Q9: i32 = 16384;
+
+/// §G.3.16 block 46 — fixed-point log-gain linear prediction.
+///
+/// Computes `LOGGAIN = −Σ_{i=1..LPCLG} GP(i+1)·GSTATE(i)` (`GP` Q14,
+/// `GSTATE` Q9 → `AA0 >> 14` back to Q9) while shifting the `GSTATE`
+/// delay line down one position (the annex folds the shift into the
+/// prediction loop). Returns the *unlimited* Q9 log-gain; block 98
+/// ([`limit_log_gain_q9`]) is applied next.
+pub fn log_gain_predict(gp: &[i16; LPCLG + 1], gstate: &mut [i16; LPCLG]) -> i32 {
+    // | AA0 = 0
+    // | For I = LPCLG, LPCLG − 1, …, 3, 2:
+    // |   P = GP(I + 1) * GSTATE(I); AA0 = AA0 − P
+    // |   GSTATE(I) = GSTATE(I − 1)
+    let mut aa0: i64 = 0;
+    for i in (2..=LPCLG).rev() {
+        let p = i32::from(gp[i]) * i32::from(gstate[i - 1]);
+        aa0 -= i64::from(p);
+        gstate[i - 1] = gstate[i - 2];
+    }
+    // | P = GP(2) * GSTATE(1); AA0 = AA0 − P
+    let p = i32::from(gp[1]) * i32::from(gstate[0]);
+    aa0 -= i64::from(p);
+    // | AA0 = AA0 >> 14; LOGGAIN = AA0
+    // (saturate the 32-bit accumulator the annex's DSP would have used
+    // before the shift; block 98 clamps to the Q9 dB range right after).
+    let aa0 = aa0.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    aa0 >> 14
+}
+
+/// §G.3.16 block 98 — the log-gain limiter: clip the predicted Q9
+/// log-gain to `[−32 dB, +28 dB]` (`[−16384, 14336]`).
+#[must_use]
+pub fn limit_log_gain_q9(loggain: i32) -> i16 {
+    loggain.clamp(LOGGAIN_MIN_Q9, LOGGAIN_MAX_Q9) as i16
+}
+
+/// §G.3.16 blocks 99 + 48 — the log-gain offset adder and the inverse
+/// logarithm calculator.
+///
+/// Adds `GOFF = 16384` (32 dB, Q9) to the limited log-gain and converts
+/// to the linear domain: `σ = 10^(Z/20) = 2^(0.1660964·Z)` with
+/// `0.1660964` split as `10·2⁻⁶ + 20649·2⁻²¹` for precision, the
+/// integer part `[X]` becoming the exponent and the fractional part
+/// `x ∈ [0, 1)` evaluated by the §G.3.16 Q15 Taylor polynomial
+/// `2^x = ((c₄x + c₃)x + c₂)x² + c₁x + c₀`.
+///
+/// Returns `(GAIN, NLSGAIN)`: the Q14 mantissa of `2^x` and
+/// `NLSGAIN = 14 − [X]`, i.e. `σ = GAIN · 2^(−NLSGAIN)` — the scalar
+/// floating-point excitation gain blocks 16 / 21 consume.
+#[must_use]
+pub fn inverse_log_gain(loggain: i16) -> (i16, i32) {
+    // Block 99: Z = LOGGAIN + GOFF (Q9, 0 … 30720 = 0 … 60 dB).
+    let z = i32::from(loggain) + GOFF_Q9;
+
+    // | AA0 = 10 * Z        | Z is Q9, 10 is Q6, so AA0 is Q15
+    // | AA1 = 20649 * Z     | 20649 is Q21, so AA1 is Q30
+    // | AA1 = AA1 << 1      | Make AA1 Q31
+    // | AA1 = RND(AA1)      | Round AA1 to Q15 in low word
+    // | AA0 = AA0 + AA1     | AA0 = [X] + x in Q15
+    let aa0 = 10 * z;
+    let aa1 = 20649 * z;
+    let aa1 = i32::from(rnd(aa1 << 1));
+    let aa0 = aa0 + aa1;
+
+    // | AA1 = AA0 >> 15; NLS = AA1   | NLS = [X]
+    // | AA1 = AA1 << 15; x = AA0 − AA1
+    let nls = aa0 >> 15;
+    let x = aa0 - (nls << 15);
+
+    // Taylor coefficients (§G.3.16): c4..c1 in Q15, c0 in Q14.
+    const C4: i32 = 323; // 0.0098571
+    const C3: i32 = 1874; // 0.0571899
+    const C2: i32 = 7866; // 0.2400512
+    const C1: i32 = 22702; // 0.6928100
+    const C0: i32 = 16384; // 1.0 in Q14
+
+    // Horner stages: each computes AA0 = TMP·x (Q30) << 1 (Q31), adds
+    // the next coefficient promoted to the high word (cᵢ << 16, Q31)
+    // and rounds back to a Q15 TMP.
+    let tmp = i32::from(rnd(((C4 * x) << 1) + (C3 << 16)));
+    let tmp = i32::from(rnd(((tmp * x) << 1) + (C2 << 16)));
+    let tmp = i32::from(rnd(((tmp * x) << 1) + (C1 << 16)));
+    // | AA0 = TMP * x       | Q30 — no left shift this time!
+    // | AA1 = c0 << 16      | Q30
+    // | GAIN = RND(AA0 + AA1)  | Q14, contains 2^x
+    let gain = rnd((tmp * x) + (C0 << 16));
+
+    // | NLSGAIN = 14 − NLS
+    (gain, 14 - nls)
+}
+
+/// §G.3.16 blocks 93 / 94 / 96 / 97 — the `GSTATE(1)` update.
+///
+/// Reconstructs the offset-removed log-gain of the *previous* vector
+/// from the predicted log-gain (block 95's `LOGGAIN`, post-limiter)
+/// plus the two Q11 dB table look-ups for the chosen gain (`ig`) and
+/// shape (`is`) indices (both 1-based), aligning at the Q16 boundary
+/// (`LOGGAIN << 7`, tables `<< 5`), shifting back to Q9 and flooring at
+/// `−16384` (= −32 dB, limiter 97 / eq. G-9).
+#[must_use]
+pub fn gstate1_update(loggain: i16, ig: usize, is: usize) -> i16 {
+    // | AA0 = LOGGAIN << 7                    | Align decimal points
+    // | AA0 = AA0 + (GCBLG(IG) << 5)
+    // | AA0 = AA0 + (SHAPELG(IS) << 5)
+    let mut aa0 = i32::from(loggain) << 7;
+    aa0 += i32::from(GCBLG_Q11[ig - 1]) << 5;
+    aa0 += i32::from(SHAPELG_Q11[is - 1]) << 5;
+    // | AA0 = AA0 >> 7                        | Back to Q9
+    aa0 >>= 7;
+    // | IF AA0 < −16384, set AA0 = −16384     | Lower limit
+    if aa0 < LOGGAIN_MIN_Q9 {
+        aa0 = LOGGAIN_MIN_Q9;
+    }
+    // | GSTATE(1) = AA0                       | Lower 16-bit word saved
+    aa0 as i16
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hybrid_window::{HybridWindow, HybridWindowState};
     use crate::tables::wnrg_f64;
+
+    #[test]
+    fn inverse_log_gain_tracks_exact_antilog() {
+        // Block 48 vs the exact 10^(Z/20) over the whole legal Q9 range
+        // (Z = LOGGAIN + 32 dB ∈ [0, 60] dB). The Q15 Taylor polynomial
+        // is accurate to a few 1e-4 relative; assert 1e-3.
+        let mut lg = LOGGAIN_MIN_Q9;
+        while lg <= LOGGAIN_MAX_Q9 {
+            let (gain, nlsgain) = inverse_log_gain(lg as i16);
+            let sigma = f64::from(gain) * (2.0f64).powi(-nlsgain);
+            let z_db = (f64::from(lg) + f64::from(GOFF_Q9)) / 512.0;
+            let want = 10.0f64.powf(z_db / 20.0);
+            let rel = (sigma - want).abs() / want;
+            assert!(
+                rel < 1e-3,
+                "LOGGAIN {lg}: σ fixed {sigma} vs exact {want} (rel {rel})"
+            );
+            lg += 37; // dense-but-fast sweep
+        }
+    }
+
+    #[test]
+    fn inverse_log_gain_unity_at_floor() {
+        // At the −32 dB floor, Z = 0 dB ⇒ σ = 1 exactly: [X] = 0,
+        // x = 0, the polynomial collapses to c0 ⇒ GAIN = 16384 Q14.
+        let (gain, nlsgain) = inverse_log_gain(LOGGAIN_MIN_Q9 as i16);
+        assert_eq!(gain, 16384);
+        assert_eq!(nlsgain, 14);
+    }
+
+    #[test]
+    fn predict_on_fresh_state_returns_floor() {
+        // Table G.2 initial state: GP = (1, −1, 0, …) Q14 and
+        // GSTATE = −16384 Q9 everywhere ⇒ the prediction is
+        // −GP(2)·GSTATE(1) >> 14 = −16384 (−32 dB) ⇒ unity σ.
+        let mut gp = [0i16; LPCLG + 1];
+        gp[0] = 16384;
+        gp[1] = -16384;
+        let mut gstate = [GSTATE_INIT_Q9; LPCLG];
+        let lg = log_gain_predict(&gp, &mut gstate);
+        assert_eq!(lg, -16384);
+        let lg = limit_log_gain_q9(lg);
+        let (gain, nlsgain) = inverse_log_gain(lg);
+        assert_eq!((gain, nlsgain), (16384, 14));
+    }
+
+    #[test]
+    fn predict_shifts_gstate_delay_line() {
+        let mut gp = [0i16; LPCLG + 1];
+        gp[0] = 16384;
+        let mut gstate: [i16; LPCLG] = std::array::from_fn(|i| (i as i16 + 1) * 100);
+        let _ = log_gain_predict(&gp, &mut gstate);
+        // GSTATE(i) = GSTATE(i−1): everything moves one down, GSTATE(1)
+        // untouched (the driver overwrites it via blocks 96/97).
+        let want: [i16; LPCLG] = std::array::from_fn(|i| if i == 0 { 100 } else { i as i16 * 100 });
+        assert_eq!(gstate, want);
+    }
+
+    #[test]
+    fn limiter_clips_both_ends() {
+        assert_eq!(limit_log_gain_q9(20000), LOGGAIN_MAX_Q9 as i16);
+        assert_eq!(limit_log_gain_q9(-20000), LOGGAIN_MIN_Q9 as i16);
+        assert_eq!(limit_log_gain_q9(1234), 1234);
+    }
+
+    #[test]
+    fn gstate1_update_matches_float_formula() {
+        // Blocks 93/94/96/97 vs the float eq. G-14 on the Q11 tables:
+        // δ(n−1) = δ̂(n−1) + GCBLG + SHAPELG, floored at −32 dB. The Q16
+        // alignment + >> 7 truncation loses at most 1 Q9 quantum.
+        for &(lg, ig, is) in &[
+            (0i16, 1usize, 1usize),
+            (5120, 4, 21),   // large positive contributions
+            (-8000, 1, 96),  // strong negative shape term
+            (-16384, 1, 96), // floor engaged
+            (14336, 8, 21),  // sign-mirrored gain level
+        ] {
+            let got = gstate1_update(lg, ig, is);
+            let f = f64::from(lg) / 512.0
+                + f64::from(crate::tables::GCBLG_Q11[ig - 1]) / 2048.0
+                + f64::from(crate::tables::SHAPELG_Q11[is - 1]) / 2048.0;
+            let want = (f.max(-32.0) * 512.0).floor();
+            assert!(
+                (f64::from(got) - want).abs() <= 1.0,
+                "gstate1({lg}, {ig}, {is}) = {got} vs float {want}"
+            );
+        }
+    }
 
     #[test]
     fn dimensions_match_spec() {

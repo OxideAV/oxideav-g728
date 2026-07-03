@@ -322,6 +322,51 @@ pub const GSQ: [f64; NG] = [
 ];
 
 // ---------------------------------------------------------------------
+// Annex G §G.5 — log-gain tables for the fixed-point gain adapter
+// (Figure G.1 blocks 93 / 94).
+//
+// Table G.3/G.728 stores 20·log10|gᵢ| and Table G.4/G.728 stores
+// 10·log10 P[yⱼ] in Q11 ("to obtain the fixed point value, multiply
+// the floating point value by 2048 = 2¹¹"). The per-test guards
+// `gcblg_q11_matches_float_db` / `shapelg_q11_matches_float_db`
+// cross-check every transcribed entry against the floating-point dB
+// functions [`crate::annex_g_gain::gain_log_db`] /
+// [`crate::annex_g_gain::shape_log_db`] (which derive the same values
+// from the Annex A / Annex B codebook columns), guarding both the
+// PDF-OCR transcription and the derivation in one shot.
+// ---------------------------------------------------------------------
+
+/// Table G.3/G.728 — `GCBLG(i) = 20·log10|gq(i)|` in Q11 for the 8
+/// gain-codebook levels (block 93). The printed table lists the four
+/// magnitudes (indices 0–3); the sign-mirrored levels 4–7 share the
+/// same dB values.
+pub const GCBLG_Q11: [i16; NG] = [
+    -11783, -1828, 8127, 18082, // indices 0..3 (|g| = 0.5156 … 2.7634)
+    -11783, -1828, 8127, 18082, // indices 4..7 (negated levels, same |g|)
+];
+
+/// Table G.4/G.728 — `SHAPELG(j) = 10·log10 P[yⱼ]` in Q11 for the 128
+/// shape codevectors (block 94), `P[yⱼ] = (1/5)·Σ yⱼₖ²`.
+pub const SHAPELG_Q11: [i16; NCWD] = [
+    -227, 10308, 6549, 7753, 7597, 16563, 6406, 11933, // 0..7
+    13569, 10569, 16328, 6536, 15803, 11673, 21318, 9100, // 8..15
+    12245, 12018, 2503, 14690, 18190, 28801, 16803, 20331, // 16..23
+    18019, 24920, 16159, 17618, 23072, 28075, 19169, 25723, // 24..31
+    8670, 10069, 503, 8647, 11165, 18447, 4264, 17381, // 32..39
+    3531, 10543, -2392, 2266, 14527, 18788, 13030, 6238, // 40..47
+    1825, 9090, 211, 1888, 18088, 22557, 10893, 18156, // 48..55
+    3426, 13400, -4375, 7970, 7754, 25270, 5313, 15615, // 56..63
+    -6296, 4510, 2202, -7229, 3146, -2818, -2674, -1567, // 64..71
+    1841, 5803, 7824, 319, 1815, 1765, 6949, 2484, // 72..79
+    2808, 9714, -4215, 6678, 2634, 3509, 871, 2190, // 80..87
+    5546, 15337, 3708, 2406, 5750, 7538, 3912, 3543, // 88..95
+    -10104, 303, -6161, -1142, 3867, 5935, -7201, -759, // 96..103
+    -2093, -2863, 2217, -3243, 6161, 5853, 7599, 6747, // 104..111
+    -2001, 10218, -54, 1912, 11495, 10575, 4517, 4279, // 112..119
+    1813, 566, 4569, 4153, 3368, 11179, 1694, 761, // 120..127
+];
+
+// ---------------------------------------------------------------------
 // Precomputed shape-codevector energy table `E_j = Σ_k y_j(k)²`
 //
 // Spec source: §3.9 of the G.728 (1992-09) Recommendation derives the
@@ -512,6 +557,38 @@ pub fn facgpv_f64() -> [f64; LPCLG + 1] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gcblg_q11_matches_float_db() {
+        // Table G.3 = round(20·log10|gq| · 2048); the float dB values
+        // derive from the same Annex B gain-codebook column.
+        let db = crate::annex_g_gain::gain_log_db();
+        for i in 0..NG {
+            let want = (db[i] * 2048.0).round() as i32;
+            let diff = (i32::from(GCBLG_Q11[i]) - want).abs();
+            assert!(
+                diff <= 1,
+                "GCBLG_Q11[{i}] = {} but float dB gives {want}",
+                GCBLG_Q11[i]
+            );
+        }
+    }
+
+    #[test]
+    fn shapelg_q11_matches_float_db() {
+        // Table G.4 = round(10·log10 P[y_j] · 2048); the float dB values
+        // derive from the same Annex A shape-codebook rows.
+        let db = crate::annex_g_gain::shape_log_db();
+        for j in 0..NCWD {
+            let want = (db[j] * 2048.0).round() as i32;
+            let diff = (i32::from(SHAPELG_Q11[j]) - want).abs();
+            assert!(
+                diff <= 1,
+                "SHAPELG_Q11[{j}] = {} but float dB gives {want}",
+                SHAPELG_Q11[j]
+            );
+        }
+    }
 
     // ------------- Cardinality cross-checks against spec prose --------
 
