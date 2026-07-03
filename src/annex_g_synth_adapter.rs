@@ -76,12 +76,12 @@ pub const N5: usize = NFRSZ / IDIM;
 /// `N6 = N4 - N5 = 17` — number of `NLSSB` entries kept across the shift.
 pub const N6: usize = N4 - N5;
 
-/// Initial value of every per-segment `NLSSB` / `NLSREXP` entry. The
-/// fresh `SB` buffer is all zero, held at the maximum left shift; the
-/// recursive autocorrelation `REXP` starts at zero with shift 0 (its
-/// scale is established on the first non-zero cycle). The annex's Table 2
-/// lists all of `SB` / `REXP` as zero at reset.
-pub const NLSSB_INIT: i32 = 0;
+/// Initial value of every per-segment `NLSSB` entry — Table G.2/G.728
+/// lists `NLSSB` (like `NLSSTATE` / `NLSSTTMP`) with "initial value =
+/// 16": the fresh all-zero `SB` buffer is held at the maximum useful
+/// left shift. (`NLSREXP` starts at its own Table G.2 value 31 — see
+/// [`crate::annex_g_hybrid::NLSREXP_INIT_G2`].)
+pub const NLSSB_INIT: i32 = crate::annex_g_hybrid::NLSSB_INIT_G2;
 
 /// One quantized-speech `ST` vector in 14-bit BFL form: `IDIM` mantissas
 /// sharing one number-of-left-shifts `nls`. This is the per-segment unit

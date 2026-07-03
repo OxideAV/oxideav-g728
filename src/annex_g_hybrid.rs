@@ -42,6 +42,15 @@
 use crate::annex_g_arith::{findnls, rnd, shl_sat, shr_sat};
 use crate::consts::IDIM;
 
+/// Initial `NLSSB` per-segment shift — Table G.2/G.728 lists `NLSSB`
+/// (and `NLSSTATE` / `NLSSTTMP`) with "initial value = 16": a zeroed
+/// signal-history buffer is held at the maximum useful left shift.
+pub const NLSSB_INIT_G2: i32 = 16;
+
+/// Initial `NLSREXP` / `NLSREXPW` / `NLSREXPLG` — Table G.2/G.728 lists
+/// all three recursive-autocorrelation shifts with "initial value = 31".
+pub const NLSREXP_INIT_G2: i32 = 31;
+
 /// `NLSATT50 = 14` — the attenuation NLS realising the `3/4` recursive
 /// decay shared by every G.728 hybrid window (§G.3.17): HWMCORE forms
 /// `−RREC << 14 + RREC << 16` over a `>> 16`, i.e.
@@ -138,10 +147,48 @@ pub struct HwmcoreOut {
     pub illcond: bool,
 }
 
+/// The permanent state of one §G.3.18 HWMCORE instance: the recursive-
+/// autocorrelation `RREC`/`REXP` BFL mantissas plus their shared shift
+/// `NLSREXP`. Every G.728 hybrid window (blocks 36 / 43 / 49) owns one;
+/// the segmented-SBFL front end ([`HybridWindowFixedState`]) and the
+/// flat-`Q9` log-gain front end (§G.3.14 block 43) both drive it.
+#[derive(Debug, Clone)]
+pub struct HwmcoreState {
+    /// `REXP(1..=order+1)` recursive-autocorrelation BFL mantissas.
+    rexp: Vec<i16>,
+    /// `NLSREXP` — the shared shift of the BFL `REXP` block.
+    nlsrexp: i32,
+}
+
+impl HwmcoreState {
+    /// Fresh HWMCORE state for an `order`-tap window: zeroed `REXP`
+    /// (Table G.2 lists `REXP` / `REXPW` / `REXPLG` all zero at reset)
+    /// with `NLSREXP` at its Table G.2 initial value 31.
+    #[must_use]
+    pub fn new(order: usize) -> Self {
+        Self {
+            rexp: vec![0; order + 1],
+            nlsrexp: NLSREXP_INIT_G2,
+        }
+    }
+
+    /// Borrow the recursive-autocorrelation `REXP` (for tests/audit).
+    #[must_use]
+    pub fn rexp(&self) -> &[i16] {
+        &self.rexp
+    }
+
+    /// `NLSREXP` — the shared shift of `REXP` (for tests/audit).
+    #[must_use]
+    pub fn nlsrexp(&self) -> i32 {
+        self.nlsrexp
+    }
+}
+
 /// Mutable state of one fixed-point hybrid-window adaptation chain: the
 /// permanent SBFL signal-history buffer `SB` with its per-segment `NLSSB`,
-/// and the recursive-autocorrelation `REXP` (BFL) with its shift
-/// `NLSREXP`. Sized to the [`HybridWindowFixed`] it is constructed for.
+/// and the recursive-autocorrelation core [`HwmcoreState`] (`REXP` /
+/// `NLSREXP`). Sized to the [`HybridWindowFixed`] it is constructed for.
 #[derive(Debug, Clone)]
 pub struct HybridWindowFixedState {
     order: usize,
@@ -151,16 +198,13 @@ pub struct HybridWindowFixedState {
     sb: Vec<i16>,
     /// `NLSSB(1..=N4)` per-segment shifts, 0-based.
     nlssb: Vec<i32>,
-    /// `REXP(1..=order+1)` recursive-autocorrelation BFL mantissas.
-    rexp: Vec<i16>,
-    /// `NLSREXP` — the shared shift of the BFL `REXP` block.
-    nlsrexp: i32,
+    /// Blocks §G.3.18 — the recursive-autocorrelation core.
+    core: HwmcoreState,
 }
 
 impl HybridWindowFixedState {
-    /// Fresh state: zeroed `SB` / `REXP` per Table 2/G.728, `NLSSB` /
-    /// `NLSREXP` at zero (the recursive scale is established on the first
-    /// non-zero cycle).
+    /// Fresh state: zeroed `SB` / `REXP` per Table G.2/G.728, with the
+    /// Table G.2 initial shifts (`NLSSB = 16`, `NLSREXP = 31`).
     #[must_use]
     pub fn new(win: &HybridWindowFixed<'_>) -> Self {
         Self {
@@ -168,9 +212,8 @@ impl HybridWindowFixedState {
             l: win.l,
             n: win.n,
             sb: vec![0; win.n3()],
-            nlssb: vec![0; win.n4()],
-            rexp: vec![0; win.order + 1],
-            nlsrexp: 0,
+            nlssb: vec![NLSSB_INIT_G2; win.n4()],
+            core: HwmcoreState::new(win.order),
         }
     }
 
@@ -189,13 +232,13 @@ impl HybridWindowFixedState {
     /// Borrow the recursive-autocorrelation `REXP` (for tests/audit).
     #[must_use]
     pub fn rexp(&self) -> &[i16] {
-        &self.rexp
+        self.core.rexp()
     }
 
     /// `NLSREXP` — the shared shift of `REXP` (for tests/audit).
     #[must_use]
     pub fn nlsrexp(&self) -> i32 {
-        self.nlsrexp
+        self.core.nlsrexp()
     }
 
     /// Run one hybrid-window + HWMCORE cycle on `new_segs` (the `N5` new
@@ -208,7 +251,7 @@ impl HybridWindowFixedState {
         debug_assert_eq!(new_segs.len(), win.n5(), "new-segment count must be N5");
 
         let (ws, nlstmp) = self.window_step(win, new_segs);
-        self.hwmcore(win, &ws, nlstmp)
+        self.core.run(win.order, win.n1(), win.n3(), &ws, nlstmp)
     }
 
     /// §G.3.17 windowing step (block 49 / block 36): shift the SBFL `SB`
@@ -272,16 +315,27 @@ impl HybridWindowFixedState {
 
         (ws, nlstmp)
     }
+}
 
+impl HwmcoreState {
     /// §G.3.18 HWMCORE: accumulate the recursive (3/4-decay) and
     /// non-recursive autocorrelation components from the BFL windowed
-    /// signal `ws`, thread the BFL shift through the `REXP` update, apply
-    /// the white-noise correction, and emit the BFL `RTMP` plus the
-    /// `ILLCOND` verdict.
-    fn hwmcore(&mut self, win: &HybridWindowFixed<'_>, ws: &[i16], nlstmp: i32) -> HwmcoreOut {
-        let lpo = win.order;
-        let n1 = win.n1();
-        let n3 = win.n3();
+    /// signal `ws` (shared shift `nlstmp`), thread the BFL shift through
+    /// the `REXP` update, apply the white-noise correction, and emit the
+    /// BFL `RTMP` plus the `ILLCOND` verdict. `order` / `n1` / `n3` are
+    /// the caller's window dimensions (`LPC`+`NFRSZ`… for block 49,
+    /// `LPCLG`+`NUPDATE`… for block 43).
+    pub fn run(
+        &mut self,
+        order: usize,
+        n1: usize,
+        n3: usize,
+        ws: &[i16],
+        nlstmp: i32,
+    ) -> HwmcoreOut {
+        let lpo = order;
+        debug_assert_eq!(self.rexp.len(), lpo + 1);
+        debug_assert!(ws.len() >= n3);
 
         // | NLSAA0 = 2 * NLSTMP    | scale of WS²
         let nls_aa0 = 2 * nlstmp;
@@ -314,7 +368,15 @@ impl HybridWindowFixedState {
             for i in 1..=lpo {
                 let mut aa0 = energy(i) >> 1;
                 let ri = self.rexp[i] as i64;
-                let aa1 = ((ri << NLSATT50) + (ri << 16)) >> ir;
+                // The published §G.3.18 case-1 loop line reads
+                // "AA1 = AA1 + (RREC(I+1) << 16)" — a sign typo (it
+                // would scale RREC by 5/4). Its own margin comment says
+                // "Scale RREC by 3/4", the R(1) line three lines above
+                // and all four case-2/case-3 instances spell
+                // "AA1 = −AA1 + (RREC << 16)", and the floating-point
+                // recursion is REXP = (3/4)·REXP + TMP; we follow the
+                // five consistent instances.
+                let aa1 = ((-(ri << NLSATT50)) + (ri << 16)) >> ir;
                 aa0 += aa1;
                 aa0 = shl_acc(aa0, nlsre);
                 new_rexp[i] = rnd(clamp_i32(aa0));
