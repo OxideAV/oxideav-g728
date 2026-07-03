@@ -253,7 +253,7 @@ pub use annex_g_gain_adapter::{
 };
 pub use annex_g_hybrid::{
     BflSegment, HwmcoreOut, HwmcoreState, HybridWindowFixed, HybridWindowFixedState, NLSATT50,
-    NLSREXP_INIT_G2, NLSSB_INIT_G2,
+    NLSATTW, NLSREXP_INIT_G2, NLSSB_INIT_G2,
 };
 pub use annex_g_levinson::{
     levinson_durbin_fixed, levinson_durbin_fixed_resume, simpdiv, LevinsonInput, LevinsonStatus,
@@ -268,7 +268,7 @@ pub use annex_g_postfilter::{
 pub use annex_g_synth_adapter::{
     bandwidth_expand_q14, log_gain_bandwidth_expand, StSegment, SynthAdapterFixed, NLSSB_INIT,
 };
-pub use annex_g_weight_adapter::{WeightAdapterFixed, WeightCoeffFixed, N5W};
+pub use annex_g_weight_adapter::{WeightAdapterFixed, WeightCoeffFixed, N1W, N2W, N3W};
 pub use bitstream::{pack_indices, unpack_indices};
 pub use codebook_search::{CodebookSearch, SearchResult};
 pub use decoder::{

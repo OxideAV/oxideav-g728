@@ -139,6 +139,13 @@ pub struct LevinsonStatus {
     /// success, or the last good value on failure. The decoder saves this
     /// at the order-10 interruption to feed [`RecursionResume`].
     pub alphatmp: i16,
+    /// `RC1` — the first reflection coefficient (Q15), captured at the
+    /// first-order step of a fresh run (Table G.2's "temporary buffer
+    /// for first reflection coefficients"). Block 85 (the short-term
+    /// postfilter coefficient calculator) consumes it as `k1`. Zero on
+    /// a resume run (the fresh order-10 run already reported it) and on
+    /// failures before the first-order step.
+    pub rc1: i16,
 }
 
 /// Inputs to the §G.2.2 recursion.
@@ -232,6 +239,7 @@ fn run(
 
     let mut nrs: i32;
     let mut alphatmp: i16;
+    let mut rc1_out: i16 = 0;
 
     if minc0 > 1 {
         // RECURSION restart (decoder, MINC0 = 10): load carried state.
@@ -248,11 +256,11 @@ fn run(
         //
         // | If ILLCOND = .TRUE., go to FAILED            | RTMP(LPC+1)=0
         if input.illcond {
-            return failed(0, lpc, 15, 0);
+            return failed(0, lpc, 15, 0, 0);
         }
         // | If RTMP(1) ≤ 0, go to FAILED                 | Skip if zero signal
         if r(1) <= 0 {
-            return failed(0, lpc, 15, 0);
+            return failed(0, lpc, 15, 0, 0);
         }
         // | NRS = 0                                      | Q15 format initially
         nrs = 0;
@@ -277,6 +285,7 @@ fn run(
         // | RC = RC1                                     |
         // | ATMP(2) = RC1                               | First order coeff
         let rc = rc1;
+        rc1_out = rc1;
         atmp[1] = rc1;
         // | ATMP(1) = 1 (Q15 unity)                      | implicit unity tap
         atmp[0] = i16::MAX; // 0x7FFF ≈ 1.0 in Q15
@@ -320,7 +329,7 @@ fn run(
         let num = (sign as i32).unsigned_abs().min(i16::MAX as u32) as i16;
         // | If NUM ≥ ALPHATMP, go to FAILED             |
         if (num as i32) >= (alphatmp as i32) {
-            return failed(minc, lpc, 15 - nrs, alphatmp);
+            return failed(minc, lpc, 15 - nrs, alphatmp, rc1_out);
         }
         // | Call SIMPDIV(NUM, ALPHATMP, AA0)            | Divide to get RC
         let div = simpdiv(num, alphatmp);
@@ -343,7 +352,7 @@ fn run(
         let p = (rc as i64) * (sign as i64);
         alpha_acc += p << 1;
         if alpha_acc <= 0 {
-            return failed(minc, lpc, 15 - nrs, alphatmp);
+            return failed(minc, lpc, 15 - nrs, alphatmp, rc1_out);
         }
         alphatmp = rnd(clamp_acc(alpha_acc));
 
@@ -408,7 +417,7 @@ fn run(
     // | If NLSATMP < 13, go to FAILED                   |
     let nlsatmp = 15 - nrs;
     if nlsatmp < 13 {
-        return failed(lpc, lpc, nlsatmp, alphatmp);
+        return failed(lpc, lpc, nlsatmp, alphatmp, rc1_out);
     }
     // | Exit this program  — recursion completed normally
     LevinsonStatus {
@@ -418,6 +427,7 @@ fn run(
         nrs,
         stopped_at: lpc + 1,
         alphatmp,
+        rc1: rc1_out,
     }
 }
 
@@ -426,7 +436,7 @@ fn run(
 /// invalid). `minc == 0` covers the two pre-recursion failure tests,
 /// which precede any postfilter-coefficient derivation, so `ILLCONDP` is
 /// set there too.
-fn failed(minc: usize, lpc: usize, nlsatmp: i32, alphatmp: i16) -> LevinsonStatus {
+fn failed(minc: usize, lpc: usize, nlsatmp: i32, alphatmp: i16, rc1: i16) -> LevinsonStatus {
     // | FAILED: Set ILLCOND = .TRUE.
     // |         If MINC ≤ 10, set ILLCONDP = .TRUE.
     let illcondp = minc <= 10;
@@ -437,6 +447,7 @@ fn failed(minc: usize, lpc: usize, nlsatmp: i32, alphatmp: i16) -> LevinsonStatu
         nrs: 15 - nlsatmp,
         stopped_at: if minc == 0 { lpc + 1 } else { minc },
         alphatmp,
+        rc1,
     }
 }
 

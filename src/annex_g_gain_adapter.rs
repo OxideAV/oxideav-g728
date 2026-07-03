@@ -141,7 +141,14 @@ impl LogGainWindowFixed {
         // | NLSATTLG = 14
         // | Call HWMCORE(LPCLG, N1, N3, NLSATTLG, WS, NLSTMP,
         // |              REXPLG, NLSREXPLG, R, ILLCONDG)
-        self.core.run(LPCLG, N1LG, N3LG, &ws, nlstmp)
+        self.core.run(
+            LPCLG,
+            N1LG,
+            N3LG,
+            crate::annex_g_hybrid::NLSATT50,
+            &ws,
+            nlstmp,
+        )
     }
 }
 
@@ -661,6 +668,7 @@ mod tests {
             l: NUPDATE,
             n: NONRLG,
             window: &fwin,
+            decay: 0.75,
         };
         let mut fstate = HybridWindowState::new(&fhw);
         let mut xstate = LogGainWindowFixed::new();

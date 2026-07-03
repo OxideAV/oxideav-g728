@@ -111,6 +111,7 @@ fn synth_window() -> HybridWindowFixed<'static> {
         l: NFRSZ,
         n: NONR,
         window: &WNR_Q15,
+        nlsatt: NLSATT50,
     }
 }
 
@@ -480,6 +481,7 @@ mod tests {
         atmp[1] = -(1 << 13); // -0.5 Q14
         atmp[2] = 1 << 12; // 0.25 Q14
         let status = LevinsonStatus {
+            rc1: 0,
             illcond: false,
             illcondp: false,
             nlsatmp: 14,
@@ -509,6 +511,7 @@ mod tests {
         atmp[0] = 1 << 14;
         atmp[1] = -(1 << 13);
         let status = LevinsonStatus {
+            rc1: 0,
             illcond: true,
             illcondp: false,
             nlsatmp: 14,

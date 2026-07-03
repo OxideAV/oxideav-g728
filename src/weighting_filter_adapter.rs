@@ -136,6 +136,10 @@ impl WeightingFilterAdapter {
             l: NFRSZ,
             n: NONRW,
             window: wnrw,
+            // Block 36's recursive decay is 1/2 (base spec §5.3
+            // pseudo-code: "REXPW(I) = (1/2)·REXPW(I) + TMP"), unlike
+            // the 3/4 of blocks 43/49.
+            decay: 0.5,
         }
     }
 

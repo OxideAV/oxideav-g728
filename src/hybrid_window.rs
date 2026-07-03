@@ -55,9 +55,11 @@ use crate::consts::WNCF;
 ///
 /// All three G.728 hybrid-window blocks share this shape: a window
 /// table sized `n3 = m + l + n`, an LPC order `m`, an input length `l`
-/// (samples per call), and a non-recursive tail length `n`. The
-/// recursive decay factor is `3/4` in every G.728 block (see module
-/// header).
+/// (samples per call), a non-recursive tail length `n` and a recursive
+/// decay factor: `3/4` for the synthesis-filter (block 49) and log-gain
+/// (block 43) windows, but `1/2` for the perceptual-weighting-filter
+/// window (block 36) — the base Recommendation's block-36 pseudo-code
+/// spells `REXPW(I) = (1/2)·REXPW(I) + TMP`.
 #[derive(Debug, Clone, Copy)]
 pub struct HybridWindow<'a> {
     /// LPC order — `m` in the spec (LPC = 50, LPCW = 10, LPCLG = 10).
@@ -72,6 +74,9 @@ pub struct HybridWindow<'a> {
     /// spec). Element 0 corresponds to spec `WNR(1)` (the rightmost /
     /// newest sample's weight in the right-to-left walk).
     pub window: &'a [f64],
+    /// Recursive-component decay: `0.75` for blocks 43/49, `0.5` for
+    /// block 36.
+    pub decay: f64,
 }
 
 impl<'a> HybridWindow<'a> {
@@ -199,7 +204,7 @@ impl HybridWindowState {
             for ni in m..n1 {
                 tmp += ws[ni] * ws[ni - i_out];
             }
-            self.rexp[i_out] = 0.75 * self.rexp[i_out] + tmp;
+            self.rexp[i_out] = window.decay * self.rexp[i_out] + tmp;
         }
 
         // | For I = 1,...,LPC+1, do the next three lines | Add non-recursive part
@@ -235,6 +240,7 @@ mod tests {
             l: NFRSZ,
             n: NONR,
             window: &wnr,
+            decay: 0.75,
         };
         assert_eq!(hw.n3(), 105, "SB buffer length should be 105");
         assert_eq!(hw.n2(), LPC + NONR);
@@ -253,6 +259,7 @@ mod tests {
             l: NUPDATE,
             n: NONRLG,
             window: &wnrg,
+            decay: 0.75,
         };
         assert_eq!(hw.n3(), 34, "SBLG buffer length should be 34");
         let st = HybridWindowState::new(&hw);
@@ -270,6 +277,7 @@ mod tests {
             l: NFRSZ,
             n: NONR,
             window: &wnr,
+            decay: 0.75,
         };
         let st = HybridWindowState::new(&hw);
         assert!(st.sb().iter().all(|&v| v == 0.0));
@@ -287,6 +295,7 @@ mod tests {
             l: NFRSZ,
             n: NONR,
             window: &wnr,
+            decay: 0.75,
         };
         let mut st = HybridWindowState::new(&hw);
         let input = vec![0.0; NFRSZ];
@@ -313,6 +322,7 @@ mod tests {
             l: NUPDATE,
             n: NONRLG,
             window: &wnrg,
+            decay: 0.75,
         };
         let mut st = HybridWindowState::new(&hw);
         let mut input = vec![0.0; NUPDATE];
@@ -340,6 +350,7 @@ mod tests {
             l: NUPDATE,
             n: NONRLG,
             window: &wnrg,
+            decay: 0.75,
         };
         let mut st = HybridWindowState::new(&hw);
         // Drive several cycles to populate the recursive part.

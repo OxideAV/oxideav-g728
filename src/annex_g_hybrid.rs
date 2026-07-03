@@ -52,10 +52,15 @@ pub const NLSSB_INIT_G2: i32 = 16;
 pub const NLSREXP_INIT_G2: i32 = 31;
 
 /// `NLSATT50 = 14` — the attenuation NLS realising the `3/4` recursive
-/// decay shared by every G.728 hybrid window (§G.3.17): HWMCORE forms
-/// `−RREC << 14 + RREC << 16` over a `>> 16`, i.e.
-/// `(−2¹⁴ + 2¹⁶)/2¹⁶ = 49152/65536 = 0.75`.
+/// decay of the synthesis-filter (block 49) and log-gain (block 43)
+/// hybrid windows: HWMCORE forms `−RREC << 14 + RREC << 16` over a
+/// `>> 16`, i.e. `(−2¹⁴ + 2¹⁶)/2¹⁶ = 49152/65536 = 0.75`.
 pub const NLSATT50: i32 = 14;
+
+/// `NLSATTW = 15` — the attenuation NLS realising block 36's `1/2`
+/// recursive decay (§G.3.12; the base spec's float block 36 spells
+/// `REXPW(I) = (1/2)·REXPW(I) + TMP`): `(−2¹⁵ + 2¹⁶)/2¹⁶ = 0.5`.
+pub const NLSATTW: i32 = 15;
 
 /// `MLS` for the double-precision accumulator passed to the §G.1.3
 /// `VSCALE` / `FINDNLS` inside HWMCORE (the 32-bit `AA0` / `AA1`
@@ -101,6 +106,9 @@ pub struct HybridWindowFixed<'a> {
     /// spec's `WNR(1)` (the newest sample's weight in the right-to-left
     /// walk).
     pub window: &'a [i16],
+    /// Attenuation NLS for the recursive decay ([`NLSATT50`] = 14 for
+    /// blocks 43/49's 3/4, [`NLSATTW`] = 15 for block 36's 1/2).
+    pub nlsatt: i32,
 }
 
 impl HybridWindowFixed<'_> {
@@ -183,6 +191,15 @@ impl HwmcoreState {
     pub fn nlsrexp(&self) -> i32 {
         self.nlsrexp
     }
+
+    /// §G.3.12's post-core clamp ("If NLSREXPW > 41, set NLSREXPW =
+    /// 41") — cap the recursive-autocorrelation shift to avoid reduced
+    /// accuracy during long zero-input periods.
+    pub fn clamp_nlsrexp(&mut self, max: i32) {
+        if self.nlsrexp > max {
+            self.nlsrexp = max;
+        }
+    }
 }
 
 /// Mutable state of one fixed-point hybrid-window adaptation chain: the
@@ -251,7 +268,8 @@ impl HybridWindowFixedState {
         debug_assert_eq!(new_segs.len(), win.n5(), "new-segment count must be N5");
 
         let (ws, nlstmp) = self.window_step(win, new_segs);
-        self.core.run(win.order, win.n1(), win.n3(), &ws, nlstmp)
+        self.core
+            .run(win.order, win.n1(), win.n3(), win.nlsatt, &ws, nlstmp)
     }
 
     /// §G.3.17 windowing step (block 49 / block 36): shift the SBFL `SB`
@@ -324,12 +342,15 @@ impl HwmcoreState {
     /// the `REXP` update, apply the white-noise correction, and emit the
     /// BFL `RTMP` plus the `ILLCOND` verdict. `order` / `n1` / `n3` are
     /// the caller's window dimensions (`LPC`+`NFRSZ`… for block 49,
-    /// `LPCLG`+`NUPDATE`… for block 43).
+    /// `LPCLG`+`NUPDATE`… for block 43, `LPCW`+`NFRSZ`… for block 36)
+    /// and `nlsatt` selects the recursive decay (`NLSATT50` = 14 ⇒ 3/4,
+    /// `NLSATTW` = 15 ⇒ 1/2).
     pub fn run(
         &mut self,
         order: usize,
         n1: usize,
         n3: usize,
+        nlsatt: i32,
         ws: &[i16],
         nlstmp: i32,
     ) -> HwmcoreOut {
@@ -360,7 +381,7 @@ impl HwmcoreState {
             let ir = nls_rrec - nls_aa0 + 1;
             let aa0 = aa0_e0 >> 1;
             let r1 = self.rexp[0] as i64;
-            let aa1 = (-(r1 << NLSATT50)) + (r1 << 16);
+            let aa1 = (-(r1 << nlsatt)) + (r1 << 16);
             let aa1 = aa1 >> ir;
             let combined = aa0 + aa1;
             nlsre = findnls(&[clamp_i32(combined)], 1, MLS_ACC);
@@ -376,7 +397,7 @@ impl HwmcoreState {
                 // "AA1 = −AA1 + (RREC << 16)", and the floating-point
                 // recursion is REXP = (3/4)·REXP + TMP; we follow the
                 // five consistent instances.
-                let aa1 = ((-(ri << NLSATT50)) + (ri << 16)) >> ir;
+                let aa1 = ((-(ri << nlsatt)) + (ri << 16)) >> ir;
                 aa0 += aa1;
                 aa0 = shl_acc(aa0, nlsre);
                 new_rexp[i] = rnd(clamp_i32(aa0));
@@ -385,7 +406,7 @@ impl HwmcoreState {
         } else if nls_rrec == nls_aa0 {
             // Case 2.
             let r1 = self.rexp[0] as i64;
-            let aa1 = (-(r1 << NLSATT50)) + (r1 << 16);
+            let aa1 = (-(r1 << nlsatt)) + (r1 << 16);
             let aa0 = aa0_e0 >> 1;
             let aa1 = aa1 >> 1;
             let combined = aa0 + aa1;
@@ -394,7 +415,7 @@ impl HwmcoreState {
             for i in 1..=lpo {
                 let mut aa0 = energy(i) >> 1;
                 let ri = self.rexp[i] as i64;
-                let aa1 = ((-(ri << NLSATT50)) + (ri << 16)) >> 1;
+                let aa1 = ((-(ri << nlsatt)) + (ri << 16)) >> 1;
                 aa0 += aa1;
                 aa0 = shl_acc(aa0, nlsre);
                 new_rexp[i] = rnd(clamp_i32(aa0));
@@ -405,14 +426,14 @@ impl HwmcoreState {
             let ir = nls_aa0 - nls_rrec + 1;
             let aa0 = aa0_e0 >> ir;
             let r1 = self.rexp[0] as i64;
-            let aa1 = ((-(r1 << NLSATT50)) + (r1 << 16)) >> 1;
+            let aa1 = ((-(r1 << nlsatt)) + (r1 << 16)) >> 1;
             let combined = aa0 + aa1;
             nlsre = findnls(&[clamp_i32(combined)], 1, MLS_ACC);
             new_rexp[0] = rnd(clamp_i32(shl_acc(combined, nlsre)));
             for i in 1..=lpo {
                 let mut aa0 = energy(i) >> ir;
                 let ri = self.rexp[i] as i64;
-                let aa1 = ((-(ri << NLSATT50)) + (ri << 16)) >> 1;
+                let aa1 = ((-(ri << nlsatt)) + (ri << 16)) >> 1;
                 aa0 += aa1;
                 aa0 = shl_acc(aa0, nlsre);
                 new_rexp[i] = rnd(clamp_i32(aa0));
@@ -542,6 +563,7 @@ mod tests {
             l: NFRSZ,
             n: NONR,
             window: &WNR_Q15,
+            nlsatt: NLSATT50,
         }
     }
 
@@ -551,6 +573,7 @@ mod tests {
             l: NFRSZ,
             n: NONRW,
             window: &WNRW_Q15,
+            nlsatt: NLSATTW,
         }
     }
 
@@ -634,21 +657,39 @@ mod tests {
         use crate::hybrid_window::{HybridWindow, HybridWindowState};
         use crate::tables::{wnr_f64, wnrw_f64};
 
-        for (order, l, n, fwin, fxwin) in [
-            (LPC, NFRSZ, NONR, wnr_f64().to_vec(), WNR_Q15.to_vec()),
-            (LPCW, NFRSZ, NONRW, wnrw_f64().to_vec(), WNRW_Q15.to_vec()),
+        for (order, l, n, fwin, fxwin, decay, nlsatt) in [
+            (
+                LPC,
+                NFRSZ,
+                NONR,
+                wnr_f64().to_vec(),
+                WNR_Q15.to_vec(),
+                0.75,
+                NLSATT50,
+            ),
+            (
+                LPCW,
+                NFRSZ,
+                NONRW,
+                wnrw_f64().to_vec(),
+                WNRW_Q15.to_vec(),
+                0.5,
+                NLSATTW,
+            ),
         ] {
             let fhw = HybridWindow {
                 m: order,
                 l,
                 n,
                 window: &fwin,
+                decay,
             };
             let xhw = HybridWindowFixed {
                 order,
                 l,
                 n,
                 window: &fxwin,
+                nlsatt,
             };
             let mut fstate = HybridWindowState::new(&fhw);
             let mut xstate = HybridWindowFixedState::new(&xhw);

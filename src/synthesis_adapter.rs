@@ -132,6 +132,7 @@ impl SynthesisAdapter {
             l: NFRSZ,
             n: NONR,
             window: wnr,
+            decay: 0.75,
         }
     }
 

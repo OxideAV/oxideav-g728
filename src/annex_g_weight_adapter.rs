@@ -5,12 +5,16 @@
 //! (§3.3, eq. 3-4a) is backward-adapted from past input speech by the same
 //! three-stage chain as the synthesis filter, at order `LPCW = 10`:
 //!
-//! * **block 36** (§G.3.17 windowing structure) — the perceptual-weighting
-//!   hybrid window `WNRW` (Annex A.3, `N3 = LPCW + NFRSZ + NONRW = 60`)
-//!   applied to past input speech, producing the 11 autocorrelation taps
-//!   `R(1..=LPCW+1)`. Structurally identical to block 49 / block 43; this
-//!   module drives the shared §G.3.17 / §G.3.18 core
-//!   [`crate::annex_g_hybrid`] with the `LPCW` dimensions,
+//! * **block 36** (§G.3.12) — the perceptual-weighting hybrid window
+//!   `WNRW` (Annex A.3, `N3 = LPCW + NFRSZ + NONRW = 60`) applied to the
+//!   flat `Q2` past-input-speech buffer `SBW`: one `FINDNLS(…, 14)` call
+//!   over the whole 60-sample buffer sets `NLSTMP = NLS − 1` (2 bits of
+//!   headroom), the `Q15` window multiply rounds into the BFL `WS`, and
+//!   the shared §G.3.18 HWMCORE runs with `NLSATTW = 15` — block 36's
+//!   recursive decay is **1/2** (the base spec's float pseudo-code:
+//!   `REXPW(I) = (1/2)·REXPW(I) + TMP`), unlike the 3/4 of blocks
+//!   43/49. `NLSREXPW` is clamped at 41 after the core ("to avoid
+//!   reduced accuracy … during long periods of zero input signal"),
 //! * **block 37** (§G.2.2) — the fixed-point Levinson-Durbin recursion
 //!   [`levinson_durbin_fixed`], producing the order-10 predictor `QTMP`
 //!   (`q_i`, eq. 3-2f) in the `Q13/Q14/Q15` block-floating format signalled
@@ -40,26 +44,23 @@
 //! [`crate::weighting_filter_coeff::WeightingFilterCoeff`] on identical
 //! requantized speech.
 
-use crate::annex_g_hybrid::{BflSegment, HybridWindowFixed, HybridWindowFixedState};
+use crate::annex_g_arith::{findnls, rnd};
+use crate::annex_g_hybrid::{HwmcoreState, NLSATTW};
 use crate::annex_g_levinson::{levinson_durbin_fixed, LevinsonInput, LevinsonStatus};
 use crate::annex_g_synth_adapter::bandwidth_expand_q14;
 use crate::consts::{LPCW, NFRSZ, NONRW};
 use crate::tables::{WNRW_Q15, WPCFV_Q14, WZCFV_Q14};
 
-/// Number of new `IDIM`-sample segments shifted into the block-36 window
-/// each adaptation cycle (`NFRSZ / IDIM = 4`).
-pub const N5W: usize = NFRSZ / crate::consts::IDIM;
+/// `N1 = LPCW + NFRSZ = 30` — end of the recursive-component taps.
+pub const N1W: usize = LPCW + NFRSZ;
+/// `N2 = LPCW + NONRW = 40` — length of the kept-old part of `SBW`.
+pub const N2W: usize = LPCW + NONRW;
+/// `N3 = LPCW + NFRSZ + NONRW = 60` — total `SBW` / `WS` length.
+pub const N3W: usize = LPCW + NFRSZ + NONRW;
 
-/// The §G.3 perceptual-weighting hybrid window descriptor (block 36):
-/// order `LPCW = 10`, `l = NFRSZ = 20`, `n = NONRW = 30`, window `WNRW`.
-fn weight_window() -> HybridWindowFixed<'static> {
-    HybridWindowFixed {
-        order: LPCW,
-        l: NFRSZ,
-        n: NONRW,
-        window: &WNRW_Q15,
-    }
-}
+/// §G.3.12: "If NLSREXPW > 41, set NLSREXPW = 41" — the zero-input
+/// accuracy clamp applied after HWMCORE.
+pub const NLSREXPW_MAX: i32 = 41;
 
 /// The two Q14 coefficient vectors of `W(z) = Q̃(z/γ₁) / Q̃(z/γ₂)` — the
 /// fixed-point analogue of
@@ -103,8 +104,11 @@ impl Default for WeightCoeffFixed {
 /// (held from the previous cycle when block 37 reports ill-conditioning).
 #[derive(Debug, Clone)]
 pub struct WeightAdapterFixed {
-    /// Block 36 + HWMCORE — the shared §G.3.17 / §G.3.18 core (LPCW dims).
-    hw: HybridWindowFixedState,
+    /// `SBW(1..=N3)` — the flat `Q2` past-input-speech buffer (§G.3.12:
+    /// "All SBW are Q2 and represented in 15 bits precision").
+    sbw: [i16; N3W],
+    /// §G.3.18 HWMCORE state (`REXPW` / `NLSREXPW`, init 31).
+    core: HwmcoreState,
     /// Live Q14 weighting coefficients `W(z) = Q̃(z/γ₁) / Q̃(z/γ₂)`.
     coeff: WeightCoeffFixed,
 }
@@ -122,7 +126,8 @@ impl WeightAdapterFixed {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            hw: HybridWindowFixedState::new(&weight_window()),
+            sbw: [0; N3W],
+            core: HwmcoreState::new(LPCW),
             coeff: WeightCoeffFixed::disabled(),
         }
     }
@@ -133,16 +138,22 @@ impl WeightAdapterFixed {
         &self.coeff
     }
 
-    /// Borrow the SBFL signal-history buffer `SBW` (for tests/audit).
+    /// Borrow the flat `Q2` signal-history buffer `SBW` (for tests/audit).
     #[must_use]
     pub fn sbw(&self) -> &[i16] {
-        self.hw.sb()
+        &self.sbw
     }
 
     /// Borrow the recursive-autocorrelation `REXPW` (for tests/audit).
     #[must_use]
     pub fn rexpw(&self) -> &[i16] {
-        self.hw.rexp()
+        self.core.rexp()
+    }
+
+    /// `NLSREXPW` — the shared shift of `REXPW` (for tests/audit).
+    #[must_use]
+    pub fn nlsrexpw(&self) -> i32 {
+        self.core.nlsrexp()
     }
 
     /// The §3.4.1 disabled `W(z) = 1` coefficient pair (`γ₁ = γ₂ = 0`).
@@ -151,19 +162,47 @@ impl WeightAdapterFixed {
         WeightCoeffFixed::disabled()
     }
 
-    /// Run one adaptation cycle: block 36 (hybrid window) → HWMCORE →
-    /// block 37 (Levinson) → block 38 (two bandwidth expansions).
+    /// Run one adaptation cycle: block 36 (§G.3.12 flat-`Q2` hybrid
+    /// window) → HWMCORE (`NLSATTW = 15`, 1/2 decay) → block 37
+    /// (Levinson) → block 38 (two bandwidth expansions).
     ///
-    /// `sbw` is the `N5W` new `IDIM`-sample input-speech segments of this
-    /// cycle in SBFL form, newest-vector last. The returned
-    /// [`LevinsonStatus`] surfaces the recursion verdict; the live
-    /// [`coeff`](Self::coeff) is updated when block 37 succeeds and left
-    /// unchanged (the previous cycle's pair) when it reports
-    /// ill-conditioning — exactly the §3.4 "keep the previous coefficients"
-    /// rule the floating-point adapter follows on a `LevinsonError`.
-    pub fn adapt(&mut self, sbw: &[BflSegment; N5W]) -> LevinsonStatus {
-        // ---- Blocks 36 + HWMCORE: shared §G.3.17 / §G.3.18 core ----
-        let core = self.hw.run(&weight_window(), sbw);
+    /// `stmp` is the cycle's `NFRSZ = 20` new input-speech samples in
+    /// flat `Q2` (`STMP`, oldest first). The returned [`LevinsonStatus`]
+    /// surfaces the recursion verdict; the live [`coeff`](Self::coeff)
+    /// is updated when block 37 succeeds and left unchanged (the
+    /// previous cycle's pair) when it reports ill-conditioning — the
+    /// §3.4 "keep the previous coefficients" rule.
+    pub fn adapt(&mut self, stmp: &[i16; NFRSZ]) -> LevinsonStatus {
+        // ---- Block 36 (§G.3.12): flat-Q2 front end ------------------
+        // | For N = 1..N2: SBW(N) = SBW(N + NFRSZ)   | Shift old buffer
+        // | For N = 1..NFRSZ: SBW(N2 + N) = STMP(N)  | Newest at SBW(N3)
+        for n in 0..N2W {
+            self.sbw[n] = self.sbw[n + NFRSZ];
+        }
+        self.sbw[N2W..N3W].copy_from_slice(stmp);
+
+        // | Call FINDNLS(SBW, N3, N3, 14, NLS); NLSTMP = NLS − 1
+        let vals: [i32; N3W] = std::array::from_fn(|i| i32::from(self.sbw[i]));
+        let nls = findnls(&vals, N3W, 14);
+        let nlstmp = nls - 1;
+
+        // | K = 1; For N = 60..1: P = SBW(N)·WNRW(K); AA0 = P << NLSTMP;
+        // | WS(N) = RND(AA0); K += 1.
+        // (`P >> 1` when NLSTMP = −1, the same convention block 43
+        // spells out for its own front end.)
+        let mut ws = [0i16; N3W];
+        for (k, n) in (0..N3W).rev().enumerate() {
+            let p = i32::from(self.sbw[n]) * i32::from(WNRW_Q15[k]);
+            let aa0 = if nlstmp == -1 { p >> 1 } else { p << nlstmp };
+            ws[n] = rnd(aa0);
+        }
+
+        // | NLSATTW = 15
+        // | Call HWMCORE(LPCW, N1, N3, NLSATTW, WS, NLSTMP, REXPW,
+        // |              NLSREXPW, R, ILLCONDW)
+        let core = self.core.run(LPCW, N1W, N3W, NLSATTW, &ws, nlstmp);
+        // | If NLSREXPW > 41, set NLSREXPW = 41
+        self.core.clamp_nlsrexp(NLSREXPW_MAX);
 
         // ---- Block 37: §G.2.2 Levinson-Durbin recursion (order LPCW) ----
         let input = LevinsonInput {
@@ -205,50 +244,24 @@ impl WeightAdapterFixed {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consts::{IDIM, WPCF, WZCF};
+    use crate::consts::{WPCF, WZCF};
     use crate::hybrid_window::{HybridWindow, HybridWindowState};
     use crate::levinson::levinson_durbin;
     use crate::tables::wnrw_f64;
     use crate::weighting_filter_coeff::WeightingFilterCoeff;
 
-    fn win() -> HybridWindowFixed<'static> {
-        weight_window()
-    }
-
-    /// Build the `N5W` SBFL segments from `NFRSZ` float samples (14-bit BFL
-    /// normalization) and return the requantized float samples so the float
-    /// oracle sees the same values.
-    fn sbfl_segments(samples: &[f64; NFRSZ]) -> ([BflSegment; N5W], [f64; NFRSZ]) {
-        let mut segs = [BflSegment::zero(0); N5W];
+    /// Quantize `NFRSZ` float speech samples to the flat 15-bit `Q2`
+    /// `STMP` form and return the requantized float samples so the
+    /// float oracle sees the same values.
+    fn q2_stmp(samples: &[f64; NFRSZ]) -> ([i16; NFRSZ], [f64; NFRSZ]) {
+        let mut stmp = [0i16; NFRSZ];
         let mut requant = [0.0f64; NFRSZ];
-        for (j, seg) in segs.iter_mut().enumerate() {
-            let vec: [f64; IDIM] = std::array::from_fn(|m| samples[j * IDIM + m]);
-            let peak = vec.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
-            let nls = if peak <= 0.0 {
-                15
-            } else {
-                let mut n = 0;
-                let mut p = peak;
-                while p < 8192.0 && n < 15 {
-                    p *= 2.0;
-                    n += 1;
-                }
-                while p >= 16384.0 {
-                    p /= 2.0;
-                    n -= 1;
-                }
-                n
-            };
-            let scale = (2.0f64).powi(nls);
-            let mut samp = [0i16; IDIM];
-            for m in 0..IDIM {
-                let q = (vec[m] * scale).round().clamp(-32768.0, 32767.0) as i16;
-                samp[m] = q;
-                requant[j * IDIM + m] = q as f64 / scale;
-            }
-            *seg = BflSegment { samples: samp, nls };
+        for (i, &v) in samples.iter().enumerate() {
+            let q = (v * 4.0).round().clamp(-16384.0, 16383.0);
+            stmp[i] = q as i16;
+            requant[i] = q / 4.0;
         }
-        (segs, requant)
+        (stmp, requant)
     }
 
     fn lcg(seed: &mut u64, amp: f64) -> [f64; NFRSZ] {
@@ -281,14 +294,14 @@ mod tests {
 
     #[test]
     fn dimensions_match_spec() {
-        let w = win();
-        assert_eq!(w.order, LPCW);
-        assert_eq!(w.n3(), 60);
-        assert_eq!(w.n5(), N5W);
-        assert_eq!(N5W, 4);
+        // §G.3.12: N1 = 30, N2 = 40, N3 = 60.
+        assert_eq!(N1W, 30);
+        assert_eq!(N2W, 40);
+        assert_eq!(N3W, 60);
         let a = WeightAdapterFixed::new();
         assert_eq!(a.sbw().len(), 60);
         assert_eq!(a.rexpw().len(), LPCW + 1);
+        assert_eq!(a.nlsrexpw(), 31, "NLSREXPW initial value = 31");
     }
 
     #[test]
@@ -296,8 +309,7 @@ mod tests {
         // Zero-speech ⇒ RTMP all-zero ⇒ ILLCOND ⇒ block 37/38 decline ⇒
         // the disabled W(z) = 1 pair is preserved.
         let mut a = WeightAdapterFixed::new();
-        let segs = [BflSegment::zero(15); N5W];
-        let status = a.adapt(&segs);
+        let status = a.adapt(&[0i16; NFRSZ]);
         assert!(status.illcond, "zero input ⇒ ILLCOND");
         assert_eq!(a.coeff().q_gamma1[0], 1 << 14);
         assert!(a.coeff().q_gamma1[1..].iter().all(|&v| v == 0));
@@ -315,9 +327,9 @@ mod tests {
         let mut seed = 0x51a7_e1b2_c3d4_e5f6u64;
         let mut committed = false;
         for _ in 0..20 {
-            let samples = lcg(&mut seed, 7000.0);
-            let (segs, _) = sbfl_segments(&samples);
-            let status = a.adapt(&segs);
+            let samples = lcg(&mut seed, 3500.0);
+            let (stmp, _) = q2_stmp(&samples);
+            let status = a.adapt(&stmp);
             if !status.illcond {
                 committed = true;
                 assert_eq!(a.coeff().q_gamma1[0], 1 << 14, "numerator unity head");
@@ -352,6 +364,8 @@ mod tests {
             l: NFRSZ,
             n: NONRW,
             window: &wnrw,
+            // Block 36's recursive decay (1/2 — see module header).
+            decay: 0.5,
         };
         let mut fstate = HybridWindowState::new(&fhw);
         let mut a = WeightAdapterFixed::new();
@@ -359,8 +373,8 @@ mod tests {
         let mut seed = 0xfeed_face_dead_c0deu64;
         let mut compared = false;
         for cyc in 0..14 {
-            let samples = lcg(&mut seed, 6500.0);
-            let (segs, requant) = sbfl_segments(&samples);
+            let samples = lcg(&mut seed, 3200.0);
+            let (stmp, requant) = q2_stmp(&samples);
 
             // Float oracle: hybrid window → Levinson → block 38.
             let mut frtmp = [0.0f64; LPCW + 1];
@@ -368,7 +382,7 @@ mod tests {
             let mut fq = [0.0f64; LPCW + 1];
             let fok = levinson_durbin(&frtmp, &mut fq, LPCW).is_ok();
 
-            let status = a.adapt(&segs);
+            let status = a.adapt(&stmp);
 
             if cyc >= 11 && fok && !status.illcond {
                 // Float block 38 for reference (γ₁ = 0.9, γ₂ = 0.6).
@@ -412,8 +426,8 @@ mod tests {
                 let t = (cyc * NFRSZ + i) as f64;
                 *s = (t * 0.17).sin() * 6000.0;
             }
-            let (segs, _) = sbfl_segments(&samples);
-            a.adapt(&segs);
+            let (stmp, _) = q2_stmp(&samples);
+            a.adapt(&stmp);
             assert_eq!(a.coeff().q_gamma1[0], 1 << 14);
             assert_eq!(a.coeff().q_gamma2[0], 1 << 14);
         }

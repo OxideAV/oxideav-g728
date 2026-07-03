@@ -102,6 +102,7 @@ impl GainAdapter {
             l: NUPDATE,
             n: NONRLG,
             window: &wnrg,
+            decay: 0.75,
         };
         let hw_state = HybridWindowState::new(&hw);
 
@@ -254,6 +255,7 @@ impl GainAdapter {
             l: NUPDATE,
             n: NONRLG,
             window: &self.wnrg,
+            decay: 0.75,
         };
 
         // ----- Block 43: hybrid window → R ---------------------------
