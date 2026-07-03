@@ -214,6 +214,7 @@ pub mod annex_g_gain_adapter;
 pub mod annex_g_hybrid;
 pub mod annex_g_levinson;
 pub mod annex_g_pf_coeff;
+pub mod annex_g_pitch;
 pub mod annex_g_postfilter;
 pub mod annex_g_synth_adapter;
 pub mod annex_g_weight_adapter;
@@ -257,6 +258,7 @@ pub use annex_g_levinson::{
     RecursionResume,
 };
 pub use annex_g_pf_coeff::{short_term_coeff_fixed, TILTF_Q14};
+pub use annex_g_pitch::{apf_to_q13, PitchAdapterFixed};
 pub use annex_g_postfilter::{
     scale_factor, LongTermCoeff, PostfilterFixed, ShortTermCoeff, AGCFAC1_Q21, AGCFAC_Q14,
     PF_ORDER, SCALEFIL_INIT_Q14,
