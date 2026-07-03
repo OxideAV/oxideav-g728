@@ -6,6 +6,81 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Annex G full fixed-point encoder + decoder main programs (§G.7)
+  (r389)** — new `annex_g_coder` module lands `EncoderFixed` /
+  `DecoderFixed`, chaining every §G.3 fixed-point block in the §G.7
+  main-program execution order and closing the fixed-point coder end to
+  end. The decoder reproduces the encoder's quantized speech `ST`
+  **bit-exactly** (mantissas + `NLSST`) from the 10-bit channel-index
+  stream alone (200-vector lockstep test), the postfiltered output
+  tracks the input at correlation > 0.9 / ±3 dB, and the decoder's
+  block 50 uses the §G.2.2 `MINC0 = 10` order-10 interrupt to capture
+  the postfilter by-product (`APF` / `RC1` / `NLSAPF`, with the §G.3.28
+  `LABEL` Q13 conversion) before resuming to order 50.
+- **Annex G fixed-point backward vector gain adapter (Figure G.1,
+  blocks 43–48 + 91–99) (r389)** — new `annex_g_gain_adapter` module:
+  the §G.3.14 block-43 flat-Q9 log-gain hybrid window
+  (`LogGainWindowFixed`), the §G.3.16 per-vector blocks — 46
+  (`log_gain_predict`), 98 (`limit_log_gain_q9`), 99+48
+  (`inverse_log_gain`, the 10·2⁻⁶ + 20649·2⁻²¹ split of
+  0.05·log₂10 and the Q15 Horner Taylor 2^x) and 93/94/96/97
+  (`gstate1_update` via the §G.5 Q11 dB tables `GCBLG_Q11` /
+  `SHAPELG_Q11`, Tables G.3/G.4, each entry cross-checked against the
+  float dB derivations) — and the `GainAdapterFixed` driver with the
+  §G.7 commit timing (43/44 at `ICOUNT = 1`, 45 at `ICOUNT = 2`).
+  Fixed-vs-float σ trajectories agree to ≈ 0.008 dB steady-state on an
+  encoder-style index stream.
+- **Annex G §G.3.24–§G.3.27 fixed-point long-term-postfilter adaptation
+  (blocks 81–84) (r389)** — new `annex_g_pitch` module
+  (`PitchAdapterFixed`): block 81 (BFL `ST` → Q2 `SST` + the Q13 LPC
+  inverse filter into the Q1 residual `D`), block 82 (Q19/Q13 1 kHz
+  low-pass + 4:1 decimation, decimated + refined correlation
+  peak-picking, and the cross-multiplied `CMAX·SUM >
+  ((CORMAX·TMP) >> 16)·ITAPTH` sub-multiple decision), block 83
+  (`PTAP` Q14 via `FINDNLS`/`RND`/`DIVIDE`), block 84 (`GL` Q14 /
+  `GLB` Q16 via `DIVIDE`), plus `apf_to_q13` (§G.3.28 `LABEL`).
+- **Annex G §G.3.1–§G.3.3 fixed-point encoder filter loop (r389)** —
+  new `annex_g_encoder` module (`EncoderFiltersFixed`): block 4 (the
+  Q2 perceptual weighting filter), blockzir (the segmented-BFL
+  synthesis-filter zero-input response + the Q2 weighting-filter ZIR)
+  and the blocks-9/10 memory update with the `LABEL1` `ET >> 1`
+  overflow-retry probe, the ±4095-at-segment-scale clip and the
+  reversed `ST`/`NLSST` emission.
+
+### Fixed
+
+- **Block 36's recursive decay is 1/2, not 3/4 (r389)** — the base
+  Recommendation's block-36 pseudo-code spells `REXPW(I) =
+  (1/2)·REXPW(I) + TMP` and §G.3.12 passes `NLSATTW = 15` into
+  HWMCORE; both the float hybrid window (which hardcoded 0.75 for all
+  blocks) and `WeightAdapterFixed` (which reused `NLSATT50 = 14`) were
+  decaying the weighting window too slowly. `HybridWindow` gains a
+  `decay` field, the fixed core a `nlsatt` parameter. The fixed
+  block-36 front end was also rewritten to the §G.3.12 flat 15-bit Q2
+  `SBW` form (with the `NLSREXPW ≤ 41` clamp); `WeightAdapterFixed::
+  adapt` now takes the cycle's 20 Q2 `STMP` samples directly.
+- **§G.3.18 HWMCORE case-1 recursive-loop sign typo (r389)** — the
+  published pseudo-code's `AA1 = AA1 + (RREC(I+1) << 16)` line (a 5/4
+  growth) contradicts its own "Scale RREC by 3/4" margin comment, the
+  R(1) line above it and all four case-2/case-3 instances; the
+  transcription now follows the five consistent `−AA1 + (RREC << 16)`
+  instances. Block 49's tests rarely reached case 1 with the old
+  `NLSREXP = 0` init; block 43 hits it every cycle.
+- **Table G.2 initial values (r389)** — `NLSSB` starts at 16 (was 0)
+  and `NLSREXP`/`NLSREXPW`/`NLSREXPLG` at 31 (was 0), per the table's
+  explicit "initial value" entries and the §G.3.12/§G.3.14 prose.
+- **Float gain adapter GP seed (r389)** — `GainAdapter::new` seeded
+  `GP = (1, 0, …)`, predicting δ̂ = 0 dB (σ ≈ 39.81) on the first
+  cycle; Table 2/G.728 lists `1, −1, 0, 0, …`, which predicts
+  δ̂(n) = δ(n−1) and yields the correct unity first σ. The two tests
+  that had codified the wrong first-vector σ were rewritten.
+
+### Changed
+
+- `LevinsonStatus` gains an `rc1` field (the Q15 first reflection
+  coefficient, Table G.2's `RC1`), captured at the first-order step for
+  block 85's `k1` input.
+
 - **Annex G §G.3 fixed-point short-term postfilter coefficient calculator
   (block 85) (r374)** — new `annex_g_pf_coeff` module lands the fixed-point
   reformulation of the §4.6 adaptive postfilter's short-term coefficient

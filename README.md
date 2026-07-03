@@ -163,6 +163,39 @@ Implemented end-to-end:
   `k1` the §G.2.2 Q15 `RC1`). Keeps the previous coefficients on Q14
   overflow / out-of-range `NLSATMP`. Cross-checked against the
   floating-point `set_from_synthesis_byproduct`.
+- **Annex G fixed-point backward vector gain adapter** (`annex_g_gain_adapter`)
+  — the complete Figure G.1 chain: the §G.3.14 block-43 flat-Q9 log-gain
+  hybrid window (`LogGainWindowFixed`, driving the shared HWMCORE), the
+  §G.3.16 per-vector blocks — 46 (`log_gain_predict`), 98
+  (`limit_log_gain_q9`, −32…+28 dB), 99 + 48 (`inverse_log_gain`: `GOFF`
+  add + the Q15 Horner Taylor `2^x` antilog → scalar-floating `(GAIN,
+  NLSGAIN)`), 93/94/96/97 (`gstate1_update` via the §G.5 Q11 dB tables
+  `GCBLG_Q11` / `SHAPELG_Q11`) — and the `GainAdapterFixed` driver with
+  the §G.7 commit timing. σ tracks the floating-point adapter to
+  ≈ 0.008 dB steady-state on an encoder-style index stream.
+- **Annex G §G.3.24–§G.3.27 fixed-point long-term-postfilter adaptation**
+  (`annex_g_pitch`) — blocks 81 (BFL `ST` → Q2 `SST` + Q13 LPC inverse
+  filter into the Q1 residual `D`), 82 (1 kHz low-pass + 4:1 decimation,
+  two-stage correlation peak-picking, cross-multiplied `ITAPTH`
+  sub-multiple decision), 83 (`PTAP` Q14 via `DIVIDE`) and 84 (`GL` Q14 /
+  `GLB` Q16), plus the §G.3.28 `LABEL` `apf_to_q13` conversion.
+- **Annex G §G.3.1–§G.3.3 fixed-point encoder filter loop**
+  (`annex_g_encoder`) — block 4 (Q2 perceptual weighting filter),
+  blockzir (segmented-BFL synthesis ZIR + Q2 weighting ZIR) and the
+  blocks-9/10 memory update (the `LABEL1` `ET >> 1` overflow-retry
+  probe, the ±4095 segment-scale clip, `VSCALE` re-normalizations and
+  the reversed `ST` / `NLSST` emission), cross-checked against in-test
+  float transcriptions and a direct-form cascade.
+- **Annex G §G.7 fixed-point encoder + decoder main programs**
+  (`annex_g_coder`) — `EncoderFixed` / `DecoderFixed` chain every §G.3
+  block in the §G.7 execution order (block-51/38 commits at
+  `ICOUNT = 3`, block 45 at 2, blocks 49/50 at 4, blocks 36/37 at 2,
+  blocks 43/44 at 1; the decoder interrupts block 50 at order 10 for
+  the `APF`/`RC1` postfilter by-product and resumes). The decoder
+  reproduces the encoder's quantized speech `ST` **bit-exactly**
+  (mantissas + `NLSST`) from the channel indices alone over a
+  200-vector lockstep test; the postfiltered output tracks the input at
+  correlation > 0.9 within 3 dB.
 
 ### Not yet implemented
 
@@ -171,49 +204,16 @@ Implemented end-to-end:
 - The remaining Annex I concealment mechanisms (§I.4.3 continued
   backward adaptation, §I.4.4 floating post-filter) and the decoder
   erasure-flag drive path that wires §I.4.1/§I.4.2/§I.4.5 together.
-- Annex G fixed-point variant — the §G.1.2 numerical representations
-  and the §G.1.3 arithmetic primitives (`shr_sat` / `shl_sat`, `rnd`,
-  `findnls` / `vscale`, `ScalarFloat`, `divide`) are landed in the
-  `annex_g_arith` module as the bit-exact foundation, and the §G.2.1
-  reformulated backward vector gain adapter — the two log-gain dB tables
-  (`gain_log_db` = `20·log10|g_i|`, `shape_log_db` = `10·log10·P[y_j]`,
-  Figure G.1 blocks 93/94) plus the adder-96/limiter-97
-  `offset_removed_log_gain` (eq. G-14) — is landed in the `annex_g_gain`
-  module. The §G.2.2 variable-precision Levinson-Durbin recursion is
-  landed in the `annex_g_levinson` module — the bit-exact reformulation
-  of the three recursion blocks (37 / 44 / 50): the `SIMPDIV` 16-bit
-  restoring division, the `Q15→Q14→Q13` `NRS` overflow-rescale strategy
-  for the predictor coefficients, the saved-high-word `ALPHATMP`, the
-  `NLSATMP = 15 − NRS` precision signal to the bandwidth-expansion
-  module, the `ILLCOND` / `ILLCONDP` ill-conditioning flags, and the
-  decoder `MINC0 = 10` restart — proven against the floating-point
-  `levinson` reference and with a bit-exact resume-vs-one-shot test.
-  The §G.3 fixed-point **coder** (analysis-by-synthesis codebook
-  search), the §G.3.11 decoder **synthesis filter** (block 32), and the
-  §G.3.20–§G.3.23 adaptive **postfilter** (blocks 71–77) are now landed
-  in the `annex_g_codebook` / `annex_g_decoder` / `annex_g_postfilter`
-  modules (see the Implemented section). The synthesis-filter backward
-  adaptation chain (block 49 hybrid window, HWMCORE, block 51 bandwidth
-  expansion) is now landed in the `annex_g_synth_adapter` module (see the
-  Implemented section), closing the fixed-point decoder's backward
-  adaptation loop with the already-landed §G.3.11 block-32 synthesis
-  filter. Block 45 (the §G.3.15 log-gain bandwidth expansion) is also
-  landed via the shared `bandwidth_expand_q14` core. The block 49 / block
-  36 hybrid window + HWMCORE is now factored into the shared
-  `annex_g_hybrid` core, and the *perceptual-weighting-filter* backward
-  adapter (blocks 36 / 37 / 38) is landed in `annex_g_weight_adapter`
-  (see the Implemented section). The remaining §G.3 per-block modules —
-  the *log-gain* hybrid window + Levinson wiring (block 43, which reuses
-  the same hybrid core at the `LPCLG` dimensions; note its 4-scalar
-  log-gain input differs from the segmented-speech input of blocks 36/49),
-  the §G.3.16 block-46 log-gain linear prediction, and the *remaining*
-  postfilter coefficient calculators (block 81 LPC inverse, 82 pitch
-  extraction, 83 pitch tap, 84 long-term coeff) — stay deferred behind the
-  floating-point build (block-85 short-term coeff is now landed in
-  `annex_g_pf_coeff`). The full fixed-point log-gain adapter
-  (blocks 43–48) additionally requires the §G.3.12–§G.3.16 log-gain
-  Q-format scaling, which the staged §G.3 trace flags as a documented gap
-  (per-module Q scaling / rounding / saturation not reproduced).
+- Annex G conformance depth beyond the in-crate lockstep: the complete
+  fixed-point coder is landed (every §G.3 block plus the §G.7 encoder /
+  decoder main programs — see the Implemented section), with the
+  encoder↔decoder quantized speech proven bit-exact in-repo. What is
+  *not* verifiable yet is bit-exactness against ITU conformance
+  material: no G.728 test-vector set is staged under `docs/audio/g728/`
+  (the ITU test vectors ship separately from the Recommendation text),
+  so cross-implementation conformance and the fixed-vs-float
+  cold-start transient behaviour on degenerate (all-zero) input remain
+  open until vectors are staged.
 
 ## Usage
 
