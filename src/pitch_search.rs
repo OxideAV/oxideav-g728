@@ -393,18 +393,21 @@ impl PitchSearch {
 
         // ----- Step 4: fundamental-vs-multiple resolution ----------
         //
-        // If the previous frame's p̂ is INSIDE the neighbourhood
-        // [p0 − KPDELTA, p0 + KPDELTA] then there is no separate
-        // candidate to test: spec says "if the time lag p0 obtained
-        // above is not in the neighbourhood of p̂". We interpret
-        // "not in the neighbourhood" symmetrically — the test is
-        // whether the *previous* pitch falls inside the p0-centred
-        // window. If it does, no second search is run; if it does
-        // not, search a 13-lag window around p̂.
+        // The §4.7 block-82 pseudo-code gates the second search
+        // one-sidedly — "If KP < M2 + 1, go to LABEL" with
+        // M2 = KP1 + KPDELTA — i.e. the fundamental candidate is only
+        // examined when the raw winner `p0` EXCEEDS `p̂ + KPDELTA`
+        // (only a *larger* lag can be a multiple of the true pitch).
+        // A symmetric neighbourhood test would also run the second
+        // search when `p0 ≪ p̂` and — because β1 ≈ β0 for a periodic
+        // signal — actively replace a correct fundamental with a lag
+        // from the stale-p̂ neighbourhood, locking the extractor onto
+        // pitch doubles (observed against the official conformance
+        // decode of `cw4`, where the symmetric variant tracked exactly
+        // 2× the Annex-G reference pitch until the double left the
+        // [KPMIN, KPMAX] range).
         let p_hat = self.p_prev;
-        let p_in_neighbourhood = p_hat + KPDELTA >= p0 && p_hat <= p0 + KPDELTA;
-
-        let p = if p_in_neighbourhood {
+        let p = if p0 <= p_hat + KPDELTA {
             p0
         } else {
             let p1_min = p_hat.saturating_sub(KPDELTA).max(KPMIN);

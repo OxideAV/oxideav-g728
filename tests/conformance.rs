@@ -275,3 +275,37 @@ fn float_encoder_reference_agreement() {
         }
     }
 }
+
+#[test]
+fn float_decoder_postfilter_case4_agreement() {
+    // The float postfiltered leg is reproducible only up to the
+    // reference codec's own floating-point precision: the AGC ratio and
+    // the postfilter IIR states accumulate sub-LSB differences between
+    // our f64 arithmetic and the reference implementation, which flip
+    // the round(x·8) output on samples whose true value sits near a
+    // rounding boundary. Empirically (r392, after the §4.7 one-sided
+    // fundamental-vs-multiple gate fix) 43 664 of 51 200 samples are
+    // exact and the rest are within ±3 16-bit LSBs. Pin those levels.
+    let dir = vectors_or_skip!();
+    let cw = read_words(&dir, "cw4.bin");
+    let reference = read_words(&dir, "outb4.bin");
+    let mut dec = Decoder::new();
+    let mut ours = Vec::with_capacity(cw.len() * IDIM);
+    for &w in &cw {
+        for x in dec.decode_vector_postfiltered((w as u16) & 0x3ff) {
+            ours.push(f64_to_pcm16(x));
+        }
+    }
+    let (n, max, first) = diff_stats(&ours, &reference);
+    assert!(
+        max <= 3,
+        "postfiltered case 4: max |Δ| {max} vs outb4 exceeds the float \
+         reproducibility bound (first diff {first:?})"
+    );
+    assert!(
+        n <= 7600,
+        "postfiltered case 4: {n}/{} samples differ from outb4 — \
+         agreement regressed below the pinned 85 % level",
+        reference.len()
+    );
+}

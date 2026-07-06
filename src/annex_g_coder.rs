@@ -536,6 +536,20 @@ impl DecoderFixed {
         &self.postfilter
     }
 
+    /// The live long-term postfilter coefficients (blocks 82 – 84
+    /// output) — for tests / conformance diagnostics.
+    #[must_use]
+    pub fn long_term_coeff(&self) -> &LongTermCoeff {
+        &self.ltc
+    }
+
+    /// The live short-term postfilter coefficients (block 85 output) —
+    /// for tests / conformance diagnostics.
+    #[must_use]
+    pub fn short_term_coeff(&self) -> &ShortTermCoeff {
+        &self.stc
+    }
+
     /// Decode a §5.11 serial byte stream (whole 10-bit indices only —
     /// see [`crate::bitstream::unpack_indices`]) into postfiltered `Q2`
     /// speech vectors.

@@ -26,6 +26,20 @@ All notable changes to this project will be documented in this file.
   (51 200 samples). Exported constant renamed `TILTF_Q14` →
   `TILTF_Q15`.
 
+- **Float pitch extractor locked onto pitch doubles — §4.7 block-82
+  fundamental-vs-multiple gate is one-sided (r392)** — the block-82
+  pseudo-code only runs the second (fundamental-candidate) search when
+  the raw correlation winner `p0` *exceeds* `p̂ + KPDELTA` ("If KP <
+  M2 + 1, go to LABEL"); the float `PitchSearch` used a symmetric
+  neighbourhood test that also fired when `p0 ≪ p̂` and — since
+  β1 ≈ β0 on periodic signals — replaced a correct fundamental with a
+  stale-neighbourhood multiple. On the official `cw4` decode the float
+  chain tracked exactly 2× the Annex-G reference pitch (until 2·KP left
+  `[KPMIN, KPMAX]`), pushing the postfiltered output up to 4 041 16-bit
+  LSBs off `outb4`. With the one-sided gate the float postfiltered
+  decode agrees with `outb4` on 43 664 / 51 200 samples with max
+  |Δ| ≤ 3 — the reference codec's own floating-point precision bound.
+
 ### Added
 
 - **Official ITU-T G.728 conformance gate (r392)** — new
