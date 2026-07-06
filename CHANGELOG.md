@@ -4,7 +4,55 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Block 12 impulse-response off-by-one (§G.3.5) — fixed encoder now
+  BIT-EXACT against the official ITU-T conformance vectors (r392)** —
+  `annex_g_codebook::impulse_response` read the caller's 0-based
+  coefficient arrays (`a[0] = A(1)` unity head) with the spec's 1-based
+  index, so the cascade filter used `A(3..6)`/`AWZ(3..6)`/`AWP(3..6)`
+  in place of `A(2..5)`… — wrong `H`, hence wrong `Y2`/`PN` and ~85 %
+  wrong codebook decisions once the backward adapters went live. With
+  the fix the full fixed-point encoder free-runs **byte-exactly** onto
+  `incw1g…incw6g` (98 048 consecutive channel indices, all six official
+  test cases).
+- **`TILTF` is 4915 in Q15, not 2458 in Q14 (§G.3.28) — fixed decoder
+  postfilter now BIT-EXACT (r392)** — block 85's spectral-tilt term is
+  `TILTZ = RND(TILTF·RC1)` with the §G.3.28 inline constant
+  `TILTF = 4915` (Q15, the *truncation* of 0.15·2¹⁵ = 4915.2); the
+  previous Q14 `2458` rendering (≡ 4916 Q15, with a different rounding
+  point) left ~19.5 % of postfiltered samples ±1 Q2 LSB off. With the
+  fix the postfiltered decode of `cw4` matches `outb4g` byte-exactly
+  (51 200 samples). Exported constant renamed `TILTF_Q14` →
+  `TILTF_Q15`.
+
 ### Added
+
+- **Official ITU-T G.728 conformance gate (r392)** — new
+  `tests/conformance.rs` drives the complete official test-vector
+  corpus (`docs/audio/g728/conformance/`, the ITU-T G.728 Appendix I
+  sequences; auto-skips when the private docs tree is absent):
+  - **Annex G fixed encoder**: `in1…in6` → `incw1g…incw6g` bit-exact
+    (98 048 indices);
+  - **Annex G fixed decoder, postfilter off**: `cw1…cw6` →
+    `outa1g…outa6g` bit-exact (491 520 samples, block-floating `ST`
+    rendered at `st·2^(3−NLSST)` with §G.1.3.1 rounding);
+  - **Annex G fixed decoder, postfilter on**: `cw4` → `outb4g`
+    bit-exact (51 200 samples, `SPF` Q2 doubled);
+  - **float decoder, postfilter off**: `cw1…cw6` → `outa1…outa6`
+    bit-exact (491 520 samples, `round(x·8)` output conversion);
+  - **float encoder**: `in1…in4` → `incw1…incw4` bit-exact (14 336
+    indices); case 6 pinned at ≤ 1 near-tie flip (index 29 of 256) and
+    case 5 pinned to track ≥ 200 decisions before its near-tie
+    free-run drift — the float references are only reproducible up to
+    the reference codec's own floating-point tie behaviour.
+- **Conformance-adjudication probes (r392)** —
+  `EncoderFixed::encode_vector_resynced` (the search runs normally
+  while the state update follows a caller-forced channel index,
+  isolating per-vector decisions from divergence cascades when driving
+  the reference bitstream through the encoder) and read-only accessors
+  `EncoderFixed::{weight_coeff, predictor}`,
+  `DecoderFixed::postfilter`.
 
 - **Annex G full fixed-point encoder + decoder main programs (§G.7)
   (r389)** — new `annex_g_coder` module lands `EncoderFixed` /
