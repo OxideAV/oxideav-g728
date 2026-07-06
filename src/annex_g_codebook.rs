@@ -201,14 +201,13 @@ pub fn vq_target(sw: &[i16; IDIM], zir: &[i16; IDIM]) -> [i16; IDIM] {
 /// cascade synthesis × weighting filter from the predictor coefficient
 /// arrays.
 ///
-/// `a` is the synthesis-filter coefficient array `A(2..IDIM)`, `awz`
-/// the weighting all-zero coefficients `AWZ(2..IDIM)`, `awp` the
-/// weighting all-pole coefficients `AWP(2..IDIM)`, **all in `Q14`** and
-/// indexed so that `a[i]` is the spec's `A(i)` for `i = 2 … IDIM`
-/// (entry `0` and `1` are unused / `A(1)` is the implicit leading `1`).
-/// To keep call-site indexing identical to the pseudo-code each slice
-/// must have length `IDIM + 1` (`a[0]` ignored, `a[1] = A(1)` ignored,
-/// `a[i] = A(i)`).
+/// `a` is the synthesis-filter coefficient array, `awz` the weighting
+/// all-zero coefficients, `awp` the weighting all-pole coefficients,
+/// **all in `Q14`** and in the crate's 0-based layout: `a[0]` is the
+/// spec's `A(1)` (the implicit leading `1` = `16384`), `a[i - 1]` is
+/// the spec's `A(i)` for `i = 2 … IDIM + 1` — exactly the head of the
+/// live predictor / weighting arrays the §G.7 driver holds. Each slice
+/// has length `IDIM + 1`.
 ///
 /// The output `H` is `Q13` (`NLSH = 13`). The two `Q14` predictor
 /// columns are merged into a single accumulator (the §G.3.5 note
@@ -235,9 +234,11 @@ pub fn impulse_response(
         while i >= 2 {
             temp[i] = temp[i - 1];
             ws[i] = ws[i - 1];
-            aa0 -= a[i] as i64 * temp[i] as i64;
-            aa1 += awz[i] as i64 * temp[i] as i64;
-            aa1 -= awp[i] as i64 * ws[i] as i64;
+            // A(I)·TEMP(I) etc., with the spec's 1-based A(I) at the
+            // crate's 0-based slot `a[i − 1]` (`a[0]` = `A(1)` = 16384).
+            aa0 -= a[i - 1] as i64 * temp[i] as i64;
+            aa1 += awz[i - 1] as i64 * temp[i] as i64;
+            aa1 -= awp[i - 1] as i64 * ws[i] as i64;
             i -= 1;
         }
         aa1 += aa0;
@@ -733,14 +734,23 @@ mod tests {
         // non-trivial coefficient set. This guards the in-place memory
         // shuffle and the combined-accumulator >> 14 against an
         // off-by-one without depending on a hand-computed magic value.
-        let a = [0i16, 0, 1000, -800, 600, -400];
-        let awz = [0i16, 0, 500, -300, 200, -100];
-        let awp = [0i16, 0, -700, 400, -250, 150];
+        // Crate layout: `a[0]` = A(1) = 16384, `a[i − 1]` = A(i).
+        let a = [16384i16, 1000, -800, 600, -400, 0];
+        let awz = [16384i16, 500, -300, 200, -100, 0];
+        let awp = [16384i16, -700, 400, -250, 150, 0];
         let h = impulse_response(&a, &awz, &awp);
 
         // Reference: TEMP / WS as Q13 16-bit words with the spec's
-        // exact loop (the truncation to i16 mirrors "Q13 16-bit
-        // words").
+        // exact 1-based loop (the truncation to i16 mirrors "Q13
+        // 16-bit words"); `ref_x[i]` is the spec's X(i).
+        let mut ref_a = [0i64; IDIM + 2];
+        let mut ref_awz = [0i64; IDIM + 2];
+        let mut ref_awp = [0i64; IDIM + 2];
+        for i in 1..=(IDIM + 1) {
+            ref_a[i] = a[i - 1] as i64;
+            ref_awz[i] = awz[i - 1] as i64;
+            ref_awp[i] = awp[i - 1] as i64;
+        }
         let mut temp = [0i16; IDIM + 1];
         let mut ws = [0i16; IDIM + 1];
         temp[1] = 8192;
@@ -752,9 +762,9 @@ mod tests {
             while i >= 2 {
                 temp[i] = temp[i - 1];
                 ws[i] = ws[i - 1];
-                acc0 -= a[i] as i64 * temp[i] as i64;
-                acc1 += awz[i] as i64 * temp[i] as i64;
-                acc1 -= awp[i] as i64 * ws[i] as i64;
+                acc0 -= ref_a[i] * temp[i] as i64;
+                acc1 += ref_awz[i] * temp[i] as i64;
+                acc1 -= ref_awp[i] * ws[i] as i64;
                 i -= 1;
             }
             acc1 += acc0;

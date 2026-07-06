@@ -84,6 +84,22 @@ pub struct EncoderFixed {
     /// `STMP` — the block-36 input-speech window (`Q2`, the annex's
     /// `(ICOUNT − 3)·IDIM` layout: vectors 3, 4, 1, 2).
     stmp: [i16; NFRSZ],
+    /// Last probe record (see [`Self::encode_vector_probe`]).
+    probe: Option<ProbeOut>,
+}
+
+/// Per-vector intermediates recorded by
+/// [`EncoderFixed::encode_vector_probe`] (conformance adjudication).
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct ProbeOut {
+    pub sw: [i16; IDIM],
+    pub zir: [i16; IDIM],
+    pub gain: i16,
+    pub nlsgain: i32,
+    pub ichan: u16,
+    pub et: [i16; IDIM],
+    pub nlset: i32,
 }
 
 impl Default for EncoderFixed {
@@ -108,12 +124,40 @@ impl EncoderFixed {
             wcoeff: WeightCoeffFixed::disabled(),
             sttmp: [StSegment::zero(16); N5],
             stmp: [0; NFRSZ],
+            probe: None,
         }
     }
 
     /// Encode one `Q2` input-speech vector (`S(1..=IDIM)`, the §G.3.1
     /// `[−16384, +16383]` range) into its 10-bit channel index.
     pub fn encode_vector(&mut self, s: &[i16; IDIM]) -> u16 {
+        self.encode_vector_inner(s, None)
+    }
+
+    /// [`Self::encode_vector`], but with the *state-update* channel
+    /// index overridden: the search still runs and its winning index is
+    /// returned, while the excitation / gain / filter-memory updates
+    /// proceed as if `forced` had been chosen.
+    ///
+    /// This is the conformance-adjudication probe: driving the state
+    /// with the reference bitstream isolates each vector's codebook
+    /// decision from the divergence cascade that a single differing
+    /// index would otherwise trigger (every later state is bit-exactly
+    /// the reference encoder's, so any remaining mismatch is a genuine
+    /// per-vector search deviation).
+    pub fn encode_vector_resynced(&mut self, s: &[i16; IDIM], forced: u16) -> u16 {
+        self.encode_vector_inner(s, Some(forced))
+    }
+
+    /// [`Self::encode_vector_resynced`] returning the per-vector
+    /// intermediates (probe for conformance adjudication).
+    #[doc(hidden)]
+    pub fn encode_vector_probe(&mut self, s: &[i16; IDIM], forced: u16) -> ProbeOut {
+        let _ = self.encode_vector_inner(s, Some(forced));
+        self.probe.clone().expect("probe recorded")
+    }
+
+    fn encode_vector_inner(&mut self, s: &[i16; IDIM], forced: Option<u16>) -> u16 {
         // | If ICOUNT = 4, set ICOUNT = 0; ICOUNT = ICOUNT + 1
         self.icount = self.icount % NUPDATE + 1;
         let icount = self.icount;
@@ -145,10 +189,34 @@ impl EncoderFixed {
         let awp6: [i16; IDIM + 1] = std::array::from_fn(|i| self.wcoeff.q_gamma2[i]);
         let out = annex_g_codebook::encode_vector(&sw, &zir, &a6, &awz6, &awp6, gain, nlsgain);
 
+        // Conformance probe: optionally re-derive the state-update
+        // excitation from a caller-forced channel index instead of the
+        // search winner (see `encode_vector_resynced`).
+        let (upd_result, upd_et, upd_nlset) = match forced {
+            None => (out.result, out.et, out.nlset),
+            Some(ichan) => {
+                let is = (ichan as usize) / NG + 1;
+                let ig = (ichan as usize) % NG + 1;
+                let result = SearchResult { is, ig, ichan };
+                let (et, nlset) = annex_g_codebook::excitation(&result, gain, nlsgain);
+                (result, et, nlset)
+            }
+        };
+
+        self.probe = Some(ProbeOut {
+            sw,
+            zir,
+            gain,
+            nlsgain,
+            ichan: out.result.ichan,
+            et: upd_et,
+            nlset: upd_nlset,
+        });
+
         // | blocks 9 and 10 during filter memory update → ST.
         let up = self.filters.memory_update(
-            &out.et,
-            out.nlset,
+            &upd_et,
+            upd_nlset,
             &self.a,
             &self.wcoeff.q_gamma1,
             &self.wcoeff.q_gamma2,
@@ -156,7 +224,7 @@ impl EncoderFixed {
 
         // | blocks 93/94/96/97; GSTATE(1) = output of block 97 (and the
         // | ICOUNT = 1 GTMP + blocks 43/44 refresh).
-        self.gain.update(icount, out.result.ig, out.result.is);
+        self.gain.update(icount, upd_result.ig, upd_result.is);
 
         // | I = (ICOUNT − 1)·IDIM; STTMP(I+1..I+5) = ST; NLSSTTMP(ICOUNT).
         self.sttmp[icount - 1] = StSegment {
@@ -191,6 +259,22 @@ impl EncoderFixed {
     pub fn last_st(&self) -> (&[i16; IDIM], i32) {
         let seg = &self.sttmp[self.icount - 1];
         (&seg.st, seg.nls)
+    }
+
+    /// The live `Q14` weighting coefficient pair (block 38 output, as
+    /// committed at the last `ICOUNT = 3`) — for tests / conformance
+    /// adjudication.
+    #[must_use]
+    pub fn weight_coeff(&self) -> &WeightCoeffFixed {
+        &self.wcoeff
+    }
+
+    /// The live `Q14` synthesis predictor `A` (block 51 output, as
+    /// committed at the last `ICOUNT = 3`) — for tests / conformance
+    /// adjudication.
+    #[must_use]
+    pub fn predictor(&self) -> &[i16; LPC + 1] {
+        &self.a
     }
 
     /// Encode a whole buffer of `Q2` speech vectors into the §5.11
@@ -443,6 +527,13 @@ impl DecoderFixed {
     pub fn last_st(&self) -> (&[i16; IDIM], i32) {
         let seg = &self.sttmp[self.icount - 1];
         (&seg.st, seg.nls)
+    }
+
+    /// Borrow the fixed-point adaptive postfilter (blocks 71 – 77) — for
+    /// tests / conformance diagnostics.
+    #[must_use]
+    pub fn postfilter(&self) -> &PostfilterFixed {
+        &self.postfilter
     }
 
     /// Decode a §5.11 serial byte stream (whole 10-bit indices only —
