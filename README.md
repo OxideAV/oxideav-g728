@@ -8,10 +8,29 @@ Zero C dependencies, no FFI, no `*-sys` crates.
 ## Status
 
 Clean-room rebuild from the published ITU-T G.728 (1992-09)
-Recommendation prose, built one spec-cited unit at a time. The codec
-is implemented as a **standalone `Encoder` / `Decoder` API**; it does
-not yet register a trait-surface codec in the `oxideav-core` runtime
-(the registry hook is a no-op pending A-law / µ-law PCM I/O wiring).
+Recommendation prose + Annex G (1994-11, fixed point) + Annex I
+(1999-05, PLC), built one spec-cited unit at a time.
+
+**Conformance — the Annex G fixed-point coder is BIT-EXACT on the
+official ITU-T G.728 test vectors** (the Appendix I sequences,
+input → reference-output black-box pairs, gated by
+`tests/conformance.rs` whenever the private docs tree is present):
+
+| Leg | Vectors | Result |
+|-----|---------|--------|
+| fixed encoder → `incw1g…incw6g` | 98 048 indices | **bit-exact** |
+| fixed decoder (postfilter off) → `outa1g…outa6g` | 491 520 samples | **bit-exact** |
+| fixed decoder (postfilter on) → `outb4g` | 51 200 samples | **bit-exact** |
+| float decoder (postfilter off) → `outa1…outa6` | 491 520 samples | **bit-exact** |
+| float encoder → `incw1…incw4` | 14 336 indices | **bit-exact** |
+| float encoder → `incw5` / `incw6` | 84 736 indices | near-tie prefix pinned (float references are reproducible only up to the reference codec's own floating-point tie behaviour) |
+| float decoder (postfilter on) → `outb4` | 51 200 samples | 85 % exact, max ±3 LSB (same float precision bound) |
+
+The codec is exposed both as **direct `Encoder` / `Decoder` /
+`EncoderFixed` / `DecoderFixed` APIs** and as a registered
+`oxideav-core` codec: `register(ctx)` wires `g728` decoder + encoder
+factories (§5.11 byte-stream packets ↔ S16 mono 8 kHz frames through
+the conformance-bit-exact fixed-point chains; WAVE tag `0x0041`).
 
 Implemented end-to-end:
 
