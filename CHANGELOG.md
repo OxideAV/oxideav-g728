@@ -42,6 +42,16 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`oxideav-core` registry wiring (r392)** — `register(ctx)` now
+  registers a real `g728` `CodecInfo` (decoder + encoder factories,
+  WAVE-format tag `0x0041`): the decoder consumes the §5.11 serial byte
+  stream (5 bytes per adaptation cycle, buffered across packet
+  boundaries) through the conformance-bit-exact Annex-G fixed-point
+  chain with the adaptive postfilter and emits S16 mono 8 kHz frames;
+  the encoder consumes S16 frames (whole-cycle buffering, zero-padded
+  final cycle on flush) through the bit-exact `EncoderFixed`. `reset`
+  restores cold-start state for seeks. The direct `make_decoder` /
+  `make_encoder` factories remain per the dual-API convention.
 - **Official ITU-T G.728 conformance gate (r392)** — new
   `tests/conformance.rs` drives the complete official test-vector
   corpus (`docs/audio/g728/conformance/`, the ITU-T G.728 Appendix I

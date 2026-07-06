@@ -235,6 +235,7 @@ pub mod long_term_postfilter;
 pub mod pitch_inverse_filter;
 pub mod pitch_postfilter_coeff;
 pub mod pitch_search;
+pub mod registry;
 pub mod short_term_postfilter;
 pub mod synthesis_adapter;
 pub mod tables;
@@ -836,13 +837,15 @@ pub fn make_decoder() -> Decoder {
     Decoder::new()
 }
 
-/// No-op codec registration. The decoder front end is exposed via
-/// [`make_decoder`] (autonomous index decode plus the §5.11 serial
-/// byte-stream path [`Decoder::decode_bytes`]) and the encoder via
-/// [`make_encoder`] / [`Encoder::encode_buffer`]; the registry-side
-/// `decoder` / `encoder` factory wiring (A-law / µ-law PCM I/O via
-/// `oxideav-g711` per §5.3 / §3.1) lands in a later round.
-pub fn register(_ctx: &mut RuntimeContext) {}
+/// Codec registration: wires the `g728` decoder + encoder factories —
+/// the bit-exact Annex G fixed-point chains behind a §5.11
+/// byte-stream / S16-PCM packet-frame face — into the runtime
+/// context's codec registry (see [`registry`]). The direct factories
+/// [`make_decoder`] / [`make_encoder`] stay available per the
+/// workspace dual-API convention.
+pub fn register(ctx: &mut RuntimeContext) {
+    registry::register(ctx);
+}
 
 oxideav_core::register!("g728", register);
 
