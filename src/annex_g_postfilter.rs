@@ -93,6 +93,8 @@ pub struct PostfilterFixed {
     stpfiir: [i32; PF_ORDER],
     /// Smoothed AGC scaling factor `SCALEFIL`, Q14 (init `16384`).
     scalefil: i32,
+    /// Last pre-AGC postfilter vector `TEMP` (diagnostics).
+    last_temp: [i32; IDIM],
 }
 
 /// Per-vector long-term postfilter coefficients (block 84 output).
@@ -141,6 +143,7 @@ impl PostfilterFixed {
             stpffir: [0; PF_ORDER],
             stpfiir: [0; PF_ORDER],
             scalefil: SCALEFIL_INIT_Q14,
+            last_temp: [0; IDIM],
         }
     }
 
@@ -157,6 +160,13 @@ impl PostfilterFixed {
     #[must_use]
     pub fn scalefil_q14(&self) -> i32 {
         self.scalefil
+    }
+
+    /// The last pre-AGC postfiltered vector `TEMP` (Q2) — diagnostics.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn last_temp(&self) -> &[i32; IDIM] {
+        &self.last_temp
     }
 
     /// Borrow the quantized-speech buffer `SST` (oldest first; the deep
@@ -194,6 +204,7 @@ impl PostfilterFixed {
 
         // ----- Blocks 71/72: long-term + short-term postfilter --------
         let temp = self.long_short_postfilter(lt, sc);
+        self.last_temp = temp;
 
         // ----- Blocks 73/74: sum of absolute values ------------------
         // SUMUNFIL = Σ |SST(K)| (decoded), SUMFIL = Σ |TEMP(K)|

@@ -261,7 +261,7 @@ pub use annex_g_levinson::{
     levinson_durbin_fixed, levinson_durbin_fixed_resume, simpdiv, LevinsonInput, LevinsonStatus,
     RecursionResume,
 };
-pub use annex_g_pf_coeff::{short_term_coeff_fixed, TILTF_Q14};
+pub use annex_g_pf_coeff::{short_term_coeff_fixed, TILTF_Q15};
 pub use annex_g_pitch::{apf_to_q13, PitchAdapterFixed};
 pub use annex_g_postfilter::{
     scale_factor, LongTermCoeff, PostfilterFixed, ShortTermCoeff, AGCFAC1_Q21, AGCFAC_Q14,

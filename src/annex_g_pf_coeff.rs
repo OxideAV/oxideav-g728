@@ -49,10 +49,12 @@ use crate::annex_g_postfilter::{ShortTermCoeff, PF_ORDER};
 use crate::annex_g_synth_adapter::bandwidth_expand_q14;
 use crate::tables::{SPFPCFV_Q14, SPFZCFV_Q14};
 
-/// `TILTF = 0.15` in Q14: `round(0.15 · 2¹⁴) = round(2457.6) = 2458`.
-/// The spectral-tilt controlling factor of Table 1/G.728 (`TILTF`), the
-/// Q14 multiplier for the `TILTZ = TILTF·k1` term of eq. 4-5.
-pub const TILTF_Q14: i32 = 2458;
+/// `TILTF = 0.15` in Q15 — the §G.3.28 fixed-point pseudo-code's inline
+/// constant ("TILTF = 4915 in Q15"; `0.15 · 2¹⁵ = 4915.2`). The spectral-
+/// tilt controlling factor of Table 1/G.728 (`TILTF`), the multiplier for
+/// the `TILTZ = RND(TILTF·RC1)` term of eq. 4-5 (`Q15 · Q15 = Q30`, whose
+/// `RND` high word is the Q14 `TILTZ`).
+pub const TILTF_Q15: i32 = 4915;
 
 /// Block 85 — derive the fixed-point short-term postfilter coefficients
 /// [`ShortTermCoeff`] from the order-10 synthesis-filter LPC by-product.
@@ -87,10 +89,10 @@ pub fn short_term_coeff_fixed(
         ap_q14[i] = ap[i] as i32;
     }
 
-    // Eq. 4-5: TILTZ = TILTF · k1. TILTF_Q14 (Q14) · k1 (Q15) = Q29; a Q14
-    // result is the round-to-nearest of that product divided by 2¹⁵.
-    let prod = TILTF_Q14 as i64 * k1_q15 as i64;
-    let tiltz_q14 = ((prod + (1 << 14)) >> 15) as i32;
+    // Eq. 4-5 / §G.3.28: AA0 = TILTF·RC1 (Q15·Q15 = Q30);
+    // TILTZ = RND(AA0) — the rounded high word is the Q14 TILTZ.
+    let prod = TILTF_Q15 * i32::from(k1_q15);
+    let tiltz_q14 = i32::from(crate::annex_g_arith::rnd(prod));
 
     Some(ShortTermCoeff {
         az_q14,
@@ -117,10 +119,13 @@ mod tests {
     }
 
     #[test]
-    fn tiltf_q14_matches_constant() {
-        // TILTF_Q14 must encode TILTF = 0.15 in Q14.
-        assert_eq!(TILTF_Q14, (TILTF * 16384.0).round() as i32);
-        assert_eq!(TILTF_Q14, 2458);
+    fn tiltf_q15_matches_constant() {
+        // TILTF_Q15 must encode TILTF = 0.15 in Q15 (§G.3.28's inline
+        // "TILTF = 4915 in Q15"; 0.15·2¹⁵ = 4915.2 truncates — NOT
+        // rounds — to the annex constant 4915, and the Annex-G
+        // conformance vectors are bit-exact only with 4915).
+        assert_eq!(TILTF_Q15, (TILTF * 32768.0).floor() as i32);
+        assert_eq!(TILTF_Q15, 4915);
     }
 
     #[test]
