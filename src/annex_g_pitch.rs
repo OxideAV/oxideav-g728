@@ -407,11 +407,27 @@ impl PitchAdapterFixed {
         let num = rnd_i64(shl_signed(aa1, nlsnum));
         let (ptap, nlsptap) = divide(num, nlsnum, den, nlsden);
         // | NRS = NLSPTAP − 14; PTAP = PTAP >> NRS
+        //
+        // `ptap` is a normalized 16-bit mantissa (`ptap ≥ 0` here — both
+        // `num` and `den` are positive by the guards above), so on the
+        // conformance path NRS stays in `[0, 15]` and the shift is exact.
+        // A degenerate or corrupted codeword stream can push NLSPTAP far
+        // enough that the raw `i16` shift amount reaches the type width
+        // and panics ("shift with overflow"); guard the out-of-range
+        // amounts (in-range arithmetic is left byte-identical):
+        //   * NRS ≥ 16  → the mantissa shifts entirely below the LSB → 0;
+        //   * −NRS ≥ 16 → the tap caps at the Q14 unit ceiling `16384`
+        //     (= 1.0, matching the `AA1 ≥ AA0` early return; unreachable
+        //     on valid input, where `AA1 < AA0` bounds the ratio below 1).
         let nrs = nlsptap - 14;
-        if nrs >= 0 {
+        if nrs >= 16 {
+            0
+        } else if nrs >= 0 {
             ptap >> nrs
-        } else {
+        } else if -nrs < 16 {
             ptap << (-nrs)
+        } else {
+            16384
         }
     }
 

@@ -904,13 +904,17 @@ mod tests {
     }
 
     #[test]
-    fn register_is_a_no_op_on_runtime_context() {
-        // The registry-side wiring is intentionally a no-op until the
-        // decoder can run end-to-end without an externally-supplied
-        // predictor. Confirm calling it doesn't panic and doesn't
-        // mutate the context in a visible way.
+    fn register_wires_the_g728_codec() {
+        // The crate-root `register` delegates to `registry::register`,
+        // which installs the fixed-point decoder + encoder factories over
+        // the §5.11 byte-stream / S16 packet-frame face. Confirm the
+        // codec is actually exposed after registration (the `registry`
+        // module carries the deeper factory/roundtrip coverage).
         let mut ctx = RuntimeContext::default();
         register(&mut ctx);
+        let id = oxideav_core::CodecId::new("g728");
+        assert!(ctx.codecs.has_decoder(&id));
+        assert!(ctx.codecs.has_encoder(&id));
     }
 
     #[test]
