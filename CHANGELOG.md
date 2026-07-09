@@ -6,6 +6,16 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Block-83 PTAP shift-overflow panic guard (§G.3.27)** — the
+  fixed-point pitch-tap calculator's final `PTAP >> (NLSPTAP − 14)` used
+  a raw `i16` shift amount that reaches the type width and panics
+  ("shift with overflow") on a degenerate or corrupted codeword stream.
+  `NLSPTAP` stays in `[14, 29]` on the conformance path, so the in-range
+  arithmetic is unchanged (all six ITU legs remain bit-exact); only the
+  out-of-range shift amounts are guarded (`≥16 → 0`; `≤−2 → 16384`, the
+  Q14 unit ceiling — both unreachable on valid input). Surfaced by the
+  new robustness suite.
+
 - **Block 12 impulse-response off-by-one (§G.3.5) — fixed encoder now
   BIT-EXACT against the official ITU-T conformance vectors (r392)** —
   `annex_g_codebook::impulse_response` read the caller's 0-based
@@ -40,7 +50,26 @@ All notable changes to this project will be documented in this file.
   decode agrees with `outb4` on 43 664 / 51 200 samples with max
   |Δ| ≤ 3 — the reference codec's own floating-point precision bound.
 
+### Documentation
+
+- **Anchored the conformance-verified Annex-G errata at their source
+  lines.** The staged `docs/audio/g728/g728-errata.md` formalizes the
+  fixed-point pseudo-code print typos this crate already corrects; each
+  correction now carries an `E1`/`E2`/`E3`/`E5`/`E6`/`N1`/`N2` reference
+  at its `src/` site, a stale `TILTF_Q14 = 2458` module doc-comment was
+  corrected to `TILTF_Q15 = 4915` (Q15), and the README's stale "Not yet
+  implemented" section was replaced with an errata table and the
+  Annex-I PLC-reference docs-gap note.
+
 ### Added
+
+- **`tests/robustness.rs` — self-consistency hardening gates.** No ITU
+  reference material; asserts invariants the private vectors never
+  exercise (the full 1024-codeword alphabet + long adversarial LCG
+  streams): the encoder never emits an out-of-10-bit-range index;
+  neither decoder path panics, emits `NaN`/`Inf` or lets the
+  backward-adapted state run away; fixed + float encode→decode
+  round-trips stay bounded.
 
 - **`oxideav-core` registry wiring (r392)** — `register(ctx)` now
   registers a real `g728` `CodecInfo` (decoder + encoder factories,
