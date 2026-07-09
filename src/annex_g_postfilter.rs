@@ -241,9 +241,12 @@ impl PostfilterFixed {
     /// §G.3.20 *floating-point* pseudo-code on the same page
     /// (`STPFIIR(1) = TEMP(K)` — the all-pole output, before the tilt
     /// term is added), with the Q16-accumulator `AA1` carrying `TEMP(K)`
-    /// per the stated Q-formats ("AP is Q14, STPFIIR(J) is Q2"). See the
-    /// docs-gap note in this module's tests for the fixed-point rendering
-    /// discrepancy on that one line.
+    /// per the stated Q-formats ("AP is Q14, STPFIIR(J) is Q2"). The
+    /// §G.3.20 *fixed-point* listing mis-sources this store from `AA0`
+    /// (which still holds the long-term term at that point); the IIR
+    /// result lives only in `AA1`, and the conformance vectors are
+    /// bit-exact only with the `AA1` source — erratum E5 in
+    /// `docs/audio/g728/g728-errata.md`.
     fn long_short_postfilter(&mut self, lt: &LongTermCoeff, sc: &ShortTermCoeff) -> [i32; IDIM] {
         let base = SST_PAST;
         let mut temp = [0i32; IDIM];

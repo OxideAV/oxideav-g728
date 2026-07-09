@@ -218,23 +218,41 @@ Implemented end-to-end:
   200-vector lockstep test; the postfiltered output tracks the input at
   correlation > 0.9 within 3 dB.
 
+### Errata
+
+The Annex-G fixed-point pseudo-code carries several print typos that a
+literal transcription would inherit; this crate follows the
+conformance-verified corrections catalogued in
+`docs/audio/g728/g728-errata.md`. Each correction is anchored at its
+source line in `src/` with an `E1…E6` / `N1` / `N2` reference:
+
+| Id | §        | Correction |
+|----|----------|------------|
+| E1 | G.3.18 `HWMCORE` case 1 | `RREC` recursion is a `−(RREC<<NLSATT)+(RREC<<16)` decay, not the printed `+` growth |
+| E2 | G.3.12 block 36 | hybrid-window decay is `1/2` (`NLSATTW=15`), not the sibling blocks' `3/4` |
+| E3 | G.3.24 block 81 | `IP` reset target is `NPWSZ − NFRSZ`, not `NFRSZ` |
+| E5 | G.3.20 block 72 | short-term IIR store sources `AA1` (all-pole result), not `AA0` |
+| E6 | G.3.2 `Blockzir` block 9 | middle MAC loop accumulates (`AA0 = AA0 − …`), not resets (`AA0 = 0 − …`) |
+| N1 | G.3.5 block 12 | impulse response consumes `A(2..5)`, never `A(6)` |
+| N2 | G.3.28 block 85 | `TILTF = 4915` in Q15, not `2458` in Q14 |
+
+(E4 — the §G.3.25 refined-pitch first-correlation-factor ambiguity — is
+resolved here in the equivalent `D`-autocorrelation form `Σ D(K)·D(K−J)`,
+bit-exact against the vectors.)
+
 ### Not yet implemented
 
-- Registry-side `decoder` / `encoder` factory wiring (waits on
-  A-law / µ-law PCM I/O per §5.3 / §3.1, handled by `oxideav-g711`).
 - The remaining Annex I concealment mechanisms (§I.4.3 continued
-  backward adaptation, §I.4.4 floating post-filter) and the decoder
-  erasure-flag drive path that wires §I.4.1/§I.4.2/§I.4.5 together.
-- Annex G conformance depth beyond the in-crate lockstep: the complete
-  fixed-point coder is landed (every §G.3 block plus the §G.7 encoder /
-  decoder main programs — see the Implemented section), with the
-  encoder↔decoder quantized speech proven bit-exact in-repo. What is
-  *not* verifiable yet is bit-exactness against ITU conformance
-  material: no G.728 test-vector set is staged under `docs/audio/g728/`
-  (the ITU test vectors ship separately from the Recommendation text),
-  so cross-implementation conformance and the fixed-vs-float
-  cold-start transient behaviour on degenerate (all-zero) input remain
-  open until vectors are staged.
+  backward adaptation, §I.4.4 floating post-filter) and the §I.5.1
+  decoder erasure-flag drive path (`VEC_LOOP`) that wires the existing
+  §I.4.1 excitation extrapolation, §I.4.2 LPC softening and §I.4.5
+  gain-growth limiter modules together. **Docs gap:** the Annex I PLC
+  path cannot be conformance-adjudicated from the in-repo corpus — the
+  staged `conformance/mask1` supplies a packet-loss mask but no paired
+  concealed-PCM reference output, so a PLC drive path can only be
+  behaviourally validated, not proven bit-exact, until the ITU Annex I
+  concealed-PCM reference is staged (see the outstanding-gap note in
+  `docs/audio/g728/g728-errata.md`).
 
 ## Usage
 

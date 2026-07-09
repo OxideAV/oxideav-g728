@@ -236,6 +236,11 @@ pub fn impulse_response(
             ws[i] = ws[i - 1];
             // A(I)·TEMP(I) etc., with the spec's 1-based A(I) at the
             // crate's 0-based slot `a[i − 1]` (`a[0]` = `A(1)` = 16384).
+            // `i` runs `K, K−1, …, 2` with `K ≤ IDIM = 5`, so the
+            // synthesis coefficients consumed are `A(2)…A(5)` — never
+            // `A(6)` (note N1 in `docs/audio/g728/g728-errata.md`; an
+            // implementer coupling the `A(J+1)` index seen elsewhere with
+            // a 1-based off-by-one can wrongly read `A(3..6)`).
             aa0 -= a[i - 1] as i64 * temp[i] as i64;
             aa1 += awz[i - 1] as i64 * temp[i] as i64;
             aa1 -= awp[i - 1] as i64 * ws[i] as i64;

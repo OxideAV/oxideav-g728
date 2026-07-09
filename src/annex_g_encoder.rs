@@ -187,6 +187,13 @@ impl EncoderFiltersFixed {
             let mut aa1 = aa0 >> nls;
 
             // | For I = 2..10: five-tap partial sums, aligned per segment.
+            // `aa0` is zeroed **once** here, before the inner `LL` loop,
+            // then accumulates (`aa0 −=`) across the five taps. The
+            // §G.3.2 fixed-point `Blockzir` block-9 listing mis-prints the
+            // inner MAC as `AA0 = 0 − …` (a reset each tap, keeping only
+            // the last); the accumulating form matches the first/third MAC
+            // loops and is required for conformance — erratum E6 in
+            // `docs/audio/g728/g728-errata.md`.
             for i in 2..=NSEG_LPC {
                 let mut aa0: i64 = 0;
                 for _ll in 0..IDIM {

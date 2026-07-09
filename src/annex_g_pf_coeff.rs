@@ -34,8 +34,13 @@
 //! expansion core [`bandwidth_expand_q14`] with the staged Q14 broadening
 //! tables `SPFZCFV_Q14` / `SPFPCFV_Q14`. The first reflection coefficient
 //! `k1` is the §G.2.2 recursion's `RC1`, a Q15 value with magnitude `< 1`;
-//! the tilt term `TILTZ = TILTF·k1` is then a Q14 quantity, computed as
-//! `round(TILTF_Q14 · k1 / 2¹⁵)` (`TILTF_Q14 = round(0.15·2¹⁴) = 2458`).
+//! the tilt term `TILTZ = TILTF·k1` is a Q14 quantity formed from the
+//! Q15·Q15 = Q30 product `TILTF_Q15 · k1` whose rounded high word is Q14.
+//! The multiplier constant is `TILTF_Q15 = 4915` (`§G.3.28`'s inline
+//! "`TILTF = 4915 in Q15`", `0.15·2¹⁵ = 4915.2` truncated), **not** the
+//! `2458` a Q14 reading of `TILTF` would give — see the `N2` note in
+//! `docs/audio/g728/g728-errata.md`; the Annex-G conformance vectors are
+//! bit-exact only with `4915`.
 //! No new dB-domain Q-format is introduced — the log-gain adapter's
 //! §G.3.12–§G.3.16 dB scaling remains a documented gap, unrelated to this
 //! block.

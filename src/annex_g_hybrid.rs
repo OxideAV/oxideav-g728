@@ -59,7 +59,10 @@ pub const NLSATT50: i32 = 14;
 
 /// `NLSATTW = 15` — the attenuation NLS realising block 36's `1/2`
 /// recursive decay (§G.3.12; the base spec's float block 36 spells
-/// `REXPW(I) = (1/2)·REXPW(I) + TMP`): `(−2¹⁵ + 2¹⁶)/2¹⁶ = 0.5`.
+/// `REXPW(I) = (1/2)·REXPW(I) + TMP`): `(−2¹⁵ + 2¹⁶)/2¹⁶ = 0.5`. Block 36
+/// decays by `1/2`, **not** the `3/4` of sibling blocks 43/49 — the
+/// `3/4` listed first in HWMCORE's shared margin comment does not apply
+/// to block 36 (erratum E2 in `docs/audio/g728/g728-errata.md`).
 pub const NLSATTW: i32 = 15;
 
 /// `MLS` for the double-precision accumulator passed to the §G.1.3
@@ -396,7 +399,9 @@ impl HwmcoreState {
                 // and all four case-2/case-3 instances spell
                 // "AA1 = −AA1 + (RREC << 16)", and the floating-point
                 // recursion is REXP = (3/4)·REXP + TMP; we follow the
-                // five consistent instances.
+                // five consistent instances — erratum E1 in
+                // `docs/audio/g728/g728-errata.md` (the Annex I republished
+                // `HWMCOREFE` also prints the corrected minus form).
                 let aa1 = ((-(ri << nlsatt)) + (ri << 16)) >> ir;
                 aa0 += aa1;
                 aa0 = shl_acc(aa0, nlsre);

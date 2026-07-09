@@ -182,7 +182,11 @@ impl PitchAdapterFixed {
         // | If IP = NPWSZ, then set IP = NPWSZ − NFRSZ
         // (the float pseudo-code line; the D write pointer wraps inside
         // the newest-NFRSZ window 81..100 once the startup offset of
-        // IPINIT = 85 has drained).
+        // IPINIT = 85 has drained). The §G.3.24 *fixed-point* listing
+        // mis-prints this reset target as `NFRSZ` alone; the paired
+        // floating-point line (used here) is `NPWSZ − NFRSZ` and is what
+        // the conformance vectors require — erratum E3 in
+        // `docs/audio/g728/g728-errata.md`.
         if self.ip == NPWSZ {
             self.ip = NPWSZ - NFRSZ;
         }
