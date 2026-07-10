@@ -6,6 +6,40 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Annex I §I.5.1 `VEC_LOOP` frame-erasure driver (float decoder).**
+  `Decoder::conceal_vector()` / `Decoder::conceal_vector_postfiltered()`
+  conceal one lost vector each through the full Annex I loop: block
+  31SF flags/FESCALE at erasure onset and every 10 ms, block 31FE
+  voiced/unvoiced excitation extrapolation, block 31E `ETPAST()`
+  update (now also maintained on every good vector, as §I.5.4
+  requires), §I.4.2 LPC softening via block 51FE (`0.97^i` over the
+  last good `ATMP`, compounding on the live `A` every further 10 ms),
+  blocks 97FE + 43FE gain-adapter vital operations, block 49FE +
+  order-10-only block 50 at cycle end (the postfilter by-product keeps
+  "floating" per §I.4.4), the first-good-`ICOUNT = 3` block-51 resync
+  on the current mixed `ATMP`, and the §I.4.5 / 47AF gain-growth clamp
+  (`FEGAINMAX = 2 dB`/vector for `min(FECOUNT, AFTERFEMAX)` good
+  cycles). Erasure granularity is one adaptation cycle (`FESIZE = 1`
+  semantics; conceal 4 calls per lost 2.5 ms cycle). New audit
+  accessors `Decoder::fe_counters()` /
+  `Decoder::frame_erasure_excitation()`; new
+  `SynthesisAdapter::{adapt_erased, raw_atmp, illcond,
+  expand_current}`, `GainAdapter::{advance_erased,
+  predict_next_limited}` and
+  `HybridWindowState::{advance_erased, run_erased}` building blocks.
+  The never-erased path is bit-identical (all six ITU conformance legs
+  still pass bit-exactly).
+
+  **Conformance caveat:** the concealed output itself is
+  *non-adjudicable in-repo* — the ITU corpus stages `mask1` but no
+  paired concealed-PCM reference, upstream builds no Annex-I decoder
+  variant, and the Annex I PDF ships no I/O vectors (docs
+  `g728-errata.md`, issue #232). `tests/annex_i.rs` pins the
+  structural properties instead (prefix bit-exactness up to the first
+  erasure of a `mask1`-driven decode of the official `cw4` bitstream,
+  FESCALE silencing schedule, clamp arm/release/saturation, recovery,
+  hostile-mask robustness).
+
 - **Anchored regression tests for errata E3–E6 (docs answer, r408).**
   The four Annex-G fixed-point pseudo-code errata are now each pinned by
   a standalone unit test that runs everywhere (no conformance corpus

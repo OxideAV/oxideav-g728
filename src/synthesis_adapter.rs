@@ -201,6 +201,27 @@ impl SynthesisAdapter {
         self.illcond
     }
 
+    /// Block 51 on demand: the `FACV` bandwidth expansion of the
+    /// **current** persistent `ATMP` array, or `None` when `ILLCOND` is
+    /// set.
+    ///
+    /// The Annex I decoder needs this at the first good `ICOUNT = 3`
+    /// after an erasure: the §I.5.1 loop's "do block 51" reads the
+    /// then-current `ATMP` — whose head `ATMP(1..11)` was refreshed by
+    /// the erased cycles' order-10 block 50 while `ATMP(12..51)` kept
+    /// the pre-erasure values — rather than a predictor staged before
+    /// the erasure began.
+    pub fn expand_current(&self) -> Option<[f64; LPC + 1]> {
+        if self.illcond {
+            return None;
+        }
+        let mut a = self.atmp;
+        for (slot, &f) in a.iter_mut().zip(self.cfg.facv.iter()) {
+            *slot *= f;
+        }
+        Some(a)
+    }
+
     /// Process one adaptation cycle of quantised-speech samples
     /// (`NFRSZ = 20` samples) through blocks 49, 50 and 51, and update
     /// the cached predictor.

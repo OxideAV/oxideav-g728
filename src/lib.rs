@@ -436,6 +436,90 @@ pub struct Decoder {
     /// block-50 note prescribes ("the old set of synthesis filter
     /// coefficients … is still being used" until the third vector).
     active_predictor: [f64; consts::LPC + 1],
+    /// Annex I frame-erasure concealment state (§I.5.1 `VEC_LOOP`
+    /// additions). Maintained on **every** vector — good or concealed —
+    /// so a [`Self::conceal_vector_postfiltered`] call can pick up
+    /// mid-stream at any adaptation-cycle boundary.
+    fe: AnnexIState,
+}
+
+/// Annex I §I.5.1 decoder-side frame-erasure state.
+///
+/// One instance lives inside [`Decoder`]; the counters follow the
+/// `VEC_LOOP` pseudo-code with per-adaptation-cycle granularity
+/// (`FESIZE = 1`, explicitly sanctioned: "e.g.: 1 for 2.5 msec FEs" —
+/// callers wanting 10 ms frames simply conceal four cycles per lost
+/// frame).
+#[derive(Debug)]
+struct AnnexIState {
+    /// Blocks 31SF / 31FE / 31E — the `ETPAST()` history plus the
+    /// voiced/unvoiced extrapolation machinery.
+    exc: FrameErasureExcitation,
+    /// The unvoiced random slide-back source (§I.5.3: any aperiodic
+    /// integer sequence in 5..=140).
+    slide: LcgSlideSource,
+    /// `FECOUNT` — consecutively erased adaptation cycles.
+    fecount: usize,
+    /// `AFTERFE` — remaining good cycles with the block 47AF gain
+    /// clamp active.
+    afterfe: usize,
+    /// `OGAINDB` — last predicted gain in dB (block 47AF output on
+    /// good vectors, block 97FE output while concealing).
+    ogaindb: f64,
+    /// `FERROR` of the current adaptation cycle (latched at the cycle
+    /// top; the §I.5.1 `AFTERFE` decrement tests the previous cycle's
+    /// value, i.e. this field *before* the latch).
+    cycle_erased: bool,
+    /// Whether the previous **vector** was concealed (drives the
+    /// §I.5.1 `OGAINDB = output of block 97FE` handover in the lagged
+    /// block-67 model).
+    prev_vector_erased: bool,
+    /// Set while an erasure is in progress so the first good
+    /// `ICOUNT = 3` runs block 51 on the **current** `ATMP` (see
+    /// [`SynthesisAdapter::expand_current`]) instead of a pre-erasure
+    /// pending predictor.
+    resync_block51: bool,
+}
+
+impl AnnexIState {
+    fn new() -> Self {
+        Self {
+            exc: FrameErasureExcitation::new(),
+            slide: LcgSlideSource::default(),
+            fecount: 0,
+            afterfe: 0,
+            ogaindb: consts::OGAINDB_INIT,
+            cycle_erased: false,
+            prev_vector_erased: false,
+            resync_block51: false,
+        }
+    }
+
+    /// §I.5.1 top-of-cycle bookkeeping (the `If ICOUNT = 4 …` block,
+    /// which in this implementation runs when the vector counter wraps
+    /// to 1). `erased` is the new cycle's `FERROR`.
+    fn cycle_top(&mut self, erased: bool) {
+        // | If FERROR = .FALSE. and AFTERFE > 0, do AFTERFE = AFTERFE - 1
+        // (tests the PREVIOUS cycle's FERROR — the statement precedes
+        // the frame-boundary `read FERROR`).
+        if !self.cycle_erased && self.afterfe > 0 {
+            self.afterfe -= 1;
+        }
+        if erased {
+            // | If FERROR = .TRUE.: FECOUNT = FECOUNT + 1;
+            // | if (FECOUNT & 3) = 1, do block 31SF
+            self.fecount += 1;
+            if (self.fecount & 3) == 1 {
+                self.exc.on_erased_cycle(self.fecount >> 2);
+            }
+        } else if self.fecount > 0 {
+            // | first good frame after an erasure:
+            // | AFTERFE += FECOUNT (≤ AFTERFEMAX); FECOUNT = 0
+            self.afterfe = (self.afterfe + self.fecount).min(consts::AFTERFEMAX);
+            self.fecount = 0;
+        }
+        self.cycle_erased = erased;
+    }
 }
 
 impl Default for Decoder {
@@ -478,6 +562,7 @@ impl Decoder {
                 a[0] = 1.0;
                 a
             },
+            fe: AnnexIState::new(),
         }
     }
 
@@ -532,14 +617,40 @@ impl Decoder {
         // `pending_synth` and swap it into the active predictor only
         // when ICOUNT reaches 3.
         self.sf_icount = (self.sf_icount % consts::NUPDATE) + 1;
+        // §I.5.1 top-of-cycle bookkeeping (inert on never-erased
+        // streams: all counters stay 0 and the flags stay false).
+        if self.sf_icount == 1 {
+            self.fe.cycle_top(false);
+        }
         if self.sf_icount == 3 {
-            if let Some(pending) = self.pending_synth.take() {
+            if self.fe.resync_block51 {
+                // First good ICOUNT = 3 after an erasure: the §I.5.1
+                // "do block 51" reads the CURRENT ATMP (head refreshed
+                // by the erased cycles' order-10 block 50) — the
+                // pre-erasure pending predictor is stale. Skipped when
+                // ILLCOND is set, per the block-51 gate.
+                if let Some(a) = self.synth_adapter.expand_current() {
+                    self.active_predictor = a;
+                }
+                self.fe.resync_block51 = false;
+                self.pending_synth = None;
+            } else if let Some(pending) = self.pending_synth.take() {
                 self.active_predictor = pending;
             }
         }
 
         // ----- Block 30: predict σ(n) from previous ET ---------------
-        let sigma = self.gain_adapter.predict_next(&self.et_prev);
+        // Block 47 is realised as the Annex I block 47AF, which is
+        // identical while AFTERFE = 0 (always, unless a concealment
+        // preceded); OGAINDB tracks the limited dB gain per §I.5.1.
+        let (sigma, gain_db) = self.gain_adapter.predict_next_limited(
+            &self.et_prev,
+            self.fe.ogaindb,
+            self.fe.afterfe,
+            self.fe.prev_vector_erased,
+        );
+        self.fe.ogaindb = gain_db;
+        self.fe.prev_vector_erased = false;
 
         // ----- Block 29: excitation VQ codebook lookup ---------------
         // §5.14 block 29: YN(K) = GQ(IG) · Y(NN + K) — the gain-
@@ -577,6 +688,12 @@ impl Decoder {
             self.pending_synth = Some(*self.synth_adapter.coefficients());
             self.sttmp_idx = 0;
         }
+
+        // ----- Block 31E: update ETPAST() ----------------------------
+        // "Regardless of whether there is a frame erasure currently
+        // being concealed, this block must be completed so that the
+        // buffer will be ready when it is needed" (§I.5.4).
+        self.fe.exc.push(&et);
 
         // ----- Block 67 wrap-around: save ET for the next call -------
         self.et_prev = et;
@@ -624,18 +741,29 @@ impl Decoder {
         // Step 1: raw synthesis-filter output (advances synth_adapter
         // state when a full adaptation cycle is collected).
         let sd = self.decode_vector(ichan);
+        self.postfilter_chain(&sd, false)
+    }
 
+    /// Blocks 85 / 81 / 82 / 83 / 84 / 71 / 72 / 73–77 — the adaptive
+    /// postfilter and its adaptation chain, shared by the good-frame
+    /// path and the Annex I concealment path (§I.4.4: "the operation of
+    /// the post-filter and post-filter adapter is the same in both good
+    /// and erased frames" — the coefficients intentionally "float" with
+    /// the synthesized speech).
+    ///
+    /// `erased` gates only the §I.4.1 last-good `PTAP`/`KP` observation:
+    /// while an erasure is in progress the voiced/unvoiced decision and
+    /// `FEDELAY` stay frozen at their onset values, so the freshly
+    /// updated pitch parameters are *not* fed to the extrapolator.
+    fn postfilter_chain(&mut self, sd: &[f64; FRAME_LEN], erased: bool) -> [f64; FRAME_LEN] {
         // Step 2: refresh the short-term postfilter coefficients at
         // the first vector of every adaptation cycle (§7.2: "updated
         // at the first vector of each frame as soon as ã_i / k1 are
         // available from the order-10 by-product"). Vectors are
-        // 0-indexed here; spec ICOUNT = 1 maps to icount = 0.
-        //
-        // The long-term postfilter coefficients are NOT refreshed
-        // here yet — they require the §4.7 block-81..84 pitch
-        // extraction front end. Until that lands, the long-term
-        // filter stays at its cold-start `(g_l, b, p) = (1, 0, KPMIN)`
-        // §4.6.1 passthrough and step 3 is the identity (`sd_lt = sd`).
+        // 0-indexed here; spec ICOUNT = 1 maps to icount = 0. During a
+        // concealed cycle the by-product keeps refreshing from the
+        // erased-path order-10 block 50 (§I.4.4), so this step is
+        // shared unchanged.
         if self.icount == 0 {
             self.short_term_pf.set_from_synthesis_byproduct(
                 self.synth_adapter.order10_predictor(),
@@ -649,7 +777,7 @@ impl Decoder {
         // Block 81 (§4.7): run the 10th-order LPC inverse filter on
         // `sd` to produce the residual `d(k)`. The residual is the
         // input to block 82's pitch-period search.
-        let residual = self.pitch_inv_filter.filter_vector(&sd);
+        let residual = self.pitch_inv_filter.filter_vector(sd);
 
         // Block 82 (§4.7): push the residual vector into the pitch
         // extractor's 240-sample buffer. The spec's vector-slot
@@ -678,7 +806,7 @@ impl Decoder {
         // sd(−239..5) buffer. The push happens unconditionally per
         // vector; the coefficient evaluation itself runs only at the
         // third vector of each frame, alongside block 82's extract.
-        self.pitch_pf_coeff.push_decoded_vector(&sd);
+        self.pitch_pf_coeff.push_decoded_vector(sd);
 
         if self.icount == 3 {
             let p = self.pitch_search.extract();
@@ -690,12 +818,20 @@ impl Decoder {
             // 71) for the upcoming adaptation cycle. Per §7.1 of the
             // decode trace and §4.7 of the Recommendation this update
             // happens at the third vector of each frame.
-            let _beta = self.pitch_pf_coeff.compute_coefficients(p);
+            let beta = self.pitch_pf_coeff.compute_coefficients(p);
             self.long_term_pf.set_coefficients(
                 self.pitch_pf_coeff.last_g_l(),
                 self.pitch_pf_coeff.last_b(),
                 p,
             );
+            // §I.4.1: record the last-good (PTAP, KP) pair for the
+            // frame-erasure extrapolator's onset decision. §I.4.4:
+            // while an erasure is in progress the postfilter keeps
+            // updating KP and PTAP, but VOICED / FEDELAY stay frozen —
+            // so the observation is skipped on concealed cycles.
+            if !erased {
+                self.fe.exc.observe_good_cycle(beta, p);
+            }
         }
 
         // Step 3: long-term (pitch) postfilter (block 71). Until the
@@ -704,7 +840,7 @@ impl Decoder {
         // §4.6.1 passthrough identity. Once block 84 starts feeding
         // non-trivial (g_l, b, p) per frame the comb begins doing
         // actual long-term postfiltering.
-        let sd_lt = self.long_term_pf.filter_vector(&sd);
+        let sd_lt = self.long_term_pf.filter_vector(sd);
 
         // Step 4: short-term postfilter (block 72). At cold start,
         // before any adaptation cycle has completed, all coefficients
@@ -716,7 +852,128 @@ impl Decoder {
         // Step 5: AGC (blocks 73-77). Block 73 takes the *raw*
         // decoded-speech vector `sd` (Figure 7/G.728), keeping the
         // power reference anchored at the synthesis filter output.
-        self.agc.apply(&sd, &sf)
+        self.agc.apply(sd, &sf)
+    }
+
+    /// Annex I §I.5.1 — conceal one erased vector and return the raw
+    /// (pre-postfilter) synthesized speech `sd(n)`, the §4.6.1
+    /// "postfilter off" rendering of the concealed output.
+    ///
+    /// See [`Self::conceal_vector_postfiltered`]; the full concealment
+    /// loop — including the postfilter adaptation blocks, which §I.4.4
+    /// keeps running during erasures — is executed either way, so the
+    /// two methods may be freely mixed with their good-frame
+    /// counterparts.
+    pub fn conceal_vector(&mut self) -> [f64; FRAME_LEN] {
+        self.conceal_vector_inner().0
+    }
+
+    /// Annex I §I.5.1 — conceal one erased vector and return the
+    /// postfiltered output (blocks 71–77 applied, as in
+    /// [`Self::decode_vector_postfiltered`]).
+    ///
+    /// One lost 10-bit channel index = one call. Erasures are
+    /// per-adaptation-cycle (`FESIZE = 1` semantics — §I.5.1 allows
+    /// "FEs [of] any multiple of 2.5 msec"): a lost 2.5 ms cycle is
+    /// four consecutive calls, a lost 10 ms frame sixteen. Concealment
+    /// should start at an adaptation-cycle boundary and cover whole
+    /// cycles; the decoder stays well-defined on misaligned calls but
+    /// the concealment quality is then unspecified.
+    ///
+    /// The per-vector §I.5.1 sequence:
+    ///
+    /// 1. top-of-cycle bookkeeping (`FECOUNT`/`AFTERFE`, block 31SF at
+    ///    erasure onset and every 10 ms);
+    /// 2. block 51FE at `ICOUNT = 3` on the same 10 ms cadence — the
+    ///    §I.4.2 LPC softening (`FACVFE = 0.97^i` over the last good
+    ///    `ATMP` first, then compounding on the live `A`);
+    /// 3. block 97FE (via the lagged block-67 model) + block 43FE for
+    ///    the gain adapter's "vital operations" (§I.4.3);
+    /// 4. block 31FE excitation extrapolation + block 31E `ETPAST()`
+    ///    update;
+    /// 5. block 32 synthesis through the softened predictor;
+    /// 6. the unchanged postfilter chain (§I.4.4), with the
+    ///    voiced/unvoiced onset decision frozen;
+    /// 7. at cycle end, block 49FE + order-10-only block 50
+    ///    ([`SynthesisAdapter::adapt_erased`]).
+    pub fn conceal_vector_postfiltered(&mut self) -> [f64; FRAME_LEN] {
+        self.conceal_vector_inner().1
+    }
+
+    /// Shared §I.5.1 erased-vector body; returns `(sd, spf)`.
+    fn conceal_vector_inner(&mut self) -> ([f64; FRAME_LEN], [f64; FRAME_LEN]) {
+        self.sf_icount = (self.sf_icount % consts::NUPDATE) + 1;
+        if self.sf_icount == 1 {
+            self.fe.cycle_top(true);
+            // Any concealed cycle invalidates a pre-erasure pending
+            // block-51 predictor and arms the first-good-ICOUNT=3
+            // resync (see decode_vector).
+            self.pending_synth = None;
+            self.fe.resync_block51 = true;
+        }
+
+        // ----- Block 51FE (§I.5.8) at ICOUNT = 3, every 10 ms --------
+        // | If FERROR = .TRUE. and (FECOUNT & 3) = 1, do block 51FE
+        // | If FECOUNT = 1 and ILLCOND = .FALSE.:
+        // |     A(I) = FACVFE(I) * ATMP(I)     — soften the LAST GOOD
+        // |                                       50th-order analysis
+        // | Otherwise: A(I) = FACVFE(I) * A(I) — compound on the live A
+        if self.sf_icount == 3 && (self.fe.fecount & 3) == 1 {
+            if self.fe.fecount == 1 && !self.synth_adapter.illcond() {
+                self.active_predictor = soften_predictor(self.synth_adapter.raw_atmp(), 1);
+            } else {
+                self.active_predictor = soften_predictor(&self.active_predictor, 1);
+            }
+        }
+
+        // ----- Blocks 97FE + 43FE: gain-adapter vital operations ------
+        // The lagged block-67 model inserts the PREVIOUS vector's ET
+        // log-gain here; when that vector was itself concealed, its
+        // ETRMS is the §I.5.1 `OGAINDB = output of block 97FE` value.
+        let etrms = self.gain_adapter.advance_erased(&self.et_prev);
+        if self.fe.prev_vector_erased {
+            self.fe.ogaindb = etrms;
+        }
+
+        // ----- Block 31FE: extrapolate the excitation ----------------
+        let et = self.fe.exc.extrapolate(&mut self.fe.slide);
+        // ----- Block 31E: update ETPAST() ----------------------------
+        self.fe.exc.push(&et);
+
+        // ----- Block 32: synthesis through the softened predictor ----
+        self.synth.set_predictor(self.active_predictor);
+        let sd = self.synth.filter_vector(&ExcitationVector(et));
+
+        // ----- Blocks 85/81/82/83/84/71–77: postfilter (floats) ------
+        let spf = self.postfilter_chain(&sd, true);
+
+        // ----- STTMP accumulation + block 49FE / order-10 block 50 ----
+        for &v in &sd {
+            self.sttmp_buf[self.sttmp_idx] = v;
+            self.sttmp_idx += 1;
+        }
+        if self.sttmp_idx >= consts::NFRSZ {
+            let _ = self.synth_adapter.adapt_erased(&self.sttmp_buf);
+            self.sttmp_idx = 0;
+        }
+
+        // ----- Block 67 wrap-around ----------------------------------
+        self.et_prev = et;
+        self.fe.prev_vector_erased = true;
+
+        (sd, spf)
+    }
+
+    /// Annex I frame-erasure counters, exposed for tests and audit:
+    /// `(FECOUNT, AFTERFE, OGAINDB)`.
+    pub fn fe_counters(&self) -> (usize, usize, f64) {
+        (self.fe.fecount, self.fe.afterfe, self.fe.ogaindb)
+    }
+
+    /// Borrow the Annex I excitation extrapolator (blocks 31SF / 31FE /
+    /// 31E) — for tests and audit.
+    pub fn frame_erasure_excitation(&self) -> &FrameErasureExcitation {
+        &self.fe.exc
     }
 
     /// Borrow the long-term postfilter (useful for tests and audit).
