@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Packet-loss concealment through the registered `g728` codec.** The
+  registry decoder treats a packet with an **empty payload** as a lost
+  transmission unit and substitutes Annex I concealed PCM for
+  `duration` samples (1/8000 units, rounded up to whole 20-sample
+  adaptation cycles; one cycle when no duration is given), then resumes
+  normal decode on the next payload-bearing packet. Uses only existing
+  `oxideav-core` packet semantics — no core changes.
+
 - **Annex I §I.5.1 `VEC_LOOP` frame-erasure driver (fixed-point
   decoder).** `DecoderFixed::conceal_vector()` conceals one lost vector
   through the fixed-point (`#ifdef FIXPT`) legs of the Annex I loop:

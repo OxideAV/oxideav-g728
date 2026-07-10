@@ -30,7 +30,10 @@ The codec is exposed both as **direct `Encoder` / `Decoder` /
 `EncoderFixed` / `DecoderFixed` APIs** and as a registered
 `oxideav-core` codec: `register(ctx)` wires `g728` decoder + encoder
 factories (§5.11 byte-stream packets ↔ S16 mono 8 kHz frames through
-the conformance-bit-exact fixed-point chains; WAVE tag `0x0041`).
+the conformance-bit-exact fixed-point chains; WAVE tag `0x0041`). The
+registry decoder performs **Annex I packet-loss concealment**: an
+empty-payload packet marks a lost unit and is replaced by concealed
+PCM for its `duration` (whole adaptation cycles).
 
 Implemented end-to-end:
 

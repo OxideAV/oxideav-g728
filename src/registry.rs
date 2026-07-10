@@ -9,7 +9,12 @@
 //!   adaptive postfilter — the chain that reproduces the official ITU-T
 //!   conformance vectors bit-exactly — and renders the `Q2` postfiltered
 //!   speech to 16-bit linear (`×2`, the same conversion the conformance
-//!   `outb4g` reference uses).
+//!   `outb4g` reference uses). **Packet loss**: a packet with an
+//!   **empty payload** marks a lost transmission unit and triggers the
+//!   Annex I concealment ([`DecoderFixed::conceal_vector`]) for
+//!   `duration` samples (1/8000 units, rounded up to whole 20-sample
+//!   adaptation cycles; one cycle when no duration is given), emitting
+//!   concealed PCM in place of the lost speech.
 //! * **encoder** — 16-bit mono 8 kHz PCM in (`S = sample >> 1` §G.3.1
 //!   input conversion), §5.11 byte stream out via the bit-exact
 //!   [`EncoderFixed`]. Input is buffered to whole adaptation cycles
@@ -142,6 +147,28 @@ impl G728RegistryDecoder {
             data: vec![data],
         }));
     }
+
+    /// Annex I concealment for `cycles` lost adaptation cycles: run the
+    /// §I.5.1 fixed-point `VEC_LOOP` erasure path and emit the concealed
+    /// PCM as one [`AudioFrame`].
+    fn conceal_cycles(&mut self, cycles: usize, pts: Option<i64>) {
+        let vectors = cycles * (CYCLE_SAMPLES / IDIM);
+        let mut data = Vec::with_capacity(vectors * IDIM * 2);
+        for _ in 0..vectors {
+            for &q2 in self.inner.conceal_vector().iter() {
+                let s = (i64::from(q2) * 2).clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16;
+                data.extend_from_slice(&s.to_le_bytes());
+            }
+        }
+        let samples = (vectors * IDIM) as u32;
+        let pts = pts.or(Some(self.next_pts));
+        self.next_pts += i64::from(samples);
+        self.out.push_back(Frame::Audio(AudioFrame {
+            samples,
+            pts,
+            data: vec![data],
+        }));
+    }
 }
 
 impl oxideav_core::Decoder for G728RegistryDecoder {
@@ -152,6 +179,19 @@ impl oxideav_core::Decoder for G728RegistryDecoder {
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
         if self.eof {
             return Err(Error::invalid("g728: send_packet after flush"));
+        }
+        if packet.data.is_empty() {
+            // Annex I: an empty payload marks a lost transmission unit.
+            // Conceal `duration` samples (rounded up to whole adaptation
+            // cycles; one cycle when unknown). Any pending partial cycle
+            // is dropped — bytes across a loss cannot be re-joined into
+            // valid 10-bit-index framing (senders using this signal
+            // frame packets on whole cycles, as the encoder side emits).
+            self.pending.clear();
+            let samples = packet.duration.unwrap_or(CYCLE_SAMPLES as i64).max(1) as usize;
+            let cycles = samples.div_ceil(CYCLE_SAMPLES).max(1);
+            self.conceal_cycles(cycles, packet.pts);
+            return Ok(());
         }
         self.pending.extend_from_slice(&packet.data);
         self.drain_cycles(packet.pts);
@@ -326,6 +366,72 @@ mod tests {
         (0..n)
             .map(|i| ((i as f64 * 0.11).sin() * 11000.0 + (i as f64 * 0.041).sin() * 4000.0) as i16)
             .collect()
+    }
+
+    #[test]
+    fn empty_packet_conceals_and_stream_resumes() {
+        // Round-trip a tone through the registered encoder, then decode
+        // with one packet replaced by an empty (lost) packet carrying
+        // its duration: the decoder must emit exactly the same number
+        // of samples (concealed in place of the loss) and keep decoding
+        // the following packets.
+        let params = audio_params();
+        let mut enc = new_encoder(&params).expect("encoder");
+        let pcm = tone(40 * CYCLE_SAMPLES);
+        let mut packets = Vec::new();
+        for chunk in pcm.chunks(5 * CYCLE_SAMPLES) {
+            enc.send_frame(&s16_frame(chunk)).expect("send_frame");
+            while let Ok(p) = enc.receive_packet() {
+                packets.push(p);
+            }
+        }
+        enc.flush().expect("flush");
+        while let Ok(p) = enc.receive_packet() {
+            packets.push(p);
+        }
+        assert!(packets.len() >= 4, "need several packets for the test");
+
+        let mut dec = new_decoder(&params).expect("decoder");
+        let lost_idx = packets.len() / 2;
+        let mut total_samples = 0u32;
+        for (i, p) in packets.iter().enumerate() {
+            if i == lost_idx {
+                // Simulate the loss: same timing, no payload.
+                let lost_duration = (p.data.len() / CYCLE_BYTES * CYCLE_SAMPLES) as i64;
+                let mut lost = Packet::new(p.stream_index, p.time_base, Vec::new());
+                lost.pts = p.pts;
+                lost.duration = Some(lost_duration);
+                dec.send_packet(&lost).expect("lost packet accepted");
+            } else {
+                dec.send_packet(p).expect("send_packet");
+            }
+            while let Ok(Frame::Audio(f)) = dec.receive_frame() {
+                total_samples += f.samples;
+                // Concealed and decoded PCM alike must be within S16 by
+                // construction; sanity-check payload sizing.
+                assert_eq!(f.data[0].len(), f.samples as usize * 2);
+            }
+        }
+        let sent: usize = packets.iter().map(|p| p.data.len() / CYCLE_BYTES).sum();
+        assert_eq!(
+            total_samples as usize,
+            sent * CYCLE_SAMPLES,
+            "concealment must substitute exactly the lost duration"
+        );
+    }
+
+    #[test]
+    fn empty_packet_without_duration_conceals_one_cycle() {
+        let mut dec = new_decoder(&audio_params()).expect("decoder");
+        let lost = Packet::new(0, TimeBase::new(1, i64::from(SAMPLE_RATE)), Vec::new());
+        dec.send_packet(&lost).expect("cold-start loss accepted");
+        match dec.receive_frame() {
+            Ok(Frame::Audio(f)) => {
+                assert_eq!(f.samples as usize, CYCLE_SAMPLES);
+                assert_eq!(f.data[0].len(), CYCLE_SAMPLES * 2);
+            }
+            other => panic!("expected one concealed cycle, got {other:?}"),
+        }
     }
 
     #[test]
