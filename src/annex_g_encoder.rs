@@ -468,6 +468,60 @@ mod tests {
         a
     }
 
+    #[test]
+    fn erratum_e6_blockzir_middle_loop_accumulates() {
+        // Erratum E6 (docs/audio/g728/g728-errata.md): the §G.3.2
+        // fixed-point Blockzir block-9 listing prints the middle
+        // (I = 2..10) inner MAC as `AA0 = 0 − STATELPC(J)·A(J+1)` — a
+        // per-tap *reset* that would keep only the last of each 5-tap
+        // segment. The accumulating form `AA0 = AA0 − …` (as printed in
+        // the first and third MAC loops of the same clause) is required.
+        //
+        // Pin it against an independent accumulating transcription of
+        // the block-9 ZIR with every NLSSTATE equal (so the segment
+        // alignment shifts vanish and the two models must agree
+        // exactly). The predictor puts several taps inside one middle
+        // 5-tap segment (A(34..36)), where the reset form diverges.
+        let mut f = EncoderFiltersFixed::new();
+        for (j, s) in f.statelpc.iter_mut().enumerate() {
+            *s = ((j as i16 * 37) % 199) + 1; // non-zero pattern
+        }
+        f.nlsstate = [2; NSEG_LPC + 1]; // flat scale ⇒ IR = 0
+        let mut a = [0i16; LPC + 1];
+        a[0] = 1 << 14;
+        a[33] = 8192; // A(34) = 0.5
+        a[34] = -4096; // A(35) = −0.25
+        a[35] = 2048; // A(36) = 0.125
+        a[7] = -2048;
+        a[50] = 1024;
+        let awz = [0i16; LPCW + 1];
+        let awp = [0i16; LPCW + 1];
+
+        // Independent reference: the plain accumulating ZIR recursion
+        // (same arithmetic, no segmentation — valid because all
+        // NLSSTATE are equal and IR = min − 2 = 0).
+        let mut state: [i64; LPC] = std::array::from_fn(|j| i64::from(f.statelpc[j]));
+        let mut want = [0i16; IDIM];
+        for w in &mut want {
+            let mut acc = 0i64;
+            for j in (1..=LPC).rev() {
+                acc -= state[j - 1] * i64::from(a[j]);
+                if j >= 2 {
+                    state[j - 1] = state[j - 2];
+                }
+            }
+            let out = (acc >> 14).clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16;
+            state[0] = i64::from(out);
+            *w = out;
+        }
+
+        let zir = f.zero_input_response(&a, &awz, &awp);
+        assert_eq!(zir, want, "block-9 middle loop must accumulate, not reset");
+        // Self-check: the middle segments actually contribute more than
+        // one tap (otherwise this test could not discriminate).
+        assert!(want.iter().any(|&v| v != 0));
+    }
+
     /// Floating-point transcription of the §G.3.1 block-4 pseudo-code
     /// (the annex prints it right above the fixed-point version).
     struct FloatWeighting {

@@ -475,6 +475,47 @@ mod tests {
     }
 
     #[test]
+    fn erratum_e5_stpfiir_memory_sources_the_all_pole_result() {
+        // Erratum E5 (docs/audio/g728/g728-errata.md): the §G.3.20
+        // fixed-point listing prints the short-term IIR memory store as
+        // `AA0 = AA0 >> 14 … STPFIIR(1) = AA0`, but at that point `AA0`
+        // still holds the *long-term* postfilter term; the all-pole
+        // result lives only in `AA1` (the paired floating-point listing
+        // stores `STPFIIR(1) = TEMP(K)`, the freshly all-pole-filtered
+        // value). Pin the recursion with a single-pole short-term filter
+        // `AP(2) = 0.5` (Q14) and an impulse: each sample's IIR memory
+        // must be the all-pole output −½·previous, not the long-term
+        // term (which is 0 for every sample after the first).
+        let mut pf = PostfilterFixed::new();
+        let lt = LongTermCoeff {
+            kp: 50,
+            gl_q14: 16384, // GL = 1
+            glb_q16: 0,    // long-term filter = identity
+        };
+        let mut ap_q14 = [0i32; PF_ORDER + 1];
+        ap_q14[1] = 8192; // AP(2) = 0.5 in Q14
+        let sc = ShortTermCoeff {
+            az_q14: [0; PF_ORDER + 1],
+            ap_q14,
+            tiltz_q14: 0,
+        };
+        // Impulse vector: SST(1..5) = (1000, 0, 0, 0, 0) in Q2.
+        let base = SST_PAST;
+        pf.sst[base] = 1000;
+        for k in 1..IDIM {
+            pf.sst[base + k] = 0;
+        }
+        let temp = pf.long_short_postfilter(&lt, &sc);
+        // All-pole recursion y(k) = x(k) − ½·y(k−1), Q2 with >>14
+        // truncation at each step: 1000, −500, 250, −125, 62.
+        assert_eq!(temp, [1000, -500, 250, -125, 62]);
+        // The IIR memory must carry the last all-pole output (AA1
+        // source). The as-printed AA0 source would have stored the
+        // long-term term instead — 0 for every sample after the first.
+        assert_eq!(pf.stpfiir[0], 62);
+    }
+
+    #[test]
     fn agcfac_constants_match_table_g1() {
         // §G.4 Table G.1/G.728: AGCFAC = 0.99 in Q14, AGCFAC1 = 0.01 in
         // Q21. Cross-check the integer literals against the floats.

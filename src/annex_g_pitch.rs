@@ -153,6 +153,16 @@ impl PitchAdapterFixed {
         self.kp
     }
 
+    /// The block-81 residual write pointer `IP` (for tests/audit).
+    ///
+    /// Walks `IPINIT = 85 → 90 → 95 → 100`, then wraps to
+    /// `NPWSZ − NFRSZ = 80` before the next write — the erratum-E3
+    /// circular-buffer rewind (see [`Self::inverse_filter`]).
+    #[must_use]
+    pub fn ip(&self) -> usize {
+        self.ip
+    }
+
     /// Borrow the `Q1` residual buffer `D` (for tests/audit).
     #[must_use]
     pub fn d(&self) -> &[i16; D_LEN] {
@@ -279,6 +289,19 @@ impl PitchAdapterFixed {
         let mut aa1 = i64::from(i32::MIN);
         let mut kp = m1;
         for j in m1..=m2 {
+            // | AA0 = AA0 + D(K) · D(K − J)   | Correlation in undecimated domain
+            //
+            // The §G.3.25 *fixed-point* listing prints this inner MAC as
+            // `AA0 = AA0 + D(K) * DEC(K – J)` — the second factor's array
+            // name is a misprint: `DEC` is the *decimated* buffer, whose
+            // index range (`−34 ..= NPWSZ/4`) cannot even hold `K − J` for
+            // `K` up to `NPWSZ = 100`. The refined undecimated-domain
+            // autocorrelation is `D(K)·D(K − J)`, exactly as the paired
+            // floating-point listing on the previous page prints it
+            // (`TMP = TMP + D(K) * D(K – J)`) and as the sibling
+            // sub-multiple loop below prints it in the fixed-point text
+            // itself. Conformance (outb4g) is bit-exact only with this
+            // form — erratum E4 in `docs/audio/g728/g728-errata.md`.
             let mut aa0: i64 = 0;
             for k in 1..=NPWSZ {
                 aa0 += i64::from(self.d[D_OFF + k]) * i64::from(self.d[(D_OFF + k) - j]);
@@ -734,5 +757,82 @@ mod tests {
         assert!(a.dec.iter().all(|&v| v == 0));
         assert_eq!(D_LEN, 240);
         assert_eq!(DEC_LEN, 60);
+    }
+
+    #[test]
+    fn erratum_e3_ip_wraps_to_npwsz_minus_nfrsz() {
+        // Erratum E3 (docs/audio/g728/g728-errata.md): the §G.3.24
+        // fixed-point listing prints the block-81 write-pointer reset as
+        // `If IP = NPWSZ, then set IP = NFRSZ` — the reset target must be
+        // `NPWSZ − NFRSZ` (= 80), as the paired floating-point listing
+        // prints. Pin the whole IP trajectory: from IPINIT = 85 the
+        // pointer walks 90 → 95 → 100, then rewinds to 80 before the
+        // next write (so the post-write value is 85 again), and never
+        // leaves the newest-NPWSZ window. With the as-printed `NFRSZ`
+        // reset the post-write value after the wrap would be 25.
+        let mut a = PitchAdapterFixed::new();
+        let apf = apf_identity();
+        let st = [0i32; IDIM];
+        let expected = [90, 95, 100, 85, 90, 95, 100, 85, 90];
+        for (call, &want) in expected.iter().enumerate() {
+            let _ = a.inverse_filter(&st, 2, &apf);
+            assert_eq!(a.ip(), want, "IP after call {call}");
+            assert!(
+                a.ip() > NPWSZ - NFRSZ && a.ip() <= NPWSZ,
+                "IP must stay inside the newest-window (80, 100]"
+            );
+        }
+    }
+
+    /// Identity order-10 predictor in Q13 (`APF = δ`).
+    fn apf_identity() -> [i16; PF_ORDER + 1] {
+        let mut apf = [0i16; PF_ORDER + 1];
+        apf[0] = 8192;
+        apf
+    }
+
+    #[test]
+    fn erratum_e4_refined_search_correlates_d_with_d() {
+        // Erratum E4 (docs/audio/g728/g728-errata.md): the §G.3.25
+        // fixed-point refined (undecimated) peak-pick prints its inner
+        // MAC as `AA0 = AA0 + D(K) * DEC(K − J)`; the second factor's
+        // array name is a misprint for `D(K − J)` (the paired
+        // floating-point listing prints `TMP = TMP + D(K) * D(K − J)`
+        // literally, and `DEC` cannot even be indexed at `K − J`).
+        //
+        // Pin the corrected behaviour with a two-pulse residual: pulses
+        // at D(60) and D(100) (lag 40) plus a decimated-domain pulse at
+        // DEC(15) so the coarse pick lands at KMAX = 10 (via the
+        // lowpassed D(100) pulse entering DEC(25)). The refined search
+        // over J = 37..43 must then pick the true undecimated lag 40 —
+        // the argmax of Σ D(K)·D(K−J), recomputed independently here.
+        let mut a = PitchAdapterFixed::new();
+        a.d[D_OFF + 100] = 8000;
+        a.d[D_OFF + 60] = 8000;
+        a.dec[DEC_OFF + 15] = 8000;
+        let d_before = a.d;
+
+        a.pitch_extract();
+
+        // Independent argmax of the refined-window autocorrelation on
+        // the pre-extract residual snapshot.
+        let mut best_j = 0usize;
+        let mut best = i64::MIN;
+        for j in 37..=43usize {
+            let mut corr = 0i64;
+            for k in 1..=NPWSZ {
+                corr += i64::from(d_before[D_OFF + k]) * i64::from(d_before[(D_OFF + k) - j]);
+            }
+            if corr > best {
+                best = corr;
+                best_j = j;
+            }
+        }
+        assert_eq!(best_j, 40, "test-vector self-check");
+        assert_eq!(
+            a.kp(),
+            best_j,
+            "block 82 must pick the argmax of the D·D refined correlation"
+        );
     }
 }

@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Anchored regression tests for errata E3–E6 (docs answer, r408).**
+  The four Annex-G fixed-point pseudo-code errata are now each pinned by
+  a standalone unit test that runs everywhere (no conformance corpus
+  needed): the block-81 `IP` rewind trajectory (E3), the block-82
+  refined undecimated peak-pick argmax identity (E4), the block-71/72
+  `STPFIIR(1)` all-pole-source recursion (E5), and the Blockzir block-9
+  middle-loop accumulation against an independent flat-scale ZIR
+  transcription (E6). E4 additionally gains its source-line anchor
+  comment (the misprinted factor is the *array name* — the printed
+  `DEC(K − J)` cannot even be indexed at `K − J`; the paired
+  floating-point listing prints the corrected `D(K)·D(K − J)` form
+  literally), plus a `PitchAdapterFixed::ip()` audit accessor.
+
 ### Fixed
 
 - **Block-83 PTAP shift-overflow panic guard (§G.3.27)** — the
