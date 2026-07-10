@@ -273,16 +273,21 @@ impl FrameErasureExcitation {
     /// [`Self::push`] it immediately (block 31E).
     pub fn extrapolate<S: SlideSource>(&self, slide: &mut S) -> ExcitationVector {
         let mut et = [0.0f64; IDIM];
-        // The vector currently being written occupies ETPAST positions
-        // [tail .. tail+IDIM); a slide-back of `d` reads from
-        // [tail-d .. tail-d+IDIM).
-        let tail = ETPAST_LEN - IDIM;
+        // Index mapping (§I.5.3): the spec's `ETPAST(0)` is the last
+        // sample of the *previous* vector — the newest sample stored in
+        // the buffer, `etpast[ETPAST_LEN − 1]` — and the current vector
+        // occupies the (not yet stored) spec slots `ETPAST(1..IDIM)`.
+        // `ET(I) = ETPAST(I − FEDELAY)` therefore reads spec positions
+        // `1−d .. IDIM−d`, i.e. `etpast[ETPAST_LEN − d ..][..IDIM]`.
+        // Both branches keep `d ≥ IDIM` (voiced `d = KP ≥ KPMIN = 20`,
+        // unvoiced `d ≥ 5`), so the segment never overlaps the vector
+        // being written and always lies in-buffer.
 
         if self.voiced {
-            // Voiced: ET(I) = FESCALE * ETPAST(I - FEDELAY).
-            let d = self.fedelay.max(1).min(tail);
+            // Voiced: ET(I) = FESCALE * ETPAST(I - FEDELAY), FEDELAY = KP.
+            let d = self.fedelay.clamp(IDIM, KPMAX);
             for (i, out) in et.iter_mut().enumerate() {
-                *out = self.fescale * self.etpast[tail - d + i];
+                *out = self.fescale * self.etpast[ETPAST_LEN - d + i];
             }
         } else {
             // Unvoiced: pull a random 5-sample segment, magnitude-match
@@ -290,11 +295,10 @@ impl FrameErasureExcitation {
             // / MAG where MAG is the segment's own magnitude sum.
             let d = slide
                 .next_slide()
-                .clamp(FE_UNVOICED_MIN_SLIDE, FE_UNVOICED_MAX_SLIDE)
-                .min(tail);
+                .clamp(FE_UNVOICED_MIN_SLIDE, FE_UNVOICED_MAX_SLIDE);
             let mut mag = 0.0;
             for (i, out) in et.iter_mut().enumerate() {
-                let v = self.etpast[tail - d + i];
+                let v = self.etpast[ETPAST_LEN - d + i];
                 *out = v;
                 mag += v.abs();
             }
@@ -434,18 +438,59 @@ mod tests {
 
     #[test]
     fn voiced_extrapolation_is_periodic_scaled_copy() {
-        // ET(i) = FESCALE * ETPAST(i - FEDELAY): a scaled copy of the
-        // segment FEDELAY samples back from the current vector position.
+        // ET(I) = FESCALE * ETPAST(I - FEDELAY): a scaled copy of the
+        // segment starting exactly FEDELAY samples before the current
+        // vector position — spec slot 1 − KP, i.e. the buffer's newest
+        // sample minus (KP − 1). With the ramp history (newest sample =
+        // 150) and KP = 20 the source segment is 131..135.
         let mut fe = ramped();
         let kp = 20;
         fe.observe_good_cycle(0.9, kp);
         fe.on_erased_cycle(0);
         let mut slide = FixedSlide::new(&[5]); // unused on voiced path
         let et = fe.extrapolate(&mut slide);
-        let tail = ETPAST_LEN - IDIM;
         for i in 0..IDIM {
-            let expected = 0.8 * fe.etpast[tail - kp + i];
+            let expected = 0.8 * fe.etpast[ETPAST_LEN - kp + i];
             assert!((et[i] - expected).abs() < 1e-12, "sample {i}");
+        }
+        // Anchor the absolute values too: the ramp's newest sample is
+        // 150.0, so ETPAST(1−20 .. 5−20) is 131..135.
+        assert_eq!(fe.etpast[ETPAST_LEN - 1], 150.0);
+        for (i, &v) in et.iter().enumerate() {
+            assert!((v - 0.8 * (131.0 + i as f64)).abs() < 1e-12, "sample {i}");
+        }
+    }
+
+    #[test]
+    fn voiced_extrapolation_stream_has_period_exactly_kp() {
+        // §I.4.1: "the extrapolation of ET() is done by periodically
+        // repeating a scaled-down version of the last KP samples of the
+        // ETPAST() array" — the generated excitation stream must be
+        // periodic with period exactly KP (not KP ± IDIM). Run the full
+        // extrapolate-then-push loop and check the emitted stream
+        // against both the history (first KP samples) and itself
+        // (period-KP recurrence thereafter, exact in f64 because each
+        // sample is literally FESCALE times the value read back).
+        let mut fe = ramped();
+        let kp = 20usize;
+        fe.observe_good_cycle(0.9, kp);
+        fe.on_erased_cycle(0); // FESCALE = 0.8
+        let hist_tail: Vec<f64> = fe.etpast[ETPAST_LEN - kp..].to_vec();
+
+        let mut stream = Vec::new();
+        let mut slide = FixedSlide::new(&[5]); // unused on voiced path
+        for _ in 0..12 {
+            let et = fe.extrapolate(&mut slide);
+            fe.push(&et); // block 31E
+            stream.extend_from_slice(&et);
+        }
+        for (n, &v) in stream.iter().enumerate() {
+            let expected = if n < kp {
+                0.8 * hist_tail[n]
+            } else {
+                0.8 * stream[n - kp]
+            };
+            assert_eq!(v, expected, "stream sample {n}");
         }
     }
 

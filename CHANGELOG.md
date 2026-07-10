@@ -21,6 +21,17 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Block-31FE slide-back was off by one vector (§I.5.3)** — the
+  frame-erasure excitation extrapolator read its 5-sample segment
+  relative to the *previous* vector's start instead of the current
+  vector position, so a slide-back of `d` effectively reached `d + IDIM`
+  samples into the past: voiced concealment repeated the excitation with
+  period `KP + 5` instead of `KP`. The index base is now the spec's
+  `ETPAST(I − FEDELAY)` mapping (spec slot 0 = the newest stored
+  sample), and a new regression test drives the full
+  extrapolate-then-push loop to pin the generated stream's period at
+  exactly `KP`.
+
 - **Block-83 PTAP shift-overflow panic guard (§G.3.27)** — the
   fixed-point pitch-tap calculator's final `PTAP >> (NLSPTAP − 14)` used
   a raw `i16` shift amount that reaches the type width and panics
