@@ -6,6 +6,35 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Annex I §I.5.1 `VEC_LOOP` frame-erasure driver (fixed-point
+  decoder).** `DecoderFixed::conceal_vector()` conceals one lost vector
+  through the fixed-point (`#ifdef FIXPT`) legs of the Annex I loop:
+  the fixed-`Q2` `ETPAST` blocks 31SF/31FE/31E
+  (`annex_i_fixed::EtPastFixed`, scalar-floating `AVMAG`/`FESCALE` with
+  the printed Q15 gain tables and the `DIVIDE`-based unvoiced magnitude
+  match), block 51FE LPC softening via the Appendix I.I `FACVFE` Q14
+  table (over the cached raw last-good `ATMP`/`NLSATMP` first,
+  compounding on the live Q14 `A` each further 10 ms), block 97FE →
+  `GSTATE(1)`/`OGAINDB` through the annex's example `LIN2DB` polynomial,
+  block 98AF replacing block 98 in the gain adapter
+  (`GainAdapterFixed::predict_limited`), block 43FE at `ICOUNT = 1`
+  (`GainAdapterFixed::update_erased`), and block 49FE + order-10-only
+  block 50 at cycle end (`HWMCOREFE` — `HwmcoreState::run_fe` /
+  `HybridWindowFixedState::run_erased`, `LPFE = 10`). New audit
+  accessors `DecoderFixed::{fe_counters, frame_erasure_excitation}`.
+  The never-erased path is bit-identical (all six ITU legs stay
+  bit-exact; the fixed `mask1` masked decode is prefix-bit-exact). Two
+  documented deviations inside the annex's no-bit-exactness envelope
+  (§I.5.9): the concealed-cycle `ATMP(1..11)` refresh feeds only the
+  post-filter by-product (the printed in-place overwrite would splice
+  mantissas of different `NLSATMP` Q formats), and the softened `A`
+  stays live until the first good cycle's own block 50/51 commit.
+  §I.5.9 note: the printed `LIN2DB` constant table lists
+  `GOFF = −16 384` while the code subtracts it (which would *add*
+  32 dB) — the subtract-32-dB intent, consistent with the float 97FE
+  and the 98AF clamp domain, is implemented and the discrepancy is
+  documented at the site.
+
 - **Annex I §I.5.1 `VEC_LOOP` frame-erasure driver (float decoder).**
   `Decoder::conceal_vector()` / `Decoder::conceal_vector_postfiltered()`
   conceal one lost vector each through the full Annex I loop: block

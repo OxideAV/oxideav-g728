@@ -72,7 +72,9 @@ Implemented end-to-end:
   the pre-erasure `AVMAG`, attenuated over 60 ms). The "random"
   slide-back is a pluggable `SlideSource` (default dependency-free LCG)
   since the spec licenses any aperiodic `5..=140` sequence during
-  erasures. Floating-point only.
+  erasures. The fixed-point twin (`annex_i_fixed::EtPastFixed`) runs
+  the §I.5.2 – §I.5.4 fixed-`Q2` pseudo-code (scalar-floating
+  `AVMAG`/`FESCALE`, `DIVIDE` magnitude match, BFL `ET` conversion).
 - **Annex I §I.4.2 frame-erasure LPC softening** — `soften_predictor`
   + `FrameErasureLpc` step bookkeeping (progressive `(0.97)^{k·i}`
   bandwidth expansion of the last good predictor during erased frames).
@@ -81,7 +83,24 @@ Implemented end-to-end:
   +2 dB`/vector above the last log-gain for the first few good frames
   after an erasure, plus `GainGrowthLimiter` driving the §I.5.1
   `AFTERFE` / `FECOUNT` / `OGAINDB` bookkeeping (clamp lasts the erasure
-  length, saturated at `AFTERFEMAX = 16` cycles = 40 ms).
+  length, saturated at `AFTERFEMAX = 16` cycles = 40 ms). Fixed-point
+  twin: block 98AF (`limit_log_gain_after_fe_q9`, Q9 domain).
+- **Annex I §I.5.1 `VEC_LOOP` concealment drivers — BOTH decoders** —
+  `Decoder::conceal_vector[_postfiltered]()` and
+  `DecoderFixed::conceal_vector()` conceal one lost vector each through
+  the full Annex I loop (one lost 2.5 ms adaptation cycle = four calls;
+  `FESIZE = 1` semantics): blocks 31SF/31FE/31E excitation
+  extrapolation, block 51FE LPC softening (float `0.97^i` /
+  fixed `FACVFE` Q14 over the last good raw `ATMP`, compounding
+  thereafter), blocks 97FE + 43FE + 49FE backward-adapter "vital
+  operations" (§I.4.3; `HWMCOREFE` truncates the non-recursive output
+  to `R(1..11)` while `REXP` updates in full), the order-10-only block
+  50 keeping the post-filter coefficients "floating" (§I.4.4), the
+  first-good-`ICOUNT = 3` block-51 resync, and the 47AF/98AF gain
+  clamp on recovery. The never-erased path is bit-identical (all
+  conformance gates unchanged); `tests/annex_i.rs` pins the structural
+  properties, including `mask1`-masked decodes of the official `cw4`
+  bitstream that stay bit-exact up to the first erasure.
 - **Annex G §G.3 fixed-point coder** (`annex_g_codebook`) — the
   bit-exact fixed-point analysis-by-synthesis codebook search of
   blocks 11 – 21, transcribed from the §G.3.4 – §G.3.10 pseudo-code one
@@ -231,28 +250,29 @@ source line in `src/` with an `E1…E6` / `N1` / `N2` reference:
 | E1 | G.3.18 `HWMCORE` case 1 | `RREC` recursion is a `−(RREC<<NLSATT)+(RREC<<16)` decay, not the printed `+` growth |
 | E2 | G.3.12 block 36 | hybrid-window decay is `1/2` (`NLSATTW=15`), not the sibling blocks' `3/4` |
 | E3 | G.3.24 block 81 | `IP` reset target is `NPWSZ − NFRSZ`, not `NFRSZ` |
+| E4 | G.3.25 block 82 | refined-search MAC is `D(K)·D(K−J)`; the printed second factor `DEC(K−J)` mis-names the decimated array (the paired float listing prints the corrected form) |
 | E5 | G.3.20 block 72 | short-term IIR store sources `AA1` (all-pole result), not `AA0` |
 | E6 | G.3.2 `Blockzir` block 9 | middle MAC loop accumulates (`AA0 = AA0 − …`), not resets (`AA0 = 0 − …`) |
 | N1 | G.3.5 block 12 | impulse response consumes `A(2..5)`, never `A(6)` |
 | N2 | G.3.28 block 85 | `TILTF = 4915` in Q15, not `2458` in Q14 |
 
-(E4 — the §G.3.25 refined-pitch first-correlation-factor ambiguity — is
-resolved here in the equivalent `D`-autocorrelation form `Σ D(K)·D(K−J)`,
-bit-exact against the vectors.)
+Each of E3–E6 is additionally pinned by a standalone anchored
+regression test that runs without the conformance corpus.
 
-### Not yet implemented
+### Annex I conformance caveat
 
-- The remaining Annex I concealment mechanisms (§I.4.3 continued
-  backward adaptation, §I.4.4 floating post-filter) and the §I.5.1
-  decoder erasure-flag drive path (`VEC_LOOP`) that wires the existing
-  §I.4.1 excitation extrapolation, §I.4.2 LPC softening and §I.4.5
-  gain-growth limiter modules together. **Docs gap:** the Annex I PLC
-  path cannot be conformance-adjudicated from the in-repo corpus — the
-  staged `conformance/mask1` supplies a packet-loss mask but no paired
-  concealed-PCM reference output, so a PLC drive path can only be
-  behaviourally validated, not proven bit-exact, until the ITU Annex I
-  concealed-PCM reference is staged (see the outstanding-gap note in
-  `docs/audio/g728/g728-errata.md`).
+The Annex I concealment output is **non-adjudicable in-repo**: the ITU
+corpus stages the packet-loss mask `conformance/mask1` but **no paired
+concealed-PCM reference output**, the upstream test package builds no
+Annex-I decoder variant, and the Annex I Recommendation PDF ships
+pseudo-code but no I/O vectors (see the outstanding-gap note in
+`docs/audio/g728/g728-errata.md`, issue #232). The drivers are
+therefore validated structurally (`tests/annex_i.rs`): prefix
+bit-exactness of masked decodes, the FESCALE silencing schedule, gain
+clamp arm/saturate/release, recovery, and hostile-mask robustness —
+plus unit-level cross-checks of every §I.5 block against the float
+pseudo-code. Bit-exact adjudication awaits an authoritative
+concealed-PCM reference for `mask1`.
 
 ## Usage
 
