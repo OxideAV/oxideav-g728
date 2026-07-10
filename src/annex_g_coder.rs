@@ -56,8 +56,10 @@ use crate::annex_g_postfilter::{
 };
 use crate::annex_g_synth_adapter::{bandwidth_expand_q14, StSegment, SynthAdapterFixed, N5};
 use crate::annex_g_weight_adapter::{WeightAdapterFixed, WeightCoeffFixed};
-use crate::consts::{IDIM, LPC, LPCW, NFRSZ, NG, NUPDATE};
-use crate::tables::FACV_Q14;
+use crate::annex_i_fixed::{gstate1_of_extrapolated_et_q9, EtPastFixed};
+use crate::consts::{AFTERFEMAX, IDIM, LPC, LPCW, NFRSZ, NG, NUPDATE};
+use crate::excitation_extrapolation::LcgSlideSource;
+use crate::tables::{FACVFE_Q14, FACV_Q14};
 
 /// The full §G.7 fixed-point encoder: input `Q2` speech vectors, output
 /// 10-bit channel indices.
@@ -323,6 +325,67 @@ pub struct DecoderFixed {
     ltc: LongTermCoeff,
     /// Live short-term postfilter coefficients (block 85 output).
     stc: ShortTermCoeff,
+    /// The raw (bandwidth-unexpanded) block-50 order-50 `ATMP` + its
+    /// `NLSATMP` from the most recent successful full adaptation —
+    /// the §I.5.8 block-51FE `FECOUNT = 1` input ("soften the last good
+    /// 50th-order analysis"). `None` until the first good full cycle or
+    /// after an ill-conditioned one (the `ILLCOND = .FALSE.` gate).
+    atmp_raw: Option<([i16; LPC + 1], i32)>,
+    /// Annex I §I.5.1 frame-erasure counters + fixed-`Q2` `ETPAST`.
+    fe: FeStateFixed,
+}
+
+/// Annex I §I.5.1 decoder-side frame-erasure state, fixed-point flavour
+/// (per-adaptation-cycle granularity — `FESIZE = 1` semantics, as in the
+/// float [`crate::Decoder`]).
+#[derive(Debug, Clone)]
+struct FeStateFixed {
+    /// Blocks 31SF / 31FE / 31E over the fixed-`Q2` `ETPAST()`.
+    etp: EtPastFixed,
+    /// Unvoiced random slide-back source (§I.5.3).
+    slide: LcgSlideSource,
+    /// `FECOUNT` — consecutively erased adaptation cycles.
+    fecount: usize,
+    /// `AFTERFE` — remaining block-98AF gain-clamp cycles.
+    afterfe: usize,
+    /// `OGAINDB` (Q9, offset-removed): block 98AF's output on good
+    /// vectors, block 97FE's while concealing.
+    ogaindb_q9: i32,
+    /// `FERROR` of the current cycle (the §I.5.1 `AFTERFE` decrement
+    /// tests this field *before* the latch — the previous cycle's value).
+    cycle_erased: bool,
+}
+
+impl FeStateFixed {
+    fn new() -> Self {
+        Self {
+            etp: EtPastFixed::new(),
+            slide: LcgSlideSource::default(),
+            fecount: 0,
+            afterfe: 0,
+            // §I.5.1: OGAINDB = −32 dB (Q9 −16384) at reset.
+            ogaindb_q9: -16_384,
+            cycle_erased: false,
+        }
+    }
+
+    /// §I.5.1 top-of-cycle bookkeeping (see the float
+    /// [`crate::Decoder`] twin for the line-by-line mapping).
+    fn cycle_top(&mut self, erased: bool) {
+        if !self.cycle_erased && self.afterfe > 0 {
+            self.afterfe -= 1;
+        }
+        if erased {
+            self.fecount += 1;
+            if (self.fecount & 3) == 1 {
+                self.etp.on_erased_cycle(self.fecount >> 2);
+            }
+        } else if self.fecount > 0 {
+            self.afterfe = (self.afterfe + self.fecount).min(AFTERFEMAX);
+            self.fecount = 0;
+        }
+        self.cycle_erased = erased;
+    }
 }
 
 impl Default for DecoderFixed {
@@ -380,6 +443,8 @@ impl DecoderFixed {
                 ap_q14: az_q14,
                 tiltz_q14: 0,
             },
+            atmp_raw: None,
+            fe: FeStateFixed::new(),
         }
     }
 
@@ -389,6 +454,12 @@ impl DecoderFixed {
         // | If ICOUNT = 4, set ICOUNT = 0; ICOUNT = ICOUNT + 1
         self.icount = self.icount % NUPDATE + 1;
         let icount = self.icount;
+
+        // §I.5.1 top-of-cycle bookkeeping (inert while nothing was ever
+        // concealed: all counters stay 0).
+        if icount == 1 {
+            self.fe.cycle_top(false);
+        }
 
         // | Obtain IS and IG from ICHAN (1-based).
         let is = (ichan as usize) / NG + 1;
@@ -402,12 +473,21 @@ impl DecoderFixed {
             }
         }
 
-        // | do blocks 46, 98, 99, and 48 (45 at ICOUNT = 2 inside).
-        let (gain, nlsgain) = self.gain.predict(icount);
+        // | do blocks 46, 98AF, 99, and 48 (45 at ICOUNT = 2 inside).
+        // Block 98 is realised as the Annex I block 98AF, identical
+        // while AFTERFE = 0; OGAINDB tracks the limited Q9 log-gain.
+        let (gain, nlsgain) =
+            self.gain
+                .predict_limited(icount, self.fe.ogaindb_q9, self.fe.afterfe);
+        self.fe.ogaindb_q9 = i32::from(self.gain.loggain());
 
         // | do blocks 19 and 21 → ET.
         let result = SearchResult { is, ig, ichan };
         let (et, nlset) = annex_g_codebook::excitation(&result, gain, nlsgain);
+
+        // | do block 31E — update ETPAST() ("regardless of whether there
+        // | is a frame erasure currently being concealed", §I.5.4).
+        self.fe.etp.push_et(&et, nlset);
 
         // | do block 32 → ST (BFL, NLSST).
         let et_i32: [i32; IDIM] = std::array::from_fn(|k| i32::from(et[k]));
@@ -431,6 +511,9 @@ impl DecoderFixed {
             self.pitch.pitch_extract();
             let ptap = self.pitch.pitch_tap(self.postfilter.sst(), SST_PAST - 1);
             self.ltc = self.pitch.long_term_coeff(ptap);
+            // §I.4.1: record the last-good (PTAP, KP) for the erasure
+            // extrapolator's onset decision (frozen during erasures).
+            self.fe.etp.observe_good_cycle(ptap, self.pitch.kp());
         }
 
         // | blocks 71 – 77 → SPF.
@@ -453,6 +536,122 @@ impl DecoderFixed {
         }
 
         spf
+    }
+
+    /// Annex I §I.5.1 — conceal one erased vector (fixed-point path)
+    /// and return the postfiltered `Q2` output, as
+    /// [`Self::decode_vector`] would for a received index.
+    ///
+    /// One lost 10-bit index = one call; erasures are per adaptation
+    /// cycle (`FESIZE = 1` semantics — four calls per lost 2.5 ms
+    /// cycle) and should start at a cycle boundary.
+    ///
+    /// Follows the fixed-point (`#ifdef FIXPT`) legs of the §I.5.1
+    /// pseudo-code: block 31SF at onset + every 10 ms, block 51FE LPC
+    /// softening on the same cadence (`FACVFE` over the last good raw
+    /// `ATMP` first, compounding on the live `A` after), block 31FE
+    /// extrapolation over the fixed-`Q2` `ETPAST`, block 31E, block 32
+    /// through the softened predictor, the unchanged postfilter chain
+    /// (§I.4.4), block 97FE → `GSTATE(1)`/`OGAINDB` via the example
+    /// `LIN2DB`, block 43FE at `ICOUNT = 1`, and block 49FE + the
+    /// order-10-only block 50 at cycle end.
+    ///
+    /// Two deliberate deviations inside the annex's own
+    /// no-bit-exactness-required envelope (§I.5.9): the concealed-path
+    /// `ATMP(1..11)` refresh feeds only the post-filter by-product (the
+    /// spec's in-place `ATMP` overwrite would splice mantissas of
+    /// different `NLSATMP` Q formats, which the printed code leaves
+    /// undefined), and after an erasure the softened `A` stays in use
+    /// until the first good cycle's own block 50/51 pipeline commits at
+    /// the following `ICOUNT = 3`.
+    pub fn conceal_vector(&mut self) -> [i32; IDIM] {
+        self.icount = self.icount % NUPDATE + 1;
+        let icount = self.icount;
+
+        if icount == 1 {
+            self.fe.cycle_top(true);
+            // A pre-erasure pending block-51 predictor is stale.
+            self.pending_a = None;
+        }
+
+        // | If ICOUNT = 3 and (FECOUNT & 3) = 1, do block 51FE (§I.5.8):
+        // | If FECOUNT = 1 and ILLCOND = .FALSE.:
+        // |     A(I) = FACVFE(I) * ATMP(I)      | soften the last good
+        // | Otherwise: A(I) = FACVFE(I) * A(I)  | compound on the live A
+        if icount == 3 && (self.fe.fecount & 3) == 1 {
+            let softened = if self.fe.fecount == 1 {
+                self.atmp_raw
+                    .as_ref()
+                    .and_then(|(raw, nls)| bandwidth_expand_q14(&raw[..], &FACVFE_Q14, *nls))
+            } else {
+                bandwidth_expand_q14(&self.a[..], &FACVFE_Q14, 14)
+            };
+            if let Some(v) = softened {
+                self.a.copy_from_slice(&v);
+            }
+        }
+
+        // | If FERROR = .TRUE., do block 31FE → extrapolated ET.
+        let (et, nlset, et_q2) = self.fe.etp.extrapolate(&mut self.fe.slide);
+
+        // | do block 31E — update ETPAST().
+        self.fe.etp.push_et(&et, nlset);
+
+        // | do block 32 → ST through the softened predictor.
+        let et_i32: [i32; IDIM] = std::array::from_fn(|k| i32::from(et[k]));
+        let a_i32: [i32; LPC + 1] = std::array::from_fn(|i| i32::from(self.a[i]));
+        let st = self.synth_filter.synthesize(&et_i32, nlset, &a_i32);
+        let nlsst = self.synth_filter.nlsst();
+
+        // Post-filter chain — identical in good and erased frames
+        // (§I.4.4; the coefficients intentionally "float").
+        if icount == 1 {
+            if let Some(sc) = short_term_coeff_fixed(&self.apf_atil, self.rc1, self.nlsapf) {
+                self.stc = sc;
+            }
+        }
+        let sst = self.pitch.inverse_filter(&st, nlsst, &self.apf_q13);
+        if icount == 3 {
+            self.pitch.pitch_extract();
+            let ptap = self.pitch.pitch_tap(self.postfilter.sst(), SST_PAST - 1);
+            self.ltc = self.pitch.long_term_coeff(ptap);
+            // VOICED / FEDELAY stay frozen: no observe_good_cycle here.
+        }
+        let spf = self.postfilter.filter_vector(&sst, &self.ltc, &self.stc);
+
+        // | If FERROR = .TRUE.: do block 97FE; OGAINDB = output of 97FE;
+        // | GSTATE(1) = output of 97FE (+ block 43FE at ICOUNT = 1).
+        let g1 = gstate1_of_extrapolated_et_q9(&et_q2);
+        self.gain.update_erased(icount, g1);
+        self.fe.ogaindb_q9 = i32::from(g1);
+
+        // | STTMP + NLSSTTMP as usual.
+        let st_i16: [i16; IDIM] = std::array::from_fn(|k| st[k] as i16);
+        self.sttmp[icount - 1] = StSegment {
+            st: st_i16,
+            nls: nlsst,
+        };
+
+        // | If ICOUNT = 4: block 49FE + block 50 order 1–10 only.
+        if icount == 4 {
+            self.adapt_synthesis_erased();
+        }
+
+        spf
+    }
+
+    /// Annex I frame-erasure counters (for tests/audit):
+    /// `(FECOUNT, AFTERFE, OGAINDB in Q9)`.
+    #[must_use]
+    pub fn fe_counters(&self) -> (usize, usize, i32) {
+        (self.fe.fecount, self.fe.afterfe, self.fe.ogaindb_q9)
+    }
+
+    /// Borrow the fixed-point Annex I excitation extrapolator (blocks
+    /// 31SF / 31FE / 31E) — for tests/audit.
+    #[must_use]
+    pub fn frame_erasure_excitation(&self) -> &EtPastFixed {
+        &self.fe.etp
     }
 
     /// The decoder's `ICOUNT = 4` once-per-frame adaptation: block 49 →
@@ -511,14 +710,52 @@ impl DecoderFixed {
 
         // Block 51 (compute now; visible at the next ICOUNT = 3).
         self.pending_a = if st50.illcond {
+            self.atmp_raw = None;
             None
         } else {
+            // Cache the raw (unexpanded) ATMP + NLSATMP for the Annex I
+            // block 51FE (`A = FACVFE·ATMP` at the first erased cycle).
+            self.atmp_raw = Some((atmp, st50.nlsatmp));
             bandwidth_expand_q14(&atmp[..=LPC], &FACV_Q14, st50.nlsatmp).map(|v| {
                 let mut a = [0i16; LPC + 1];
                 a.copy_from_slice(&v);
                 a
             })
         };
+    }
+
+    /// Annex I `ICOUNT = 4` adaptation during a concealed cycle: block
+    /// **49FE** (`HWMCOREFE` with `LPFE = 10` — full recursive `REXP`
+    /// update, `RTMP(1..11)` only) + block 50 **order 1–10 only**, whose
+    /// output refreshes the post-filter by-product (`APF` / `RC1`, which
+    /// keeps "floating" per §I.4.4). The order-50 continuation and
+    /// block 51 are skipped — the live `A` is managed by block 51FE.
+    fn adapt_synthesis_erased(&mut self) {
+        let segs: [BflSegment; N5] = std::array::from_fn(|j| BflSegment {
+            samples: self.sttmp[j].st,
+            nls: self.sttmp[j].nls,
+        });
+        let core = self.hw49.run_erased(&synth_window(), &segs, PF_ORDER);
+
+        // Block 50, order 1 – 10 (§I.5.1 "do block 50, order 1 to 10").
+        let mut atmp10 = [0i16; PF_ORDER + 1];
+        let st10 = levinson_durbin_fixed(
+            &LevinsonInput {
+                rtmp: &core.rtmp,
+                illcond: core.illcond,
+                lpc: LPCW,
+            },
+            &mut atmp10,
+        );
+        if !st10.illcondp {
+            self.apf_atil = atmp10;
+            self.nlsapf = st10.nlsatmp;
+            self.rc1 = st10.rc1;
+            self.apf_q13 = apf_to_q13(&atmp10, st10.nlsatmp);
+        }
+        // No order-50 continuation, no block 51: any pre-erasure pending
+        // predictor is already invalidated at the cycle top.
+        self.pending_a = None;
     }
 
     /// The most recent decoded (pre-postfilter) quantized-speech vector

@@ -22,7 +22,7 @@
 //!   backward adapters keep tracking).
 
 use oxideav_g728::consts::{AFTERFEMAX, IDIM, NUPDATE};
-use oxideav_g728::{Decoder, FRAME_LEN};
+use oxideav_g728::{Decoder, DecoderFixed, FRAME_LEN};
 
 /// Deterministic 10-bit channel-index stream (arbitrary but fixed).
 fn index_stream(n: usize, seed: u64) -> Vec<u16> {
@@ -316,6 +316,158 @@ fn mask1_masked_decode_of_official_bitstream() {
     // the erasure), but the masked decode must remain bounded speech.
     let (fecount, _, _) = masked.fe_counters();
     assert_eq!(fecount, 0, "erasure closed by the following good frames");
+}
+
+// ---------------------------------------------------------------------
+// Fixed-point (Annex G) Annex I path.
+// ---------------------------------------------------------------------
+
+fn assert_sane_q2(v: &[i32; IDIM], what: &str) {
+    for (k, &x) in v.iter().enumerate() {
+        assert!(
+            x.abs() <= 1 << 20,
+            "{what}: Q2 sample {k} escaped any plausible range ({x})"
+        );
+    }
+}
+
+#[test]
+fn fixed_annex_i_state_never_perturbs_a_good_stream() {
+    let idx = index_stream(64 * NUPDATE, 0x0F1E_5EED);
+    let mut a = DecoderFixed::new();
+    let mut b = DecoderFixed::new();
+    for &i in &idx {
+        let va = a.decode_vector(i);
+        let vb = b.decode_vector(i);
+        let _ = b.fe_counters();
+        let _ = b.frame_erasure_excitation().in_erasure();
+        assert_eq!(va, vb);
+    }
+    let (fecount, afterfe, _) = a.fe_counters();
+    assert_eq!((fecount, afterfe), (0, 0));
+}
+
+#[test]
+fn fixed_concealment_is_finite_and_decoder_resumes() {
+    let mut dec = DecoderFixed::new();
+    for &i in &index_stream(32 * NUPDATE, 51) {
+        let v = dec.decode_vector(i);
+        assert_sane_q2(&v, "fixed pre-erasure");
+    }
+    for _ in 0..(8 * NUPDATE) {
+        let v = dec.conceal_vector();
+        assert_sane_q2(&v, "fixed concealed");
+        assert!(dec.frame_erasure_excitation().in_erasure());
+    }
+    let (fecount, _, _) = dec.fe_counters();
+    assert_eq!(fecount, 8);
+    for &i in &index_stream(32 * NUPDATE, 52) {
+        let v = dec.decode_vector(i);
+        assert_sane_q2(&v, "fixed post-erasure");
+    }
+    let (fecount, afterfe, ogaindb) = dec.fe_counters();
+    assert_eq!(fecount, 0);
+    assert!(afterfe <= AFTERFEMAX);
+    assert!((-16_384..=14_336).contains(&ogaindb), "OGAINDB Q9 domain");
+}
+
+#[test]
+fn fixed_long_erasure_scales_to_silence() {
+    let mut dec = DecoderFixed::new();
+    for &i in &index_stream(64 * NUPDATE, 53) {
+        dec.decode_vector(i);
+    }
+    for _ in 0..(40 * NUPDATE) {
+        let v = dec.conceal_vector();
+        assert_sane_q2(&v, "fixed long conceal");
+    }
+    assert_eq!(
+        dec.frame_erasure_excitation().fescale(),
+        0,
+        "fixed FESCALE schedule must bottom out past 70 ms"
+    );
+}
+
+#[test]
+fn fixed_gain_clamp_arms_and_saturates() {
+    let mut dec = DecoderFixed::new();
+    for &i in &index_stream(8 * NUPDATE, 54) {
+        dec.decode_vector(i);
+    }
+    for _ in 0..((AFTERFEMAX + 4) * NUPDATE) {
+        dec.conceal_vector();
+    }
+    for &i in &index_stream(NUPDATE, 55) {
+        dec.decode_vector(i);
+    }
+    let (_, afterfe, _) = dec.fe_counters();
+    assert_eq!(afterfe, AFTERFEMAX, "40 ms ceiling (§I.4.5)");
+    // Clamp releases after AFTERFEMAX further good cycles.
+    for &i in &index_stream(AFTERFEMAX * NUPDATE, 56) {
+        dec.decode_vector(i);
+    }
+    let (_, afterfe, _) = dec.fe_counters();
+    assert_eq!(afterfe, 0, "clamp released");
+}
+
+#[test]
+fn fixed_mask1_masked_decode_of_official_bitstream() {
+    let Some(dir) = conformance_dir() else {
+        eprintln!("G.728 conformance vectors not present — skipping");
+        return;
+    };
+    let cw = std::fs::read(dir.join("cw4.bin")).expect("cw4.bin");
+    let indices: Vec<u16> = cw
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]) & 0x3FF)
+        .collect();
+    let mask: Vec<bool> = std::fs::read_to_string(dir.join("mask1"))
+        .expect("mask1")
+        .trim()
+        .chars()
+        .map(|c| c == '1')
+        .collect();
+
+    const VEC_PER_FRAME: usize = 4 * NUPDATE;
+    let mut masked = DecoderFixed::new();
+    let mut reference = DecoderFixed::new();
+    let mut in_prefix = true;
+    for (n, &i) in indices.iter().enumerate() {
+        let frame = n / VEC_PER_FRAME;
+        let erased = *mask.get(frame).unwrap_or(&false);
+        let r = reference.decode_vector(i);
+        let m = if erased {
+            in_prefix = false;
+            masked.conceal_vector()
+        } else {
+            masked.decode_vector(i)
+        };
+        assert_sane_q2(&m, "fixed masked decode");
+        if in_prefix {
+            assert_eq!(m, r, "vector {n}: pre-erasure prefix must be bit-exact");
+        }
+    }
+    let (fecount, _, _) = masked.fe_counters();
+    assert_eq!(fecount, 0, "erasure closed by the following good frames");
+}
+
+#[test]
+fn fixed_hostile_random_masks_never_panic() {
+    let mut s = 0xFEED_FACE_u64;
+    let mut rnd = move || {
+        s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        s >> 33
+    };
+    let mut dec = DecoderFixed::new();
+    for _ in 0..4096 {
+        let r = rnd();
+        let v = if r & 7 == 0 {
+            dec.conceal_vector()
+        } else {
+            dec.decode_vector((r & 0x3FF) as u16)
+        };
+        assert_sane_q2(&v, "fixed hostile");
+    }
 }
 
 #[test]
