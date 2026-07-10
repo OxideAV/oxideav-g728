@@ -383,6 +383,23 @@ impl GainAdapterFixed {
     /// blocks 46 → 98 → 99 → 48. Returns `(GAIN, NLSGAIN)` — the Q14
     /// mantissa of `2^x` and its shift, i.e. `σ(n) = GAIN·2^(−NLSGAIN)`.
     pub fn predict(&mut self, icount: usize) -> (i16, i32) {
+        // OGAINDB/AFTERFE at their inert values make block 98AF the
+        // plain block 98, so the non-erasure path is unchanged.
+        self.predict_limited(icount, 0, 0)
+    }
+
+    /// [`Self::predict`] with the Annex I block **98AF** (§I.5.10)
+    /// post-erasure growth limiter in place of block 98: after the
+    /// `[−16384, 14336]` range clamp, while `afterfe > 0` the Q9
+    /// log-gain may exceed `ogaindb_q9` (the §I.5.1 `OGAINDB`) by at
+    /// most `FEGAINMAX = 1024` (+2 dB). Identical to [`Self::predict`]
+    /// when `afterfe == 0`.
+    pub fn predict_limited(
+        &mut self,
+        icount: usize,
+        ogaindb_q9: i32,
+        afterfe: usize,
+    ) -> (i16, i32) {
         debug_assert!((1..=NUPDATE).contains(&icount));
         // | If ICOUNT = 2 and ILLCONDG = .FALSE., then do block 45
         if icount == 2 {
@@ -394,9 +411,9 @@ impl GainAdapterFixed {
                 self.gp = gp;
             }
         }
-        // | do blocks 46, 98, 99, and 48
+        // | do blocks 46, 98AF, 99, and 48
         let lg = log_gain_predict(&self.gp, &mut self.gstate);
-        self.loggain = limit_log_gain_q9(lg);
+        self.loggain = crate::annex_i_fixed::limit_log_gain_after_fe_q9(lg, ogaindb_q9, afterfe);
         inverse_log_gain(self.loggain)
     }
 
@@ -404,6 +421,33 @@ impl GainAdapterFixed {
     /// the chosen 1-based gain / shape indices, then — at `ICOUNT = 1`
     /// — the per-cycle blocks 43 + 44 refresh `GPTMP` / `ILLCONDG`
     /// (block 45 commits it at the next `ICOUNT = 2` [`predict`]).
+    /// Annex I erased-vector update (§I.4.3 "vital operations"):
+    /// `GSTATE(1)` receives the block-97FE log-gain of the extrapolated
+    /// excitation instead of the blocks-93/94/96/97 index reconstruction,
+    /// and — at `ICOUNT = 1` — block **43FE** runs the hybrid window
+    /// (buffer + recursive-component update; the fixed-point 43FE
+    /// computes its full `R(1..11)` output anyway, which is simply
+    /// discarded) while block 44 is skipped ("If FERROR = .FALSE., do
+    /// block 44", §I.5.1). `ILLCONDG` is refreshed from 43FE's verdict
+    /// per the §I.5.1 `output ill-condition flag = ILLCONDG` line.
+    pub fn update_erased(&mut self, icount: usize, gstate1_97fe_q9: i16) {
+        debug_assert!((1..=NUPDATE).contains(&icount));
+        // | do block 97FE; GSTATE(1) = output of block 97FE
+        self.gstate[0] = gstate1_97fe_q9;
+
+        // | If ICOUNT = 1: GTMP in one shot; do block 43FE (no block 44).
+        if icount == 1 {
+            let gtmp = [
+                self.gstate[3],
+                self.gstate[2],
+                self.gstate[1],
+                self.gstate[0],
+            ];
+            let core = self.window.run(&gtmp);
+            self.illcondg = core.illcond;
+        }
+    }
+
     pub fn update(&mut self, icount: usize, ig: usize, is: usize) {
         debug_assert!((1..=NUPDATE).contains(&icount));
         // | do blocks 93, 94, 96, and 97; GSTATE(1) = output of block 97

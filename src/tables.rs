@@ -14,7 +14,9 @@
 //!   the same `value / 2^q` rule the prose specifies.
 //!
 //! These tables are derived solely from the published Recommendation
-//! PDF — no reference implementation source has been consulted. The
+//! PDF — no reference implementation source has been consulted.
+//! ([`FACVFE_Q14`] additionally transcribes the Q14 frame-erasure
+//! softening table of Annex I Appendix I.I, 1999-05.) The
 //! cross-check between the Annex A float column and the Annex A
 //! integer column (the prose lists both) provides an in-repo guard
 //! against typos: the [`tests`] module asserts every float-equivalent
@@ -450,6 +452,26 @@ pub const FACV_Q14: [i16; LPC + 1] = [
     11_104, 10_974, 10_845, 10_718, 10_593, 10_468, 10_346, 10_225, // 34..41
     10_105, 9_986, 9_869, 9_754, 9_639, 9_526, 9_415, 9_304, // 42..49
     9_195, 9_088, // 50..51
+];
+
+/// Annex I frame-erasure LPC-softening vector `FACVFE(1..=51)` in Q14
+/// (Appendix I.I/G.728, "Values used for bandwidth expansion of LPC
+/// predictor during frame erasures"): `FACVFE(I) = 0.97^(I−1)`,
+/// consumed by block 51FE (§I.5.8). Read left-to-right, top-to-bottom
+/// from the appendix table.
+pub const FACVFE_Q14: [i16; LPC + 1] = [
+    16_384, //  1
+    15_892, 15_416, 14_953, 14_505, //  2.. 5
+    14_069, 13_647, 13_238, 12_841, 12_456, //  6..10
+    12_082, 11_719, 11_368, 11_027, 10_696, // 11..15
+    10_375, 10_064, 9_762, 9_469, 9_185, // 16..20
+    8_910, 8_642, 8_383, 8_131, 7_888, // 21..25
+    7_651, 7_421, 7_199, 6_983, 6_773, // 26..30
+    6_570, 6_373, 6_182, 5_996, 5_816, // 31..35
+    5_642, 5_473, 5_309, 5_149, 4_995, // 36..40
+    4_845, 4_700, 4_559, 4_422, 4_289, // 41..45
+    4_161, 4_036, 3_915, 3_797, 3_683, // 46..50
+    3_573, // 51
 ];
 
 /// Log-gain BW broadening vector `facgpv[i]` (1 ≤ i ≤ LPCLG+1 = 11). Q14.
@@ -894,5 +916,21 @@ mod tests {
         for j in 0..NCWD {
             assert_eq!(view[j], Y_ENERGY[j]);
         }
+    }
+
+    #[test]
+    fn facvfe_q14_encodes_097_powers() {
+        // Appendix I.I/G.728: FACVFE(I) = 0.97^(I−1) in Q14. Guard every
+        // printed integer against the closed form within one quantum
+        // (the appendix's own "divide by 16384" rule).
+        for (i, &q) in FACVFE_Q14.iter().enumerate() {
+            let want = 0.97f64.powi(i as i32) * 16_384.0;
+            assert!(
+                (f64::from(q) - want).abs() <= 1.0,
+                "FACVFE[{i}] = {q} vs 0.97^{i}·2¹⁴ = {want}"
+            );
+        }
+        assert_eq!(FACVFE_Q14[0], 16_384, "unity head");
+        assert_eq!(FACVFE_Q14[LPC], 3_573, "printed tail value");
     }
 }

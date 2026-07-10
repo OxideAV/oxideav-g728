@@ -220,6 +220,7 @@ pub mod annex_g_pitch;
 pub mod annex_g_postfilter;
 pub mod annex_g_synth_adapter;
 pub mod annex_g_weight_adapter;
+pub mod annex_i_fixed;
 pub mod bitstream;
 pub mod codebook_search;
 pub mod consts;
@@ -272,6 +273,10 @@ pub use annex_g_synth_adapter::{
     bandwidth_expand_q14, log_gain_bandwidth_expand, StSegment, SynthAdapterFixed, NLSSB_INIT,
 };
 pub use annex_g_weight_adapter::{WeightAdapterFixed, WeightCoeffFixed, N1W, N2W, N3W};
+pub use annex_i_fixed::{
+    gstate1_of_extrapolated_et_q9, limit_log_gain_after_fe_q9, lin2db_gstate_q9, EtPastFixed,
+    FEGAINMAX_Q9, VTH_Q14,
+};
 pub use bitstream::{pack_indices, unpack_indices};
 pub use codebook_search::{CodebookSearch, SearchResult};
 pub use decoder::{

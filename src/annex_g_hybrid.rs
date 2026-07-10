@@ -275,6 +275,25 @@ impl HybridWindowFixedState {
             .run(win.order, win.n1(), win.n3(), win.nlsatt, &ws, nlstmp)
     }
 
+    /// Annex I block **49FE** (§I.5.7): the same window step, but the
+    /// core runs as `HWMCOREFE` with the non-recursive output truncated
+    /// to `R(1..=lpfe+1)` (`lpfe = 10` during a frame erasure — enough
+    /// for the post-filter's order-10 by-product). The signal buffer
+    /// and the recursive `REXP` update are identical to [`Self::run`],
+    /// so the adaptation chain resynchronises seamlessly at the next
+    /// good frame.
+    pub fn run_erased(
+        &mut self,
+        win: &HybridWindowFixed<'_>,
+        new_segs: &[BflSegment],
+        lpfe: usize,
+    ) -> HwmcoreOut {
+        debug_assert_eq!(new_segs.len(), win.n5(), "new-segment count must be N5");
+        let (ws, nlstmp) = self.window_step(win, new_segs);
+        self.core
+            .run_fe(win.order, win.n1(), win.n3(), win.nlsatt, &ws, nlstmp, lpfe)
+    }
+
     /// §G.3.17 windowing step (block 49 / block 36): shift the SBFL `SB`
     /// buffer, align every segment to the common minimum shift `NLSTMP`,
     /// multiply by the Q15 window, and return the BFL windowed signal `WS`
@@ -357,7 +376,31 @@ impl HwmcoreState {
         ws: &[i16],
         nlstmp: i32,
     ) -> HwmcoreOut {
+        self.run_fe(order, n1, n3, nlsatt, ws, nlstmp, order)
+    }
+
+    /// Annex I `HWMCOREFE` (§I.5.7) — identical to [`Self::run`] except
+    /// that the **non-recursive** output is truncated to `R(1..lpfe+1)`
+    /// ("in the event of a frame erasure, only the values of RTMP(1),
+    /// …, RTMP(11) are calculated, although REXP(1), …, REXP(51) are
+    /// updated"): the recursive `REXP` update always spans the full
+    /// `order + 1` lags, while the returned `rtmp` has `lpfe + 1`
+    /// entries and the `ILLCOND` verdict tests the 32-bit `R(lpfe+1)`
+    /// accumulator (`LPFE = LPO` on good frames, `LPFE = 10` during an
+    /// erasure — the §I.5.7 `If FERROR = .TRUE., set LPFE = 10` line).
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_fe(
+        &mut self,
+        order: usize,
+        n1: usize,
+        n3: usize,
+        nlsatt: i32,
+        ws: &[i16],
+        nlstmp: i32,
+        lpfe: usize,
+    ) -> HwmcoreOut {
         let lpo = order;
+        debug_assert!(lpfe <= lpo);
         debug_assert_eq!(self.rexp.len(), lpo + 1);
         debug_assert!(ws.len() >= n3);
 
@@ -458,7 +501,9 @@ impl HwmcoreState {
             acc
         };
 
-        let mut rtmp = vec![0i16; lpo + 1];
+        // §I.5.7 HWMCOREFE: `LPFE = LPO` normally, 10 during a frame
+        // erasure — only R(1..LPFE+1) are produced below.
+        let mut rtmp = vec![0i16; lpfe + 1];
         let mut illcond = false;
         let nlsrr: i32;
 
@@ -473,14 +518,14 @@ impl HwmcoreState {
             aa1 += wn;
             nlsrr = findnls(&[clamp_i32(aa1)], 1, MLS_ACC);
             rtmp[0] = rnd(clamp_i32(shl_acc(aa1, nlsrr)));
-            for i in 1..=lpo {
+            for i in 1..=lpfe {
                 let aa0 = nonrec(i) >> 1;
                 let ri = self.rexp[i] as i64;
                 let aa1 = (ri << 16) >> ir;
                 let aa1 = aa0 + aa1;
                 let aa1 = shl_acc(aa1, nlsrr);
                 rtmp[i] = rnd(clamp_i32(aa1));
-                if i == lpo && aa1 == 0 {
+                if i == lpfe && aa1 == 0 {
                     illcond = true;
                 }
             }
@@ -494,14 +539,14 @@ impl HwmcoreState {
             aa1 += wn;
             nlsrr = findnls(&[clamp_i32(aa1)], 1, MLS_ACC);
             rtmp[0] = rnd(clamp_i32(shl_acc(aa1, nlsrr)));
-            for i in 1..=lpo {
+            for i in 1..=lpfe {
                 let aa0 = nonrec(i) >> 1;
                 let ri = self.rexp[i] as i64;
                 let aa1 = ri << 15;
                 let aa1 = aa0 + aa1;
                 let aa1 = shl_acc(aa1, nlsrr);
                 rtmp[i] = rnd(clamp_i32(aa1));
-                if i == lpo && aa1 == 0 {
+                if i == lpfe && aa1 == 0 {
                     illcond = true;
                 }
             }
@@ -516,14 +561,14 @@ impl HwmcoreState {
             aa1 += wn;
             nlsrr = findnls(&[clamp_i32(aa1)], 1, MLS_ACC);
             rtmp[0] = rnd(clamp_i32(shl_acc(aa1, nlsrr)));
-            for i in 1..=lpo {
+            for i in 1..=lpfe {
                 let aa0 = nonrec(i) >> ir;
                 let ri = self.rexp[i] as i64;
                 let aa1 = ri << 15;
                 let aa1 = aa0 + aa1;
                 let aa1 = shl_acc(aa1, nlsrr);
                 rtmp[i] = rnd(clamp_i32(aa1));
-                if i == lpo && aa1 == 0 {
+                if i == lpfe && aa1 == 0 {
                     illcond = true;
                 }
             }
