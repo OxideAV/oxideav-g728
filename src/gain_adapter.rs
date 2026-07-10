@@ -152,7 +152,16 @@ impl GainAdapter {
     ///
     /// Advances `ICOUNT` modulo NUPDATE after each call.
     pub fn predict_next(&mut self, et_prev: &[f64; IDIM]) -> f64 {
-        // ----- Blocks 67 + 39 + 40: RMS + log dB ---------------------
+        // With OGAINDB/AFTERFE at their inert values the Annex I block
+        // 47AF reduces exactly to the base block-47 limiter, so the
+        // non-erasure path is unchanged.
+        self.predict_next_limited(et_prev, 0.0, 0, false).0
+    }
+
+    /// Blocks 67 + 39 + 40 (§5.7) — energy of the previous excitation
+    /// vector in dB (`ETRMS`, the value block 42 offsets into
+    /// `GSTATE(1)` and Annex I's block 97FE assigns to `OGAINDB`).
+    fn etrms_db(et_prev: &[f64; IDIM]) -> f64 {
         // | ETRMS = ET(1) * ET(1)
         // | For K = 2,3,...,IDIM: ETRMS = ETRMS + ET(K) * ET(K)
         // | ETRMS = ETRMS * DIMINV                  | divide by IDIM
@@ -166,8 +175,12 @@ impl GainAdapter {
         if etrms < 1.0 {
             etrms = 1.0;
         }
-        etrms = 10.0 * etrms.log10();
+        10.0 * etrms.log10()
+    }
 
+    /// Block 42 + the GTMP FIFO push — insert the previous vector's
+    /// offset-removed log-gain at the head of the predictor memory.
+    fn push_log_gain(&mut self, etrms: f64) {
         // ----- Block 42: log-gain offset subtractor ------------------
         // | GSTATE(1) = ETRMS - GOFF
         //
@@ -188,6 +201,68 @@ impl GainAdapter {
             self.gtmp[i] = self.gtmp[i + 1];
         }
         self.gtmp[NUPDATE - 1] = new_gstate1;
+    }
+
+    /// Annex I erased-vector advance (§I.4.3 "vital operations"): run
+    /// blocks 67/39/40/42 on the previous (extrapolated) excitation —
+    /// this **is** the float block 97FE, which the annex describes as
+    /// "the same code as Blocks 67, 39, 40 and 42" — and, at
+    /// `ICOUNT = 2`, run block **43FE** (update the `SBLG` buffer and
+    /// the recursive component `REXPLG`, skip the autocorrelation
+    /// output and blocks 44/45 whose results would be discarded).
+    ///
+    /// No predicted gain is produced (block 31FE supplies the erased
+    /// vector's excitation directly). Returns the previous vector's
+    /// `ETRMS` in dB — the §I.5.1 `OGAINDB = output of block 97FE`
+    /// value the caller must latch while the erasure lasts.
+    ///
+    /// Advances `ICOUNT` modulo NUPDATE, exactly like
+    /// [`Self::predict_next`], so good/erased vectors interleave.
+    pub fn advance_erased(&mut self, et_prev: &[f64; IDIM]) -> f64 {
+        let etrms = Self::etrms_db(et_prev);
+        self.push_log_gain(etrms);
+
+        // Block 43FE at ICOUNT = 2: buffer + recursive-component update
+        // only ("If FERROR = .TRUE., skip all the lines below").
+        if self.icount == 2 {
+            let hw = HybridWindow {
+                m: LPCLG,
+                l: NUPDATE,
+                n: NONRLG,
+                window: &self.wnrg,
+                decay: 0.75,
+            };
+            let gtmp = self.gtmp;
+            self.hw_state.advance_erased(&hw, &gtmp);
+        }
+
+        self.icount = (self.icount % NUPDATE) + 1;
+        etrms
+    }
+
+    /// Run block-30 for the next decoded vector with the Annex I block
+    /// **47AF** post-erasure gain-growth limiter in place of the base
+    /// block 47 (§I.5.6).
+    ///
+    /// * `ogaindb` — the last predicted gain in dB (§I.5.1 `OGAINDB`);
+    /// * `afterfe` — the remaining gain-clamp cycles (0 ⇒ clamp off,
+    ///   making this identical to [`Self::predict_next`]);
+    /// * `prev_erased` — whether the previous vector was concealed; if
+    ///   so, `et_prev` is the extrapolated excitation and its `ETRMS`
+    ///   (the block-97FE output) supersedes `ogaindb` per §I.5.1.
+    ///
+    /// Returns `(σ(n), limited log-gain in dB)`; the caller stores the
+    /// latter as the next `OGAINDB`.
+    pub fn predict_next_limited(
+        &mut self,
+        et_prev: &[f64; IDIM],
+        ogaindb: f64,
+        afterfe: usize,
+        prev_erased: bool,
+    ) -> (f64, f64) {
+        let etrms = Self::etrms_db(et_prev);
+        let ogaindb = if prev_erased { etrms } else { ogaindb };
+        self.push_log_gain(etrms);
 
         // ----- ICOUNT = 2: re-derive log-gain predictor --------------
         // | This block is executed only when ICOUNT = 2, after
@@ -219,15 +294,16 @@ impl GainAdapter {
         // | GAIN = GAIN + GOFF
         gain += GOFF;
 
-        // ----- Block 47: log-gain limiter ----------------------------
-        // | If GAIN < 0, set GAIN = 0          | linear gain 1
-        // | If GAIN > 60, set GAIN = 60        | linear gain 1000
+        // ----- Block 47AF: log-gain limiter (§I.5.6) -----------------
+        // | If GAIN < 0., set GAIN = 0.    | linear gain 1
+        // | If GAIN > 60., set GAIN = 60. | linear gain 1000
+        // | TMP = GAIN - OGAINDB
+        // | If AFTERFE > 0 and TMP > FEGAINMAX, GAIN = OGAINDB + FEGAINMAX
         //
-        // Spec writes two independent `If` statements; an else-if is
-        // semantically equivalent because the first branch sets GAIN
-        // = 0 which can't then satisfy `> 60`. We use Rust's clamp()
-        // for clarity (clippy::manual_clamp flags the if/else form).
-        gain = gain.clamp(0.0, 60.0);
+        // With `afterfe == 0` this is exactly the base block 47 (§5.7):
+        // the [0, 60] range clamp and nothing else.
+        gain = crate::gain_growth_limiter::limit_log_gain(gain, ogaindb, afterfe);
+        let gain_db = gain;
 
         // ----- Block 48: inverse logarithm ---------------------------
         // | GAIN = 10^(GAIN/20)
@@ -236,7 +312,7 @@ impl GainAdapter {
         // Advance ICOUNT modulo NUPDATE.
         self.icount = (self.icount % NUPDATE) + 1;
 
-        gain
+        (gain, gain_db)
     }
 
     /// Inner helper: run blocks 43 (hybrid window), 44 (Levinson) and

@@ -151,10 +151,56 @@ impl HybridWindowState {
     /// windows — block 36, block 43 and block 49 all spell the line
     /// `R(1) = R(1) * WNCF`.
     pub fn run(&mut self, window: &HybridWindow<'_>, input: &[f64], rtmp_out: &mut [f64]) {
+        self.run_taps(window, input, rtmp_out, self.m + 1);
+    }
+
+    /// Annex I frame-erasure variant, block **43FE** shape (§I.5.5):
+    /// shift the signal buffer, shift in the new input and update the
+    /// recursive autocorrelation component `REXP*` — but skip the
+    /// non-recursive output accumulation entirely ("If FERROR = .TRUE.,
+    /// skip all the lines below", including the `WNCF` correction).
+    ///
+    /// The buffer and `REXP*` states after this call are identical to
+    /// what [`Self::run`] would have left, so the adaptation chain
+    /// resynchronises seamlessly at the next good frame (§I.4.3: the
+    /// "vital operations" of the backward adapters continue during
+    /// erased frames).
+    pub fn advance_erased(&mut self, window: &HybridWindow<'_>, input: &[f64]) {
+        self.run_taps(window, input, &mut [], 0);
+    }
+
+    /// Annex I frame-erasure variant, block **49FE** shape (§I.5.7):
+    /// full buffer shift and recursive `REXP` update, but only the first
+    /// `taps` non-recursive output coefficients are produced (the
+    /// synthesis-filter window computes `RTMP(1..11)` during an erasure
+    /// — enough for the post-filter's order-10 by-product — instead of
+    /// `RTMP(1..51)`). The `WNCF` white-noise correction still applies
+    /// to `R(1)` (the §I.5.7 float listing runs it unconditionally).
+    pub fn run_erased(
+        &mut self,
+        window: &HybridWindow<'_>,
+        input: &[f64],
+        rtmp_out: &mut [f64],
+        taps: usize,
+    ) {
+        assert!(taps >= 1 && taps <= self.m + 1, "taps out of range");
+        self.run_taps(window, input, rtmp_out, taps);
+    }
+
+    /// Shared core: shift + window + recursive update over all `m + 1`
+    /// lags, then produce the first `taps` output coefficients
+    /// (`taps == 0` ⇒ pure state advance, no output, no WNCF).
+    fn run_taps(
+        &mut self,
+        window: &HybridWindow<'_>,
+        input: &[f64],
+        rtmp_out: &mut [f64],
+        taps: usize,
+    ) {
         assert_eq!(input.len(), self.l, "hybrid-window input length mismatch");
         assert!(
-            rtmp_out.len() > self.m,
-            "rtmp_out buffer too short for hybrid window order"
+            taps == 0 || rtmp_out.len() >= taps,
+            "rtmp_out buffer too short for requested taps"
         );
         assert_eq!(window.window.len(), window.n3(), "window length mismatch");
         debug_assert_eq!(self.m, window.m);
@@ -211,7 +257,12 @@ impl HybridWindowState {
         // |     RTMP(I) = REXP(I)
         // |     For N = N1+1, ..., N3, do the next line
         // |         RTMP(I) = RTMP(I) + WS(N) * WS(N+1-I)
-        for i_out in 0..=m {
+        //
+        // Annex I: during an erased frame block 43FE skips this part
+        // entirely (`taps == 0`) and block 49FE truncates it to the
+        // first 11 lags (`taps == 11`); see `advance_erased` /
+        // `run_erased` above.
+        for i_out in 0..taps {
             rtmp_out[i_out] = self.rexp[i_out];
             for ni in n1..n3 {
                 rtmp_out[i_out] += ws[ni] * ws[ni - i_out];
@@ -219,7 +270,9 @@ impl HybridWindowState {
         }
 
         // | R(1) = R(1) * WNCF                           | White-noise correction
-        rtmp_out[0] *= WNCF;
+        if taps > 0 {
+            rtmp_out[0] *= WNCF;
+        }
     }
 }
 

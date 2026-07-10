@@ -83,6 +83,19 @@ pub struct SynthesisAdapter {
     /// at construction time so the adapter is safe to read from before
     /// any speech has been pushed.
     last_predictor: [f64; LPC + 1],
+    /// The spec's persistent `ATMP(1..LPC+1)` array — the **raw**
+    /// (bandwidth-unexpanded) block-50 Levinson output. Persisted
+    /// across cycles because the Annex I frame-erasure path both reads
+    /// it (block 51FE softens `FACVFE(I)·ATMP(I)` at the first erased
+    /// cycle, §I.5.8) and partially overwrites it (block 50 runs order
+    /// 1–10 only during erased cycles, refreshing `ATMP(1..11)` while
+    /// `ATMP(12..51)` keeps the last good-frame values — exactly the
+    /// §I.5.1 array semantics). Defaults to the all-pass predictor.
+    atmp: [f64; LPC + 1],
+    /// `ILLCOND` — whether the most recent block-50 recursion (order 50
+    /// on good cycles, order 10 on erased cycles) reported
+    /// ill-conditioning. Block 51 / 51FE skip the expansion when set.
+    illcond: bool,
     /// Most recently computed order-10 by-product predictor in our
     /// canonical Levinson `A` layout: `[1.0, a_1, …, a_{10}]`. The
     /// spec's `ã_i` (predictor convention `s(n) ≈ Σ ã_i s(n-i)`) maps
@@ -121,6 +134,8 @@ impl SynthesisAdapter {
             cfg,
             hw_state,
             last_predictor,
+            atmp: last_predictor,
+            illcond: true, // no valid ATMP until the first good cycle
             last_order10,
             last_k1: 0.0,
         }
@@ -169,6 +184,23 @@ impl SynthesisAdapter {
         self.last_k1
     }
 
+    /// The spec's persistent `ATMP(1..LPC+1)` array — the raw
+    /// (bandwidth-unexpanded) block-50 output, in our canonical Levinson
+    /// `A` layout (`atmp[0] = 1.0`). During an erasure only the first 11
+    /// entries are fresh (block 50 runs order 1–10); the tail keeps the
+    /// last good frame's values. Consumed by the Annex I block 51FE
+    /// (`A(I) = FACVFE(I)·ATMP(I)` at the first erased cycle, §I.5.8).
+    pub fn raw_atmp(&self) -> &[f64; LPC + 1] {
+        &self.atmp
+    }
+
+    /// `ILLCOND` — whether the most recent block-50 recursion reported
+    /// ill-conditioning (blocks 51 / 51FE skip their expansion when
+    /// set; §I.5.8 gates the `FECOUNT = 1` branch on it).
+    pub fn illcond(&self) -> bool {
+        self.illcond
+    }
+
     /// Process one adaptation cycle of quantised-speech samples
     /// (`NFRSZ = 20` samples) through blocks 49, 50 and 51, and update
     /// the cached predictor.
@@ -195,7 +227,14 @@ impl SynthesisAdapter {
         // cycle's predictor on failure, not adopt the all-pass reset.
         // So we run into a scratch buffer and only commit on Ok.
         let mut atmp = vec![0.0f64; LPC + 1];
-        levinson_durbin(&rtmp, &mut atmp, LPC)?;
+        if let Err(e) = levinson_durbin(&rtmp, &mut atmp, LPC) {
+            self.illcond = true;
+            return Err(e);
+        }
+        self.illcond = false;
+        // Persist the raw (unexpanded) ATMP for the Annex I block 51FE
+        // consumer before block 51 expands the scratch copy below.
+        self.atmp.copy_from_slice(&atmp[..=LPC]);
 
         // ----- Block 50 by-product: order-10 predictor + k1 ------------
         //
@@ -258,6 +297,57 @@ impl SynthesisAdapter {
         }
 
         Ok(&self.last_predictor)
+    }
+
+    /// Annex I frame-erasure adaptation (§I.5.1 `ICOUNT = 4` processing
+    /// during an erased cycle): block **49FE** + block 50 **order 1–10
+    /// only**.
+    ///
+    /// Per §I.4.3/§I.4.4:
+    ///
+    /// * the hybrid-window buffer `SB` and the recursive component
+    ///   `REXP` are updated exactly as in a good cycle (the "vital
+    ///   operations"), but only `RTMP(1..11)` are produced;
+    /// * Durbin's recursion runs from order 1 to order 10, refreshing
+    ///   the persistent `ATMP(1..11)` and the post-filter's order-10
+    ///   by-product + first reflection coefficient (the post-filter
+    ///   "floats" with the concealed speech);
+    /// * the order-50 continuation and block 51 are **not** performed —
+    ///   [`Self::coefficients`] is left untouched. The live synthesis
+    ///   predictor is softened by block 51FE instead (driven by the
+    ///   decoder at the third vector of the cycle).
+    ///
+    /// Returns the Levinson status of the order-10 recursion; on error
+    /// the previous by-product (and `ATMP`) are kept, and
+    /// [`Self::illcond`] reports `true`.
+    pub fn adapt_erased(&mut self, sttmp: &[f64]) -> Result<(), LevinsonError> {
+        assert_eq!(sttmp.len(), NFRSZ, "adapter input must be NFRSZ samples");
+
+        let hw = Self::window_descriptor(&self.cfg.wnr);
+
+        // ----- Block 49FE: hybrid window → RTMP(1..11) only -----------
+        let mut rtmp = [0.0f64; PF_LPC_ORDER + 1];
+        self.hw_state
+            .run_erased(&hw, sttmp, &mut rtmp, PF_LPC_ORDER + 1);
+
+        // ----- Block 50, order 1–10 only -------------------------------
+        let mut atmp10 = [0.0f64; PF_LPC_ORDER + 1];
+        if let Err(e) = levinson_durbin(&rtmp, &mut atmp10, PF_LPC_ORDER) {
+            self.illcond = true;
+            return Err(e);
+        }
+        self.illcond = false;
+        // Refresh the persistent ATMP head; ATMP(12..51) keeps the last
+        // good frame's values (§I.5.1: "do block 50, order 1 to 10").
+        self.atmp[..=PF_LPC_ORDER].copy_from_slice(&atmp10);
+        // The post-filter by-product keeps floating (§I.4.4).
+        self.last_order10.copy_from_slice(&atmp10);
+        self.last_k1 = if rtmp[0] > 0.0 {
+            -rtmp[1] / rtmp[0]
+        } else {
+            0.0
+        };
+        Ok(())
     }
 }
 

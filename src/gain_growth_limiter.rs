@@ -119,6 +119,10 @@ pub struct GainGrowthLimiter {
     /// §I.5.1 `OGAINDB`: the last (limited) predicted log-gain, in dB.
     /// Initialised to [`OGAINDB_INIT`] (= -32 dB, the log-gain floor).
     ogaindb: f64,
+    /// The previous cycle's `FERROR`. The §I.5.1 top-of-cycle `AFTERFE`
+    /// decrement tests `FERROR` *before* the frame-boundary `read
+    /// FERROR`, i.e. the erasure state of the **previous** cycle.
+    prev_erased: bool,
 }
 
 impl Default for GainGrowthLimiter {
@@ -127,6 +131,7 @@ impl Default for GainGrowthLimiter {
             afterfe: 0,
             fecount: 0,
             ogaindb: OGAINDB_INIT,
+            prev_erased: false,
         }
     }
 }
@@ -154,9 +159,13 @@ impl GainGrowthLimiter {
     /// Returns the updated [`Self::afterfe`].
     pub fn on_cycle(&mut self, erased: bool) -> usize {
         // If FERROR = .FALSE. and AFTERFE > 0, do AFTERFE = AFTERFE - 1
-        //   | the last adaptation cycle was not erased, and the gain was
-        //   | clamped: decrease the number of cycles left to clamp.
-        if !erased && self.afterfe > 0 {
+        //   | "If the last adaptation cycle was not erased, and the gain
+        //   |  was clamped, decrease the number of adaptation cycles left
+        //   |  to clamp the gain."
+        // The §I.5.1 listing tests FERROR *before* the frame-boundary
+        // `read FERROR`, so the value tested is the previous cycle's
+        // erasure state — not this cycle's.
+        if !self.prev_erased && self.afterfe > 0 {
             self.afterfe -= 1;
         }
 
@@ -176,6 +185,7 @@ impl GainGrowthLimiter {
             self.fecount = 0;
         }
 
+        self.prev_erased = erased;
         self.afterfe
     }
 
@@ -324,6 +334,32 @@ mod tests {
         }
         assert_eq!(t.fecount(), AFTERFEMAX + 10);
         assert_eq!(t.on_cycle(false), AFTERFEMAX, "AFTERFE saturates");
+    }
+
+    #[test]
+    fn tracker_decrement_tests_previous_cycle_ferror() {
+        // §I.5.1 orders the top-of-cycle AFTERFE decrement BEFORE the
+        // frame-boundary `read FERROR`, so the FERROR it tests is the
+        // previous cycle's. Two consequences visible when a second
+        // erasure overlaps an active clamp window:
+        //  * the first erased cycle still decrements (previous cycle
+        //    was good and the clamp was active);
+        //  * the good cycle that ends the second erasure does NOT
+        //    decrement before loading (previous cycle was erased).
+        let mut t = GainGrowthLimiter::new();
+        let schedule = [
+            (true, 0),  // e: FECOUNT=1
+            (true, 0),  // e: FECOUNT=2
+            (false, 2), // g: prev erased → no dec; load AFTERFE=2
+            (true, 1),  // e: prev good, clamp active → dec 2→1; FECOUNT=1
+            (false, 2), // g: prev erased → no dec; load 1+1=2
+            (false, 1), // g: dec
+            (false, 0), // g: dec
+            (false, 0), // g: floor
+        ];
+        for (i, &(erased, want)) in schedule.iter().enumerate() {
+            assert_eq!(t.on_cycle(erased), want, "cycle {i}");
+        }
     }
 
     #[test]
