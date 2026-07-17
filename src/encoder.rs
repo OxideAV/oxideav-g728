@@ -245,6 +245,7 @@ impl Encoder {
     /// analysis-by-synthesis search reads this once per shape-codebook
     /// scan; exposing it through the encoder is the convenience hook
     /// future encoder rounds will use.
+    #[doc(hidden)] // internal: per-block driver / tests-and-audit accessor
     pub fn shape_energy(&self) -> &'static [f64; NCWD] {
         &Y_ENERGY
     }
@@ -253,12 +254,14 @@ impl Encoder {
     /// type is used by the decoder; §4.5 of the Recommendation
     /// mandates that the two backward adapters be bit-for-bit
     /// identical.
+    #[doc(hidden)] // internal: per-block driver / tests-and-audit accessor
     pub fn synthesis_adapter(&self) -> &SynthesisAdapter {
         &self.synth_adapter
     }
 
     /// Borrow the encoder's log-gain adapter (§3.8). Same constraint
     /// as [`Self::synthesis_adapter`].
+    #[doc(hidden)] // internal: per-block driver / tests-and-audit accessor
     pub fn gain_adapter(&self) -> &GainAdapter {
         &self.gain_adapter
     }
@@ -272,6 +275,7 @@ impl Encoder {
     /// The decoder's [`crate::Decoder::active_predictor`] follows the
     /// identical stagger, so the two values coincide vector-for-vector
     /// when both ends process the same quantised-speech stream.
+    #[doc(hidden)] // internal: per-block driver / tests-and-audit accessor
     pub fn active_predictor(&self) -> &[f64; LPC + 1] {
         &self.active_predictor
     }
@@ -280,12 +284,14 @@ impl Encoder {
     /// `1 → 2 → 3 → 4 → 1` once per [`Self::encode_vector`] call). The
     /// block-51 / block-38 coefficient swap commits when this reaches
     /// 3. Useful for tests and audit.
+    #[doc(hidden)] // internal: per-block driver / tests-and-audit accessor
     pub fn sf_icount(&self) -> usize {
         self.sf_icount
     }
 
     /// Borrow the previous gain-scaled excitation `ET(1..IDIM)`. Block
     /// 67 (1-vector delay) reads this on every encoded vector.
+    #[doc(hidden)] // internal: per-block driver / tests-and-audit accessor
     pub fn previous_excitation(&self) -> &[f64; FRAME_LEN] {
         &self.et_prev
     }
@@ -294,6 +300,7 @@ impl Encoder {
     /// `(Q̃(z/γ₁), Q̃(z/γ₂))` — output of block 38 (§3.3 eqs. 3-4b,
     /// 3-4c). Before the first adaptation cycle has run (round-248
     /// scaffold state), this is the all-pass `W(z) = 1`.
+    #[doc(hidden)] // internal: per-block driver / tests-and-audit accessor
     pub fn weighting_filter_coeff(&self) -> &WeightingFilterCoeff {
         &self.weighting_filter_coeff
     }
@@ -312,6 +319,7 @@ impl Encoder {
     /// [`PerceptualWeightingFilter`] (block 4) — per §3.3 / §3.4 the
     /// freeze-and-swap convention only swaps the taps, never the
     /// per-sample memory.
+    #[doc(hidden)] // internal: per-block driver / tests-and-audit accessor
     pub fn set_weighting_filter_coeff_from_lpc(&mut self, q: &[f64; crate::consts::LPCW + 1]) {
         self.weighting_filter_coeff = WeightingFilterCoeff::from_lpc(q);
         self.weighting_filter
@@ -335,6 +343,7 @@ impl Encoder {
 
     /// Borrow the live block-4 perceptual weighting filter state
     /// (current coefficients + per-sample delay-line memory).
+    #[doc(hidden)] // internal: per-block driver / tests-and-audit accessor
     pub fn weighting_filter(&self) -> &PerceptualWeightingFilter {
         &self.weighting_filter
     }
@@ -346,6 +355,7 @@ impl Encoder {
     /// cannot bypass [`Self::commit_weighting_filter_coefficients`]
     /// (which is what propagates the new `q_i` to the live block-4
     /// filter).
+    #[doc(hidden)] // internal: per-block driver / tests-and-audit accessor
     pub fn weighting_filter_adapter(&self) -> &WeightingFilterAdapter {
         &self.weighting_filter_adapter
     }
@@ -363,6 +373,7 @@ impl Encoder {
     /// untouched and the error is propagated so the caller can log
     /// or trace it; the block-33 mirror policy is documented on
     /// [`WeightingFilterAdapter::adapt`].
+    #[doc(hidden)] // internal: per-block driver / tests-and-audit accessor
     pub fn adapt_weighting_filter(&mut self, speech: &[f64; NFRSZ]) -> Result<(), LevinsonError> {
         self.weighting_filter_adapter.adapt(speech)?;
         Ok(())
@@ -378,6 +389,7 @@ impl Encoder {
     ///
     /// Per §3.4 spec rule the per-sample memory of block 4 is
     /// preserved across the swap — only the coefficients change.
+    #[doc(hidden)] // internal: per-block driver / tests-and-audit accessor
     pub fn commit_weighting_filter_coefficients(&mut self) {
         let q = *self.weighting_filter_adapter.predictor();
         self.set_weighting_filter_coeff_from_lpc(&q);
@@ -394,6 +406,7 @@ impl Encoder {
     /// is intentionally still NOT wired up — its cascade with the
     /// synthesis filter requires the §3.10 pre-/post-save memory
     /// handling and lands in a future round.
+    #[doc(hidden)] // internal: per-block driver / tests-and-audit accessor
     pub fn apply_weighting_filter(&mut self, s: &[f64; FRAME_LEN]) -> [f64; FRAME_LEN] {
         self.weighting_filter.filter_vector(s)
     }
@@ -401,6 +414,7 @@ impl Encoder {
     /// Borrow the zero-input-response unit (blocks 9 + 10 + 11). The
     /// accessor exposes the three filter-memory arrays
     /// (`STATELPC` / `ZIRWFIR` / `ZIRWIIR`) for tests and audit.
+    #[doc(hidden)] // internal: per-block driver / tests-and-audit accessor
     pub fn zero_input_response_unit(&self) -> &ZeroInputResponse {
         &self.zir
     }
@@ -427,6 +441,7 @@ impl Encoder {
     /// chosen excitation `e(n)` back onto the saved ring memory — is a
     /// later round; it depends on the §3.9 codebook search output that
     /// is not yet wired up.
+    #[doc(hidden)] // internal: per-block driver / tests-and-audit accessor
     pub fn compute_vq_target(&mut self, v: &[f64; FRAME_LEN]) -> [f64; FRAME_LEN] {
         let a = *self.synth_adapter.coefficients();
         let w = self.weighting_filter_coeff;
@@ -436,6 +451,7 @@ impl Encoder {
     /// Borrow the codebook-search module (blocks 12–18 of §3.9) —
     /// read-only view of the current impulse response `H` and
     /// filtered-shape energy table `Y2`.
+    #[doc(hidden)] // internal: per-block driver / tests-and-audit accessor
     pub fn codebook_search(&self) -> &CodebookSearch {
         &self.codebook_search
     }

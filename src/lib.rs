@@ -205,99 +205,174 @@
 
 use oxideav_core::RuntimeContext;
 
+// The per-spec-block modules below are `pub` so integration tests /
+// benches / fuzz targets can drive each block in isolation, but they
+// are NOT the crate's stable API — the stable surface is the codec
+// face (`Decoder` / `Encoder` / `DecoderFixed` / `EncoderFixed`, the
+// `make_*` factories, `register`, the §5.11 `bitstream` helpers and
+// the §3.11 sync-bit helper). `#[doc(hidden)]` keeps semver tooling
+// (and docs.rs) focused on that face; hidden paths stay compilable.
+#[doc(hidden)] // internal: block 73–77 AGC machinery
 pub mod agc;
+#[doc(hidden)] // internal: §G.1 fixed-point arithmetic primitives
 pub mod annex_g_arith;
+#[doc(hidden)] // internal: §G.3 fixed-point codebook search
 pub mod annex_g_codebook;
 pub mod annex_g_coder;
+#[doc(hidden)] // internal: §G.3.11 fixed-point synthesis filter
 pub mod annex_g_decoder;
+#[doc(hidden)] // internal: §G.3.1–§G.3.3 fixed-point encoder filters
 pub mod annex_g_encoder;
+#[doc(hidden)] // internal: §G fixed-point log-gain helpers
 pub mod annex_g_gain;
+#[doc(hidden)] // internal: §G.3.14–§G.3.16 fixed-point gain adapter
 pub mod annex_g_gain_adapter;
+#[doc(hidden)] // internal: §G.3.17/§G.3.18 fixed-point hybrid-window core
 pub mod annex_g_hybrid;
+#[doc(hidden)] // internal: §G.2.2 fixed-point Levinson-Durbin
 pub mod annex_g_levinson;
+#[doc(hidden)] // internal: §G.3.28 fixed-point postfilter coefficients
 pub mod annex_g_pf_coeff;
+#[doc(hidden)] // internal: §G.3.24–§G.3.27 fixed-point pitch adaptation
 pub mod annex_g_pitch;
+#[doc(hidden)] // internal: §G.3.20–§G.3.23 fixed-point postfilter
 pub mod annex_g_postfilter;
+#[doc(hidden)] // internal: §G.3.17–§G.3.19 fixed-point synthesis adapter
 pub mod annex_g_synth_adapter;
+#[doc(hidden)] // internal: §G.3.12/§G.3.13 fixed-point weighting adapter
 pub mod annex_g_weight_adapter;
+#[doc(hidden)] // internal: §I.5 fixed-point concealment blocks
 pub mod annex_i_fixed;
 pub mod bitstream;
+#[doc(hidden)] // internal: §3.9 blocks 12–18 codebook search
 pub mod codebook_search;
+#[doc(hidden)] // internal: Table 1/G.728 parameter constants
 pub mod consts;
 pub mod decoder;
 pub mod encoder;
+#[doc(hidden)] // internal: §I.4.1 blocks 31SF/31FE/31E PLC excitation
 pub mod excitation_extrapolation;
+#[doc(hidden)] // internal: §I.4.2 block 51FE LPC softening
 pub mod frame_erasure_lpc;
+#[doc(hidden)] // internal: block 30 backward vector gain adapter
 pub mod gain_adapter;
+#[doc(hidden)] // internal: §I.4.5 block 47AF gain-growth limiter
 pub mod gain_growth_limiter;
+#[doc(hidden)] // internal: Annex A hybrid-window machinery
 pub mod hybrid_window;
+#[doc(hidden)] // internal: block 50 Levinson-Durbin recursion
 pub mod levinson;
+#[doc(hidden)] // internal: block 71 long-term postfilter
 pub mod long_term_postfilter;
+#[doc(hidden)] // internal: block 81 LPC inverse filter
 pub mod pitch_inverse_filter;
+#[doc(hidden)] // internal: blocks 83/84 pitch-postfilter coefficients
 pub mod pitch_postfilter_coeff;
+#[doc(hidden)] // internal: block 82 pitch-period extractor
 pub mod pitch_search;
 pub mod registry;
+#[doc(hidden)] // internal: block 72 short-term postfilter
 pub mod short_term_postfilter;
+#[doc(hidden)] // internal: block 33 backward synthesis-filter adapter
 pub mod synthesis_adapter;
+#[doc(hidden)] // internal: Annex A–D transcribed numeric tables
 pub mod tables;
+#[doc(hidden)] // internal: block 4 perceptual weighting filter
 pub mod weighting_filter;
+#[doc(hidden)] // internal: blocks 36/37 weighting-filter adapter
 pub mod weighting_filter_adapter;
+#[doc(hidden)] // internal: block 38 weighting coefficient calculator
 pub mod weighting_filter_coeff;
+#[doc(hidden)] // internal: §3.5/§3.10 zero-input response + memory update
 pub mod zero_input_response;
 
+// Crate-root re-exports of internal per-block machinery keep their
+// historical paths compilable but are hidden alongside their source
+// modules; the un-hidden re-exports below them are the stable face.
+#[doc(hidden)] // internal re-export (see module note above)
 pub use agc::Agc;
+#[doc(hidden)] // internal re-export (see module note above)
 pub use annex_g_arith::{divide, findnls, rnd, vscale, ScalarFloat};
 pub use annex_g_coder::{DecoderFixed, EncoderFixed};
+#[doc(hidden)] // internal re-export (see module note above)
 pub use annex_g_decoder::{SynthesisFilterFixed, NLSSTATE_INIT, NSEG, STATELPC_CLIP};
+#[doc(hidden)] // internal re-export (see module note above)
 pub use annex_g_encoder::{EncoderFiltersFixed, MemoryUpdateOut};
+#[doc(hidden)] // internal re-export (see module note above)
 pub use annex_g_gain::{gain_log_db, offset_removed_log_gain, shape_log_db, DELTA_FLOOR_DB};
+#[doc(hidden)] // internal re-export (see module note above)
 pub use annex_g_gain_adapter::{
     gstate1_update, inverse_log_gain, limit_log_gain_q9, log_gain_predict, LogGainWindowFixed,
     GOFF_Q9, GSTATE_INIT_Q9, LOGGAIN_MAX_Q9, LOGGAIN_MIN_Q9,
 };
+#[doc(hidden)] // internal re-export (see module note above)
 pub use annex_g_hybrid::{
     BflSegment, HwmcoreOut, HwmcoreState, HybridWindowFixed, HybridWindowFixedState, NLSATT50,
     NLSATTW, NLSREXP_INIT_G2, NLSSB_INIT_G2,
 };
+#[doc(hidden)] // internal re-export (see module note above)
 pub use annex_g_levinson::{
     levinson_durbin_fixed, levinson_durbin_fixed_resume, simpdiv, LevinsonInput, LevinsonStatus,
     RecursionResume,
 };
+#[doc(hidden)] // internal re-export (see module note above)
 pub use annex_g_pf_coeff::{short_term_coeff_fixed, TILTF_Q15};
+#[doc(hidden)] // internal re-export (see module note above)
 pub use annex_g_pitch::{apf_to_q13, PitchAdapterFixed};
+#[doc(hidden)] // internal re-export (see module note above)
 pub use annex_g_postfilter::{
     scale_factor, LongTermCoeff, PostfilterFixed, ShortTermCoeff, AGCFAC1_Q21, AGCFAC_Q14,
     PF_ORDER, SCALEFIL_INIT_Q14,
 };
+#[doc(hidden)] // internal re-export (see module note above)
 pub use annex_g_synth_adapter::{
     bandwidth_expand_q14, log_gain_bandwidth_expand, StSegment, SynthAdapterFixed, NLSSB_INIT,
 };
+#[doc(hidden)] // internal re-export (see module note above)
 pub use annex_g_weight_adapter::{WeightAdapterFixed, WeightCoeffFixed, N1W, N2W, N3W};
+#[doc(hidden)] // internal re-export (see module note above)
 pub use annex_i_fixed::{
     gstate1_of_extrapolated_et_q9, limit_log_gain_after_fe_q9, lin2db_gstate_q9, EtPastFixed,
     FEGAINMAX_Q9, VTH_Q14,
 };
 pub use bitstream::{pack_indices, unpack_indices};
+#[doc(hidden)] // internal re-export (see module note above)
 pub use codebook_search::{CodebookSearch, SearchResult};
-pub use decoder::{
-    extract_sync_bit, pack_channel_index, ExcitationVector, Synthesizer, DEFAULT_MAX, FRAME_LEN,
-};
+pub use decoder::{extract_sync_bit, DEFAULT_MAX, FRAME_LEN};
+#[doc(hidden)] // internal re-export: decoder-internal building blocks
+pub use decoder::{pack_channel_index, ExcitationVector, Synthesizer};
 pub use encoder::{make_encoder, Encoder, CHANNEL_INDEX_BITS};
+#[doc(hidden)] // internal re-export (see module note above)
 pub use excitation_extrapolation::{FrameErasureExcitation, LcgSlideSource, SlideSource};
+#[doc(hidden)] // internal re-export (see module note above)
 pub use frame_erasure_lpc::{soften_predictor, FrameErasureLpc};
+#[doc(hidden)] // internal re-export (see module note above)
 pub use gain_adapter::GainAdapter;
+#[doc(hidden)] // internal re-export (see module note above)
 pub use gain_growth_limiter::{limit_log_gain, GainGrowthLimiter};
+#[doc(hidden)] // internal re-export (see module note above)
 pub use hybrid_window::{HybridWindow, HybridWindowState};
+#[doc(hidden)] // internal re-export (see module note above)
 pub use levinson::{levinson_durbin, LevinsonError};
+#[doc(hidden)] // internal re-export (see module note above)
 pub use long_term_postfilter::LongTermPostfilter;
+#[doc(hidden)] // internal re-export (see module note above)
 pub use pitch_inverse_filter::PitchInverseFilter;
+#[doc(hidden)] // internal re-export (see module note above)
 pub use pitch_postfilter_coeff::PitchPostfilterCoeff;
+#[doc(hidden)] // internal re-export (see module note above)
 pub use pitch_search::PitchSearch;
+#[doc(hidden)] // internal re-export (see module note above)
 pub use short_term_postfilter::ShortTermPostfilter;
+#[doc(hidden)] // internal re-export (see module note above)
 pub use synthesis_adapter::SynthesisAdapter;
+#[doc(hidden)] // internal re-export (see module note above)
 pub use weighting_filter::PerceptualWeightingFilter;
+#[doc(hidden)] // internal re-export (see module note above)
 pub use weighting_filter_adapter::WeightingFilterAdapter;
+#[doc(hidden)] // internal re-export (see module note above)
 pub use weighting_filter_coeff::WeightingFilterCoeff;
+#[doc(hidden)] // internal re-export (see module note above)
 pub use zero_input_response::ZeroInputResponse;
 
 /// Crate-local error type.
@@ -971,22 +1046,26 @@ impl Decoder {
 
     /// Annex I frame-erasure counters, exposed for tests and audit:
     /// `(FECOUNT, AFTERFE, OGAINDB)`.
+    #[doc(hidden)] // internal: tests-and-audit state accessor
     pub fn fe_counters(&self) -> (usize, usize, f64) {
         (self.fe.fecount, self.fe.afterfe, self.fe.ogaindb)
     }
 
     /// Borrow the Annex I excitation extrapolator (blocks 31SF / 31FE /
     /// 31E) — for tests and audit.
+    #[doc(hidden)] // internal: tests-and-audit state accessor
     pub fn frame_erasure_excitation(&self) -> &FrameErasureExcitation {
         &self.fe.exc
     }
 
     /// Borrow the long-term postfilter (useful for tests and audit).
+    #[doc(hidden)] // internal: tests-and-audit state accessor
     pub fn long_term_postfilter(&self) -> &LongTermPostfilter {
         &self.long_term_pf
     }
 
     /// Borrow the short-term postfilter (useful for tests and audit).
+    #[doc(hidden)] // internal: tests-and-audit state accessor
     pub fn short_term_postfilter(&self) -> &ShortTermPostfilter {
         &self.short_term_pf
     }
@@ -997,6 +1076,7 @@ impl Decoder {
     /// refresh at the first vector of each adaptation cycle. Useful
     /// for tests and audit, and for the still-pending block-82 search
     /// to read the residual stream once it lands.
+    #[doc(hidden)] // internal: tests-and-audit state accessor
     pub fn pitch_inverse_filter(&self) -> &PitchInverseFilter {
         &self.pitch_inv_filter
     }
@@ -1008,6 +1088,7 @@ impl Decoder {
     /// blocks 83 / 84 (via [`Self::pitch_pf_coeff`]) at the third
     /// vector of each frame to drive the long-term postfilter's
     /// `(g_l, b, p)` coefficients.
+    #[doc(hidden)] // internal: tests-and-audit state accessor
     pub fn pitch_search(&self) -> &PitchSearch {
         &self.pitch_search
     }
@@ -1018,27 +1099,32 @@ impl Decoder {
     /// audit; downstream callers should read `(b, g_l)` indirectly via
     /// [`Self::long_term_postfilter`] which is what the comb-filter
     /// machinery (block 71) consumes at sample rate.
+    #[doc(hidden)] // internal: tests-and-audit state accessor
     pub fn pitch_pf_coeff(&self) -> &PitchPostfilterCoeff {
         &self.pitch_pf_coeff
     }
 
     /// Borrow the AGC (useful for tests and audit).
+    #[doc(hidden)] // internal: tests-and-audit state accessor
     pub fn agc(&self) -> &Agc {
         &self.agc
     }
 
     /// Borrow the synthesiser (useful for tests and audit).
+    #[doc(hidden)] // internal: tests-and-audit state accessor
     pub fn synthesizer(&self) -> &Synthesizer {
         &self.synth
     }
 
     /// Borrow the synthesis-filter adapter (useful for tests and
     /// audit).
+    #[doc(hidden)] // internal: tests-and-audit state accessor
     pub fn synthesis_adapter(&self) -> &SynthesisAdapter {
         &self.synth_adapter
     }
 
     /// Borrow the gain adapter (useful for tests and audit).
+    #[doc(hidden)] // internal: tests-and-audit state accessor
     pub fn gain_adapter(&self) -> &GainAdapter {
         &self.gain_adapter
     }
@@ -1052,6 +1138,7 @@ impl Decoder {
     /// with [`Self::synthesis_adapter`]`().coefficients()`, which is
     /// the *most recently computed* predictor regardless of swap
     /// timing.
+    #[doc(hidden)] // internal: tests-and-audit state accessor
     pub fn active_predictor(&self) -> &[f64; consts::LPC + 1] {
         &self.active_predictor
     }
@@ -1060,6 +1147,7 @@ impl Decoder {
     /// `1 → 2 → 3 → 4 → 1` once per [`Self::decode_vector`] call). The
     /// block-51 coefficient swap commits when this reaches 3. Useful
     /// for tests and audit.
+    #[doc(hidden)] // internal: tests-and-audit state accessor
     pub fn sf_icount(&self) -> usize {
         self.sf_icount
     }

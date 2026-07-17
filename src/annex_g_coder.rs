@@ -147,6 +147,7 @@ impl EncoderFixed {
     /// index would otherwise trigger (every later state is bit-exactly
     /// the reference encoder's, so any remaining mismatch is a genuine
     /// per-vector search deviation).
+    #[doc(hidden)] // internal: conformance-adjudication / tests-and-audit surface
     pub fn encode_vector_resynced(&mut self, s: &[i16; IDIM], forced: u16) -> u16 {
         self.encode_vector_inner(s, Some(forced))
     }
@@ -258,6 +259,7 @@ impl EncoderFixed {
     /// The most recent quantized-speech vector's mantissas + shift (for
     /// tests / decoder-lockstep verification).
     #[must_use]
+    #[doc(hidden)] // internal: conformance-adjudication / tests-and-audit surface
     pub fn last_st(&self) -> (&[i16; IDIM], i32) {
         let seg = &self.sttmp[self.icount - 1];
         (&seg.st, seg.nls)
@@ -267,6 +269,7 @@ impl EncoderFixed {
     /// committed at the last `ICOUNT = 3`) — for tests / conformance
     /// adjudication.
     #[must_use]
+    #[doc(hidden)] // internal: conformance-adjudication / tests-and-audit surface
     pub fn weight_coeff(&self) -> &WeightCoeffFixed {
         &self.wcoeff
     }
@@ -275,6 +278,7 @@ impl EncoderFixed {
     /// committed at the last `ICOUNT = 3`) — for tests / conformance
     /// adjudication.
     #[must_use]
+    #[doc(hidden)] // internal: conformance-adjudication / tests-and-audit surface
     pub fn predictor(&self) -> &[i16; LPC + 1] {
         &self.a
     }
@@ -643,6 +647,7 @@ impl DecoderFixed {
     /// Annex I frame-erasure counters (for tests/audit):
     /// `(FECOUNT, AFTERFE, OGAINDB in Q9)`.
     #[must_use]
+    #[doc(hidden)] // internal: conformance-adjudication / tests-and-audit surface
     pub fn fe_counters(&self) -> (usize, usize, i32) {
         (self.fe.fecount, self.fe.afterfe, self.fe.ogaindb_q9)
     }
@@ -650,6 +655,7 @@ impl DecoderFixed {
     /// Borrow the fixed-point Annex I excitation extrapolator (blocks
     /// 31SF / 31FE / 31E) — for tests/audit.
     #[must_use]
+    #[doc(hidden)] // internal: conformance-adjudication / tests-and-audit surface
     pub fn frame_erasure_excitation(&self) -> &EtPastFixed {
         &self.fe.etp
     }
@@ -761,6 +767,7 @@ impl DecoderFixed {
     /// The most recent decoded (pre-postfilter) quantized-speech vector
     /// (mantissas + shift) — for encoder-lockstep verification.
     #[must_use]
+    #[doc(hidden)] // internal: conformance-adjudication / tests-and-audit surface
     pub fn last_st(&self) -> (&[i16; IDIM], i32) {
         let seg = &self.sttmp[self.icount - 1];
         (&seg.st, seg.nls)
@@ -769,6 +776,7 @@ impl DecoderFixed {
     /// Borrow the fixed-point adaptive postfilter (blocks 71 – 77) — for
     /// tests / conformance diagnostics.
     #[must_use]
+    #[doc(hidden)] // internal: conformance-adjudication / tests-and-audit surface
     pub fn postfilter(&self) -> &PostfilterFixed {
         &self.postfilter
     }
@@ -776,6 +784,7 @@ impl DecoderFixed {
     /// The live long-term postfilter coefficients (blocks 82 – 84
     /// output) — for tests / conformance diagnostics.
     #[must_use]
+    #[doc(hidden)] // internal: conformance-adjudication / tests-and-audit surface
     pub fn long_term_coeff(&self) -> &LongTermCoeff {
         &self.ltc
     }
@@ -783,6 +792,7 @@ impl DecoderFixed {
     /// The live short-term postfilter coefficients (block 85 output) —
     /// for tests / conformance diagnostics.
     #[must_use]
+    #[doc(hidden)] // internal: conformance-adjudication / tests-and-audit surface
     pub fn short_term_coeff(&self) -> &ShortTermCoeff {
         &self.stc
     }

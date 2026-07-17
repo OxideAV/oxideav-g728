@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Internal public surface marked `#[doc(hidden)]`.** The per-spec-block
+  modules (backward adapters, postfilter chain, Annex G/I machinery,
+  tables/consts), their crate-root re-exports, and the tests-and-audit
+  accessors / per-block drivers on `Decoder` / `Encoder` /
+  `EncoderFixed` / `DecoderFixed` are now hidden from rustdoc and
+  semver tooling. No paths, signatures or behaviour changed — the
+  stable face remains `Decoder` / `Encoder` / `DecoderFixed` /
+  `EncoderFixed` with their codec entry points, `make_decoder` /
+  `make_encoder` / `register`, `pack_indices` / `unpack_indices`,
+  `extract_sync_bit`, `Error` / `Result`, and the `FRAME_LEN` /
+  `CHANNEL_INDEX_BITS` / `DEFAULT_MAX` constants.
+
 ### Added
 
 - **Packet-loss concealment through the registered `g728` codec.** The

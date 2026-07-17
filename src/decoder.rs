@@ -59,6 +59,7 @@ pub const DEFAULT_MAX: f64 = 4_095.0;
 /// (Annex B prose: "To obtain the floating point value from the
 /// integer value, divide the integer value by 2 048"). We pre-apply
 /// that division so downstream filtering can stay in `f64`.
+#[doc(hidden)] // internal: block-29 codebook-lookup building block
 #[derive(Debug, Clone, Copy)]
 pub struct ExcitationVector(pub [f64; FRAME_LEN]);
 
@@ -106,6 +107,7 @@ impl ExcitationVector {
 /// Per the spec §3.11 most-significant-bit-first convention, the
 /// shape index occupies bits `9..3` (the high 7 bits) and the gain
 /// index occupies bits `2..0` (the low 3 bits).
+#[doc(hidden)] // internal: test/bench convenience index packer
 pub fn pack_channel_index(shape: u8, gain: u8) -> u16 {
     let shape = (shape as u16) & 0x7F;
     let gain = (gain as u16) & 0x07;
@@ -149,6 +151,7 @@ pub fn extract_sync_bit(ichan: u16) -> bool {
 /// adaptation cycle (i.e. every fourth call to [`filter_vector`])
 /// via [`set_predictor`]. Between updates the synthesiser keeps
 /// using the most recently supplied predictor.
+#[doc(hidden)] // internal: block-32 synthesis-filter building block
 #[derive(Debug, Clone)]
 pub struct Synthesizer {
     predictor: [f64; LPC + 1],
