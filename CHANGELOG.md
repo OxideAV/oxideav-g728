@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-g728/compare/v0.0.8...v0.0.9) - 2026-07-17
+
+### Other
+
+- doc(hidden) the internal per-block surface; stable codec face unchanged
+- Annex I packet-loss concealment through the g728 codec face
+- README + CHANGELOG — Annex I VEC_LOOP drivers, E4 errata row, conformance caveat
+- annex I: fixed-point §I.5.1 VEC_LOOP conceal driver on DecoderFixed
+- annex I fixed-point building blocks: 31SF/31FE/31E, 97FE/LIN2DB, 98AF, HWMCOREFE, FACVFE
+- annex I: §I.5.1 VEC_LOOP frame-erasure concealment driver (float decoder)
+- annex I plumbing: 43FE/49FE hybrid-window variants, erased-cycle adapter paths, 47AF-integrated gain predict
+- fix §I.5.3 slide-back off by one vector
+- anchor E4 at its §G.3.25 source line + add E3-E6 regression tests
+- round 403 — PTAP shift-overflow guard, robustness gates, errata anchoring
+- guard block-83 PTAP shift against out-of-range NLS; add robustness gates
+- anchor conformance-verified Annex-G errata (E1/E2/E3/E5/E6/N1/N2) at their source lines
+
 ### Changed
 
 - **Internal public surface marked `#[doc(hidden)]`.** The per-spec-block
