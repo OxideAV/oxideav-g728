@@ -229,7 +229,7 @@ pub fn impulse_response(
     for k in 2..=IDIM {
         let mut aa0: i64 = 0; // synthesis branch
         let mut aa1: i64 = 0; // combined weighting branch
-                              // For I = K, K−1, …, 2 (shift the memory then filter).
+        // For I = K, K−1, …, 2 (shift the memory then filter).
         let mut i = k;
         while i >= 2 {
             temp[i] = temp[i - 1];

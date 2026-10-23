@@ -42,7 +42,7 @@
 //! prose of `T-REC-G.728-199905-AnnI.pdf`; no reference C / external
 //! implementation was consulted.
 
-use crate::consts::{FEFAC, FE_LPC_CYCLES_PER_STEP, LPC};
+use crate::consts::{FE_LPC_CYCLES_PER_STEP, FEFAC, LPC};
 
 /// Softened (frame-erasure bandwidth-expanded) order-50 LPC predictor.
 ///

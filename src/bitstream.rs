@@ -104,7 +104,7 @@ pub fn pack_indices(indices: &[u16]) -> Vec<u8> {
 /// framing unit of the codec.
 pub fn unpack_indices(bytes: &[u8]) -> Result<Vec<u16>> {
     let total_bits = bytes.len() * 8;
-    if total_bits % CHANNEL_INDEX_BITS as usize != 0 {
+    if !total_bits.is_multiple_of(CHANNEL_INDEX_BITS as usize) {
         return Err(Error::InvalidInputLength);
     }
     let count = total_bits / CHANNEL_INDEX_BITS as usize;

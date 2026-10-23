@@ -18,7 +18,7 @@
 //! divide-by-zero, an unchecked shift, or an unbounded feedback loop
 //! fails here even when the private corpus is absent.
 
-use oxideav_g728::{Decoder, DecoderFixed, Encoder, EncoderFixed, DEFAULT_MAX};
+use oxideav_g728::{DEFAULT_MAX, Decoder, DecoderFixed, Encoder, EncoderFixed};
 
 const IDIM: usize = 5;
 /// Runaway detector for the fixed-point Q2 decoder output. Q2 speech is

@@ -436,11 +436,7 @@ impl SynthesisFilterFixed {
 #[inline]
 fn shr_i64(value: i64, k: i32) -> i64 {
     if k >= 0 {
-        if k >= 64 {
-            value >> 63
-        } else {
-            value >> k
-        }
+        if k >= 64 { value >> 63 } else { value >> k }
     } else {
         let s = (-k) as u32;
         if s >= 64 {

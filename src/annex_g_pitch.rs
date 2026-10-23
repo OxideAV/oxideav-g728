@@ -514,11 +514,7 @@ fn clamp_i32(v: i64) -> i32 {
 /// shift) — the `VSCALE`-style alignment used on the 32-bit energies.
 #[inline]
 fn shl_signed(v: i64, k: i32) -> i64 {
-    if k >= 0 {
-        v << k
-    } else {
-        v >> (-k)
-    }
+    if k >= 0 { v << k } else { v >> (-k) }
 }
 
 /// Clip a 32-bit value to the signed 16-bit range.
@@ -652,7 +648,7 @@ mod tests {
             for _v in 0..4 {
                 let mut st = [0i32; IDIM];
                 for k in 0..IDIM {
-                    if n % period == 0 {
+                    if n.is_multiple_of(period) {
                         st[k] = 4000; // Q2 pulse
                     }
                     n += 1;
@@ -710,7 +706,11 @@ mod tests {
         let mut sst = vec![0i32; 400];
         for (i, v) in sst.iter_mut().enumerate() {
             // Alternate sign every KP1_INIT = 50 samples ⇒ s(k)·s(k−50) < 0.
-            *v = if (i / KP1_INIT) % 2 == 0 { 1000 } else { -1000 };
+            *v = if (i / KP1_INIT).is_multiple_of(2) {
+                1000
+            } else {
+                -1000
+            };
         }
         assert_eq!(a.pitch_tap(&sst, 399), 0);
     }

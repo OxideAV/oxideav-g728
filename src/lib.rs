@@ -292,18 +292,18 @@ pub mod zero_input_response;
 #[doc(hidden)] // internal re-export (see module note above)
 pub use agc::Agc;
 #[doc(hidden)] // internal re-export (see module note above)
-pub use annex_g_arith::{divide, findnls, rnd, vscale, ScalarFloat};
+pub use annex_g_arith::{ScalarFloat, divide, findnls, rnd, vscale};
 pub use annex_g_coder::{DecoderFixed, EncoderFixed};
 #[doc(hidden)] // internal re-export (see module note above)
-pub use annex_g_decoder::{SynthesisFilterFixed, NLSSTATE_INIT, NSEG, STATELPC_CLIP};
+pub use annex_g_decoder::{NLSSTATE_INIT, NSEG, STATELPC_CLIP, SynthesisFilterFixed};
 #[doc(hidden)] // internal re-export (see module note above)
 pub use annex_g_encoder::{EncoderFiltersFixed, MemoryUpdateOut};
 #[doc(hidden)] // internal re-export (see module note above)
-pub use annex_g_gain::{gain_log_db, offset_removed_log_gain, shape_log_db, DELTA_FLOOR_DB};
+pub use annex_g_gain::{DELTA_FLOOR_DB, gain_log_db, offset_removed_log_gain, shape_log_db};
 #[doc(hidden)] // internal re-export (see module note above)
 pub use annex_g_gain_adapter::{
-    gstate1_update, inverse_log_gain, limit_log_gain_q9, log_gain_predict, LogGainWindowFixed,
-    GOFF_Q9, GSTATE_INIT_Q9, LOGGAIN_MAX_Q9, LOGGAIN_MIN_Q9,
+    GOFF_Q9, GSTATE_INIT_Q9, LOGGAIN_MAX_Q9, LOGGAIN_MIN_Q9, LogGainWindowFixed, gstate1_update,
+    inverse_log_gain, limit_log_gain_q9, log_gain_predict,
 };
 #[doc(hidden)] // internal re-export (see module note above)
 pub use annex_g_hybrid::{
@@ -312,48 +312,48 @@ pub use annex_g_hybrid::{
 };
 #[doc(hidden)] // internal re-export (see module note above)
 pub use annex_g_levinson::{
-    levinson_durbin_fixed, levinson_durbin_fixed_resume, simpdiv, LevinsonInput, LevinsonStatus,
-    RecursionResume,
+    LevinsonInput, LevinsonStatus, RecursionResume, levinson_durbin_fixed,
+    levinson_durbin_fixed_resume, simpdiv,
 };
 #[doc(hidden)] // internal re-export (see module note above)
-pub use annex_g_pf_coeff::{short_term_coeff_fixed, TILTF_Q15};
+pub use annex_g_pf_coeff::{TILTF_Q15, short_term_coeff_fixed};
 #[doc(hidden)] // internal re-export (see module note above)
-pub use annex_g_pitch::{apf_to_q13, PitchAdapterFixed};
+pub use annex_g_pitch::{PitchAdapterFixed, apf_to_q13};
 #[doc(hidden)] // internal re-export (see module note above)
 pub use annex_g_postfilter::{
-    scale_factor, LongTermCoeff, PostfilterFixed, ShortTermCoeff, AGCFAC1_Q21, AGCFAC_Q14,
-    PF_ORDER, SCALEFIL_INIT_Q14,
+    AGCFAC_Q14, AGCFAC1_Q21, LongTermCoeff, PF_ORDER, PostfilterFixed, SCALEFIL_INIT_Q14,
+    ShortTermCoeff, scale_factor,
 };
 #[doc(hidden)] // internal re-export (see module note above)
 pub use annex_g_synth_adapter::{
-    bandwidth_expand_q14, log_gain_bandwidth_expand, StSegment, SynthAdapterFixed, NLSSB_INIT,
+    NLSSB_INIT, StSegment, SynthAdapterFixed, bandwidth_expand_q14, log_gain_bandwidth_expand,
 };
 #[doc(hidden)] // internal re-export (see module note above)
-pub use annex_g_weight_adapter::{WeightAdapterFixed, WeightCoeffFixed, N1W, N2W, N3W};
+pub use annex_g_weight_adapter::{N1W, N2W, N3W, WeightAdapterFixed, WeightCoeffFixed};
 #[doc(hidden)] // internal re-export (see module note above)
 pub use annex_i_fixed::{
-    gstate1_of_extrapolated_et_q9, limit_log_gain_after_fe_q9, lin2db_gstate_q9, EtPastFixed,
-    FEGAINMAX_Q9, VTH_Q14,
+    EtPastFixed, FEGAINMAX_Q9, VTH_Q14, gstate1_of_extrapolated_et_q9, limit_log_gain_after_fe_q9,
+    lin2db_gstate_q9,
 };
 pub use bitstream::{pack_indices, unpack_indices};
 #[doc(hidden)] // internal re-export (see module note above)
 pub use codebook_search::{CodebookSearch, SearchResult};
-pub use decoder::{extract_sync_bit, DEFAULT_MAX, FRAME_LEN};
+pub use decoder::{DEFAULT_MAX, FRAME_LEN, extract_sync_bit};
 #[doc(hidden)] // internal re-export: decoder-internal building blocks
-pub use decoder::{pack_channel_index, ExcitationVector, Synthesizer};
-pub use encoder::{make_encoder, Encoder, CHANNEL_INDEX_BITS};
+pub use decoder::{ExcitationVector, Synthesizer, pack_channel_index};
+pub use encoder::{CHANNEL_INDEX_BITS, Encoder, make_encoder};
 #[doc(hidden)] // internal re-export (see module note above)
 pub use excitation_extrapolation::{FrameErasureExcitation, LcgSlideSource, SlideSource};
 #[doc(hidden)] // internal re-export (see module note above)
-pub use frame_erasure_lpc::{soften_predictor, FrameErasureLpc};
+pub use frame_erasure_lpc::{FrameErasureLpc, soften_predictor};
 #[doc(hidden)] // internal re-export (see module note above)
 pub use gain_adapter::GainAdapter;
 #[doc(hidden)] // internal re-export (see module note above)
-pub use gain_growth_limiter::{limit_log_gain, GainGrowthLimiter};
+pub use gain_growth_limiter::{GainGrowthLimiter, limit_log_gain};
 #[doc(hidden)] // internal re-export (see module note above)
 pub use hybrid_window::{HybridWindow, HybridWindowState};
 #[doc(hidden)] // internal re-export (see module note above)
-pub use levinson::{levinson_durbin, LevinsonError};
+pub use levinson::{LevinsonError, levinson_durbin};
 #[doc(hidden)] // internal re-export (see module note above)
 pub use long_term_postfilter::LongTermPostfilter;
 #[doc(hidden)] // internal re-export (see module note above)

@@ -57,7 +57,7 @@
 
 use crate::annex_g_arith::rnd;
 use crate::annex_g_hybrid::{BflSegment, HybridWindowFixed, HybridWindowFixedState};
-use crate::annex_g_levinson::{levinson_durbin_fixed, LevinsonInput, LevinsonStatus};
+use crate::annex_g_levinson::{LevinsonInput, LevinsonStatus, levinson_durbin_fixed};
 use crate::consts::{IDIM, LPC, LPCLG, NFRSZ, NONR};
 use crate::tables::{FACGPV_Q14, FACV_Q14, WNR_Q15};
 

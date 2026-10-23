@@ -47,19 +47,19 @@ use crate::annex_g_encoder::EncoderFiltersFixed;
 use crate::annex_g_gain_adapter::GainAdapterFixed;
 use crate::annex_g_hybrid::{BflSegment, HybridWindowFixed, HybridWindowFixedState, NLSATT50};
 use crate::annex_g_levinson::{
-    levinson_durbin_fixed, levinson_durbin_fixed_resume, LevinsonInput, RecursionResume,
+    LevinsonInput, RecursionResume, levinson_durbin_fixed, levinson_durbin_fixed_resume,
 };
 use crate::annex_g_pf_coeff::short_term_coeff_fixed;
-use crate::annex_g_pitch::{apf_to_q13, PitchAdapterFixed};
+use crate::annex_g_pitch::{PitchAdapterFixed, apf_to_q13};
 use crate::annex_g_postfilter::{
-    LongTermCoeff, PostfilterFixed, ShortTermCoeff, PF_ORDER, SST_PAST,
+    LongTermCoeff, PF_ORDER, PostfilterFixed, SST_PAST, ShortTermCoeff,
 };
-use crate::annex_g_synth_adapter::{bandwidth_expand_q14, StSegment, SynthAdapterFixed, N5};
+use crate::annex_g_synth_adapter::{N5, StSegment, SynthAdapterFixed, bandwidth_expand_q14};
 use crate::annex_g_weight_adapter::{WeightAdapterFixed, WeightCoeffFixed};
-use crate::annex_i_fixed::{gstate1_of_extrapolated_et_q9, EtPastFixed};
+use crate::annex_i_fixed::{EtPastFixed, gstate1_of_extrapolated_et_q9};
 use crate::consts::{AFTERFEMAX, IDIM, LPC, LPCW, NFRSZ, NG, NUPDATE};
 use crate::excitation_extrapolation::LcgSlideSource;
-use crate::tables::{FACVFE_Q14, FACV_Q14};
+use crate::tables::{FACV_Q14, FACVFE_Q14};
 
 /// The full §G.7 fixed-point encoder: input `Q2` speech vectors, output
 /// 10-bit channel indices.
@@ -471,10 +471,10 @@ impl DecoderFixed {
 
         // | If ICOUNT = 3: If ILLCOND = .FALSE., do block 51 (commit the
         // | pending expansion from the previous cycle's ICOUNT = 4).
-        if icount == 3 {
-            if let Some(a) = self.pending_a.take() {
-                self.a = a;
-            }
+        if icount == 3
+            && let Some(a) = self.pending_a.take()
+        {
+            self.a = a;
         }
 
         // | do blocks 46, 98AF, 99, and 48 (45 at ICOUNT = 2 inside).
@@ -501,10 +501,10 @@ impl DecoderFixed {
 
         // | If ICOUNT = 1, do block 85 (short-term postfilter coeffs
         // | from the order-10 by-product; keep the old set on decline).
-        if icount == 1 {
-            if let Some(sc) = short_term_coeff_fixed(&self.apf_atil, self.rc1, self.nlsapf) {
-                self.stc = sc;
-            }
+        if icount == 1
+            && let Some(sc) = short_term_coeff_fixed(&self.apf_atil, self.rc1, self.nlsapf)
+        {
+            self.stc = sc;
         }
 
         // | do block 81 → SST (Q2) + residual D.
@@ -609,10 +609,10 @@ impl DecoderFixed {
 
         // Post-filter chain — identical in good and erased frames
         // (§I.4.4; the coefficients intentionally "float").
-        if icount == 1 {
-            if let Some(sc) = short_term_coeff_fixed(&self.apf_atil, self.rc1, self.nlsapf) {
-                self.stc = sc;
-            }
+        if icount == 1
+            && let Some(sc) = short_term_coeff_fixed(&self.apf_atil, self.rc1, self.nlsapf)
+        {
+            self.stc = sc;
         }
         let sst = self.pitch.inverse_filter(&st, nlsst, &self.apf_q13);
         if icount == 3 {

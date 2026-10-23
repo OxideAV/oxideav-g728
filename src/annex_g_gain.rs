@@ -174,7 +174,7 @@ pub fn offset_removed_log_gain(
 mod tests {
     use super::*;
     use crate::consts::IDIM;
-    use crate::tables::{y_f64, GSQ};
+    use crate::tables::{GSQ, y_f64};
 
     // --- Block 93: gain-codebook log-gain table -------------------
 

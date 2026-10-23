@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- edition 2024, MSRV 1.95
 - **Internal public surface marked `#[doc(hidden)]`.** The per-spec-block
   modules (backward adapters, postfilter chain, Annex G/I machinery,
   tables/consts), their crate-root re-exports, and the tests-and-audit

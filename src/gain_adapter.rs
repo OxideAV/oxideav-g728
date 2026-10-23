@@ -46,7 +46,7 @@
 use crate::consts::{DIMINV, GOFF, IDIM, LPCLG, NONRLG, NUPDATE};
 use crate::hybrid_window::{HybridWindow, HybridWindowState};
 use crate::levinson::levinson_durbin;
-use crate::tables::{facgpv_f64, wnrg_f64, FACGPV_Q14, Q14};
+use crate::tables::{FACGPV_Q14, Q14, facgpv_f64, wnrg_f64};
 
 /// Spec-stated initial value for every entry of the GSTATE and GTMP
 /// log-gain buffers (Table 2/G.728). The choice of `-32` (the

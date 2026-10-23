@@ -402,14 +402,14 @@ impl GainAdapterFixed {
     ) -> (i16, i32) {
         debug_assert!((1..=NUPDATE).contains(&icount));
         // | If ICOUNT = 2 and ILLCONDG = .FALSE., then do block 45
-        if icount == 2 {
-            if let Some(gp) = crate::annex_g_synth_adapter::log_gain_bandwidth_expand(
+        if icount == 2
+            && let Some(gp) = crate::annex_g_synth_adapter::log_gain_bandwidth_expand(
                 &self.gptmp,
                 self.nlsgptmp,
                 self.illcondg,
-            ) {
-                self.gp = gp;
-            }
+            )
+        {
+            self.gp = gp;
         }
         // | do blocks 46, 98AF, 99, and 48
         let lg = log_gain_predict(&self.gp, &mut self.gstate);
@@ -508,7 +508,7 @@ mod tests {
         // log-gains, the Q11 dB tables, the Q14 predictor and the Q15
         // antilog polynomial.
         use crate::gain_adapter::GainAdapter;
-        use crate::tables::{y_f64, GQ};
+        use crate::tables::{GQ, y_f64};
 
         let mut fixed = GainAdapterFixed::new();
         let mut float = GainAdapter::new();

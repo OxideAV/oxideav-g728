@@ -50,7 +50,7 @@
 //! the per-test cross-checks below run this fixed-point path against it on
 //! identical order-10 predictors.
 
-use crate::annex_g_postfilter::{ShortTermCoeff, PF_ORDER};
+use crate::annex_g_postfilter::{PF_ORDER, ShortTermCoeff};
 use crate::annex_g_synth_adapter::bandwidth_expand_q14;
 use crate::tables::{SPFPCFV_Q14, SPFZCFV_Q14};
 

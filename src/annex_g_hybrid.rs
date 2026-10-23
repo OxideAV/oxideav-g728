@@ -583,11 +583,7 @@ impl HwmcoreState {
 /// Used for the HWMCORE `AA0 << NLSRE` line where `NLSRE` may be negative.
 #[inline]
 fn shl_acc(acc: i64, k: i32) -> i64 {
-    if k >= 0 {
-        acc << k
-    } else {
-        acc >> (-k)
-    }
+    if k >= 0 { acc << k } else { acc >> (-k) }
 }
 
 /// Saturate a 64-bit accumulator value into the 32-bit range so the
@@ -602,7 +598,7 @@ fn clamp_i32(v: i64) -> i32 {
 mod tests {
     use super::*;
     use crate::consts::{LPC, LPCW, NFRSZ, NONR, NONRW};
-    use crate::tables::{WNRW_Q15, WNR_Q15};
+    use crate::tables::{WNR_Q15, WNRW_Q15};
 
     // `lcg_samples` / `sbfl_segments_requant` are defined further down and
     // shared by the float-tracking + broadband tests.

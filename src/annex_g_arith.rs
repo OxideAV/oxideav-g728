@@ -265,7 +265,7 @@ pub fn findnls(input: &[i32], slen: usize, mls: i32) -> i32 {
     } else {
         // Case 3: the positive extreme has the larger magnitude.
         let mini = 1i64 << mls; // = 2^mls (mantissa lower bound)
-                                // maxi = mini − 1; maxi = maxi + mini = 2*mini − 1.
+        // maxi = mini − 1; maxi = maxi + mini = 2*mini − 1.
         let maxi = (mini - 1) + mini;
         let mut a = aa0 as i64;
         if a > maxi {

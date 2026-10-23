@@ -85,9 +85,11 @@ macro_rules! vectors_or_skip {
 
 fn read_words(dir: &Path, name: &str) -> Vec<i16> {
     let bytes = std::fs::read(dir.join(name)).unwrap_or_else(|e| panic!("read {name}: {e}"));
-    assert!(bytes.len() % 2 == 0, "{name}: odd byte length");
+    assert!(bytes.len().is_multiple_of(2), "{name}: odd byte length");
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect()
 }
@@ -149,7 +151,9 @@ fn fixed_encoder_bit_exact_on_all_vectors() {
         let reference = read_words(&dir, &format!("incw{case}g.bin"));
         let mut enc = EncoderFixed::new();
         let ours: Vec<i16> = input
-            .chunks_exact(IDIM)
+            .as_chunks::<IDIM>()
+            .0
+            .iter()
             .map(|c| enc.encode_vector(&pcm16_to_q2(c)) as i16)
             .collect();
         let (n, _, first) = diff_stats(&ours, &reference);
@@ -249,7 +253,9 @@ fn float_encoder_reference_agreement() {
         let reference = read_words(&dir, &format!("incw{case}.bin"));
         let mut enc = Encoder::new();
         let ours: Vec<i16> = input
-            .chunks_exact(IDIM)
+            .as_chunks::<IDIM>()
+            .0
+            .iter()
             .map(|c| {
                 let s: [f64; IDIM] = std::array::from_fn(|k| f64::from(c[k] >> 1) / 4.0);
                 enc.encode_vector(&s).expect("encode") as i16

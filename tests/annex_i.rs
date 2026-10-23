@@ -188,14 +188,14 @@ fn ogaindb_tracks_and_growth_is_limited_after_erasure() {
         dec.decode_vector_postfiltered(0x3FF);
         let (_, afterfe, ogaindb) = dec.fe_counters();
         assert!(ogaindb.is_finite());
-        if let Some(p) = prev {
-            if afterfe > 0 {
-                assert!(
-                    ogaindb - p <= 2.0 + 1e-9,
-                    "vector {n}: OGAINDB jumped {} dB under an active clamp",
-                    ogaindb - p
-                );
-            }
+        if let Some(p) = prev
+            && afterfe > 0
+        {
+            assert!(
+                ogaindb - p <= 2.0 + 1e-9,
+                "vector {n}: OGAINDB jumped {} dB under an active clamp",
+                ogaindb - p
+            );
         }
         prev = Some(ogaindb);
     }
@@ -267,7 +267,9 @@ fn mask1_masked_decode_of_official_bitstream() {
     };
     let cw = std::fs::read(dir.join("cw4.bin")).expect("cw4.bin");
     let indices: Vec<u16> = cw
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]) & 0x3FF)
         .collect();
     let mask: Vec<bool> = std::fs::read_to_string(dir.join("mask1"))
@@ -418,7 +420,9 @@ fn fixed_mask1_masked_decode_of_official_bitstream() {
     };
     let cw = std::fs::read(dir.join("cw4.bin")).expect("cw4.bin");
     let indices: Vec<u16> = cw
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]) & 0x3FF)
         .collect();
     let mask: Vec<bool> = std::fs::read_to_string(dir.join("mask1"))

@@ -439,11 +439,7 @@ fn clip_i16_64(v: i64) -> i16 {
 /// the §G.3 `If IR > 0 … If IR < 0` alignment idiom.
 #[inline]
 fn shr_signed(v: i64, ir: i32) -> i64 {
-    if ir >= 0 {
-        v >> ir
-    } else {
-        v << (-ir)
-    }
+    if ir >= 0 { v >> ir } else { v << (-ir) }
 }
 
 #[cfg(test)]

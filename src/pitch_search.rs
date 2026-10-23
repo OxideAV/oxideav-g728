@@ -421,11 +421,7 @@ impl PitchSearch {
             let beta1 = self.beta(d_k_start, d_k_end, p1);
 
             // Eq. 4-11: p = p0 if β1 ≤ TAPTH·β0 else p1.
-            if beta1 <= TAPTH * beta0 {
-                p0
-            } else {
-                p1
-            }
+            if beta1 <= TAPTH * beta0 { p0 } else { p1 }
         };
 
         // ----- Step 5: post-extract buffer slide, stash p̂ -----------
@@ -585,7 +581,7 @@ mod tests {
         ps.push_residual(&v3);
         ps.push_residual(&v4);
         let off = KPMAX - 1; // +139 base
-                             // d(86..90) = v1
+        // d(86..90) = v1
         for k in 0..IDIM {
             assert_eq!(ps.residual_buffer()[off + 86 + k], v1[k]);
         }
@@ -759,7 +755,7 @@ mod tests {
         let mut ps = PitchSearch::new();
         fill_with_impulse_train(&mut ps, 40);
         ps.p_prev = 100; // 100 is > 6 away from 40 → triggers the
-                         // multiple-resolution path.
+        // multiple-resolution path.
         ps.vec_idx = 3;
         let p = ps.extract();
         assert!((KPMIN..=KPMAX).contains(&p));

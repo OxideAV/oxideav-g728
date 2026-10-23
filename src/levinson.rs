@@ -127,8 +127,8 @@ pub fn levinson_durbin(r: &[f64], a: &mut [f64], lpc_order: usize) -> Result<(),
         let mut sum = 0.0;
         for ip in 1..=minc {
             let n1 = minc - ip + 2; // spec 1-based
-                                    // r is stored 0-based, so spec R(N1) is r[N1 - 1].
-                                    // a is stored 0-based, so spec A(IP) is a[IP - 1].
+            // r is stored 0-based, so spec R(N1) is r[N1 - 1].
+            // a is stored 0-based, so spec A(IP) is a[IP - 1].
             sum += r[n1 - 1] * a[ip - 1];
         }
 

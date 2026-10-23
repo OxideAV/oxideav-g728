@@ -46,7 +46,7 @@
 
 use crate::annex_g_arith::{findnls, rnd};
 use crate::annex_g_hybrid::{HwmcoreState, NLSATTW};
-use crate::annex_g_levinson::{levinson_durbin_fixed, LevinsonInput, LevinsonStatus};
+use crate::annex_g_levinson::{LevinsonInput, LevinsonStatus, levinson_durbin_fixed};
 use crate::annex_g_synth_adapter::bandwidth_expand_q14;
 use crate::consts::{LPCW, NFRSZ, NONRW};
 use crate::tables::{WNRW_Q15, WPCFV_Q14, WZCFV_Q14};

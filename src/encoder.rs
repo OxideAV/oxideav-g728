@@ -54,6 +54,7 @@
 //! (`Y_ENERGY`, `G2`, `GSQ`, `GB`) live in `tables.rs`; the per-cycle
 //! `E_j = ‖H·y_j‖²` table lives in [`CodebookSearch`].
 
+use crate::Error;
 use crate::codebook_search::CodebookSearch;
 use crate::consts::{LPC, NCWD, NFRSZ, NUPDATE};
 use crate::decoder::{ExcitationVector, FRAME_LEN};
@@ -65,7 +66,6 @@ use crate::weighting_filter::PerceptualWeightingFilter;
 use crate::weighting_filter_adapter::WeightingFilterAdapter;
 use crate::weighting_filter_coeff::WeightingFilterCoeff;
 use crate::zero_input_response::ZeroInputResponse;
-use crate::Error;
 
 /// Number of bits in one G.728 channel index (§2.1). Exposed as a
 /// constant so encoder consumers can size their bitstream buffers

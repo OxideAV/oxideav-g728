@@ -371,8 +371,8 @@ mod tests {
             t.on_cycle(true);
         }
         t.on_cycle(false); // AFTERFE = 2, OGAINDB still -32
-                           // First good vector: GAIN = 0 (silence floor). TMP = 0 - (-32) =
-                           // 32 > 2 -> clamped to -32 + 2 = -30; OGAINDB becomes -30.
+        // First good vector: GAIN = 0 (silence floor). TMP = 0 - (-32) =
+        // 32 > 2 -> clamped to -32 + 2 = -30; OGAINDB becomes -30.
         let g1 = t.limit(0.0);
         assert!((g1 - (-30.0)).abs() < 1e-12);
         assert!((t.ogaindb() - (-30.0)).abs() < 1e-12);

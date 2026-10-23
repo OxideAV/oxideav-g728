@@ -31,8 +31,8 @@
 
 use crate::consts::{LPC, NFRSZ, NONR};
 use crate::hybrid_window::{HybridWindow, HybridWindowState};
-use crate::levinson::{levinson_durbin, LevinsonError};
-use crate::tables::{facv_f64, wnr_f64, FACV_Q14, Q14};
+use crate::levinson::{LevinsonError, levinson_durbin};
+use crate::tables::{FACV_Q14, Q14, facv_f64, wnr_f64};
 
 /// Order at which the synthesis-filter Levinson recursion is stopped to
 /// extract the postfilter's `ã_1..ã_10` by-products and the first

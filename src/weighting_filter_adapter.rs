@@ -64,7 +64,7 @@
 
 use crate::consts::{LPCW, NFRSZ, NONRW};
 use crate::hybrid_window::{HybridWindow, HybridWindowState};
-use crate::levinson::{levinson_durbin, LevinsonError};
+use crate::levinson::{LevinsonError, levinson_durbin};
 use crate::tables::wnrw_f64;
 
 /// Static (table-derived) parameters for the weighting-filter

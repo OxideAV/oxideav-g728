@@ -64,26 +64,26 @@ pub fn register(ctx: &mut RuntimeContext) {
 /// Validate the audio parameters shared by both factories: G.728 is
 /// mono 8 kHz, 16-bit linear PCM on the uncompressed side.
 fn check_params(params: &CodecParameters) -> Result<()> {
-    if let Some(rate) = params.sample_rate {
-        if rate != SAMPLE_RATE {
-            return Err(Error::unsupported(format!(
-                "g728: sample rate {rate} unsupported (G.728 is {SAMPLE_RATE} Hz only)"
-            )));
-        }
+    if let Some(rate) = params.sample_rate
+        && rate != SAMPLE_RATE
+    {
+        return Err(Error::unsupported(format!(
+            "g728: sample rate {rate} unsupported (G.728 is {SAMPLE_RATE} Hz only)"
+        )));
     }
-    if let Some(ch) = params.channels {
-        if ch != 1 {
-            return Err(Error::unsupported(format!(
-                "g728: {ch} channels unsupported (G.728 is mono)"
-            )));
-        }
+    if let Some(ch) = params.channels
+        && ch != 1
+    {
+        return Err(Error::unsupported(format!(
+            "g728: {ch} channels unsupported (G.728 is mono)"
+        )));
     }
-    if let Some(fmt) = params.sample_format {
-        if fmt != SampleFormat::S16 {
-            return Err(Error::unsupported(format!(
-                "g728: sample format {fmt:?} unsupported (S16 only)"
-            )));
-        }
+    if let Some(fmt) = params.sample_format
+        && fmt != SampleFormat::S16
+    {
+        return Err(Error::unsupported(format!(
+            "g728: sample format {fmt:?} unsupported (S16 only)"
+        )));
     }
     Ok(())
 }
@@ -265,7 +265,9 @@ impl G728RegistryEncoder {
         }
         let consumed = cycles * CYCLE_SAMPLES;
         let vectors: Vec<[i16; IDIM]> = self.pending[..consumed]
-            .chunks_exact(IDIM)
+            .as_chunks::<IDIM>()
+            .0
+            .iter()
             // §G.3.1: 16-bit linear → Q2 is a right shift of 1 bit.
             .map(|c| std::array::from_fn(|k| c[k] >> 1))
             .collect();
@@ -307,7 +309,9 @@ impl oxideav_core::Encoder for G728RegistryEncoder {
         }
         self.pending.extend(
             plane
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|b| i16::from_le_bytes([b[0], b[1]])),
         );
         self.drain_cycles();
@@ -494,7 +498,9 @@ mod tests {
                         assert_eq!(a.data.len(), 1);
                         decoded.extend(
                             a.data[0]
-                                .chunks_exact(2)
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
                                 .map(|b| i16::from_le_bytes([b[0], b[1]])),
                         );
                     }
