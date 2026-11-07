@@ -383,6 +383,7 @@ pub use zero_input_response::ZeroInputResponse;
 /// fixed-point arithmetic variant and the byte-stream framing
 /// helpers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// Functionality is part of the planned scope but not yet wired
     /// up. The error carries no payload — see the per-call docs for

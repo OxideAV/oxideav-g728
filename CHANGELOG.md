@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- `#[non_exhaustive]` on the crate `Error` enum (the internal
+  per-block machinery was already `#[doc(hidden)]`).
 - edition 2024, MSRV 1.95
 - **Internal public surface marked `#[doc(hidden)]`.** The per-spec-block
   modules (backward adapters, postfilter chain, Annex G/I machinery,
